@@ -111,11 +111,10 @@ body{
 
 .tl-item{
   position:relative;padding-left:48px;margin-bottom:24px;
-  opacity:0;transform:translateY(20px);
-  transition:opacity .5s ease,transform .5s ease;
+  animation:fadeUp .5s ease both;
 }
-.tl-item.visible{opacity:1;transform:translateY(0)}
 .tl-item.hidden{display:none}
+@keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
 
 /* Timeline dot */
 .tl-dot{
@@ -469,31 +468,13 @@ function renderTimeline(events){
     tl.appendChild(item);
   }
 
-  // Scroll animation with staggered reveal
-  const observer = new IntersectionObserver((entries)=>{
-    entries.forEach(entry=>{
-      if(entry.isIntersecting) entry.target.classList.add('visible');
-    });
-  },{threshold:0.05, rootMargin:'50px'});
+  // Staggered animation
   document.querySelectorAll('.tl-item').forEach((el,i)=>{
-    // Stagger initial reveal for items in/near viewport
-    setTimeout(()=>{
-      observer.observe(el);
-      // Force-reveal if already in viewport or near it
-      const rect = el.getBoundingClientRect();
-      if(rect.top < window.innerHeight + 200) el.classList.add('visible');
-    }, i * 80);
+    el.style.animationDelay = (i*0.08)+'s';
   });
-  window._tlObserver = observer;
 }
 
-function observeItem(el){
-  if(window._tlObserver){
-    el.classList.remove('visible');
-    window._tlObserver.unobserve(el);
-    window._tlObserver.observe(el);
-  }
-}
+function observeItem(el){/* no-op */}
 
 /* ── Helpers ── */
 function mk(tag,props){
