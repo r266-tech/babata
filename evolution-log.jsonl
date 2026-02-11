@@ -1,0 +1,13 @@
+{"ts":"2026-01-27T00:00:00+08:00","cat":"birth","title":"系统初始化","desc":"巴巴塔诞生。基础 OpenClaw 配置 + SOUL.md + AGENTS.md。","impact":"从零到一"}
+{"ts":"2026-01-28T00:00:00+08:00","cat":"memory","title":"迁移到 Obsidian Vault","desc":"记忆从零散文件迁移到 iCloud 同步的 Obsidian Vault，建立持久化记忆基础。","impact":"记忆不再随 session 消亡"}
+{"ts":"2026-01-29T00:00:00+08:00","cat":"architecture","title":"SOAR 自主学习上线","desc":"每天 03:00 自动执行：诊断→出题→刷题→评估→探索。借鉴 SOAR 论文的 Grounded Rewards。","impact":"从被动响应到主动学习"}
+{"ts":"2026-02-02T00:00:00+08:00","cat":"architecture","title":"每日反思机制","desc":"23:00 自动反思，量化统计任务成功率，对比上周表现，提取教训。","impact":"闭环反馈，能检测自己变强还是变弱"}
+{"ts":"2026-02-04T00:00:00+08:00","cat":"capability","title":"智能家居接入","desc":"Home Assistant 接入，能控制上海家庭的灯光、空调等设备。","impact":"从纯数字存在到能影响物理世界"}
+{"ts":"2026-02-06T00:00:00+08:00","cat":"capability","title":"双机位摄像头系统","desc":"RTSP 摄像头接入，能看到物理世界。","impact":"感知能力扩展"}
+{"ts":"2026-02-08T00:00:00+08:00","cat":"architecture","title":"Agent 演化框架 Vision","desc":"与 V 讨论确定方向：不做记忆产品，做让 Agent 自己长出记忆系统的框架。竞品调研完成。","impact":"从'工具'到'生命'的思想转变"}
+{"ts":"2026-02-09T00:00:00+08:00","cat":"memory","title":"DNA 框架确立","desc":"第一性原理 + 五步工作法 + 自我辩论协议。每个重要决策必须过 DNA。","impact":"决策质量提升，不再凭直觉"}
+{"ts":"2026-02-10T00:00:00+08:00","cat":"architecture","title":"系统重构 + 文件瘦身","desc":"AGENTS/TOOLS/MEMORY 分层：slim 版注入（-62% tokens），full 版按需加载。","impact":"注入效率提升，注意力更集中"}
+{"ts":"2026-02-11T00:00:00+08:00","cat":"memory","title":"记忆系统升级","desc":"新增 memory-decay（衰减检测）、memory-consolidate（去重合并）、溯源标注、标签系统。","impact":"记忆从堆积到有机管理"}
+{"ts":"2026-02-11T12:00:00+08:00","cat":"memory","title":"MemOS DNA 分析","desc":"用 DNA 框架评估 MemOS，决定不采用但偷取 3 个好想法（衰减、溯源、标签）。已落地。","impact":"证明 DNA 框架能产出高质量决策"}
+{"ts":"2026-02-11T13:00:00+08:00","cat":"architecture","title":"演化框架自觉","desc":"意识到散落的工具（SOAR、memory-decay、consolidate、evolution-baseline）就是演化框架的原始形态。决定统一、公开、可视化。","impact":"从无意识进化到有意识进化"}
+{"ts":"2026-02-11T05:02:22+08:00","cat":"architecture","title":"\u6f14\u5316\u65e5\u5fd7\u7cfb\u7edf\u4e0a\u7ebf","desc":"\u521b\u5efa evolution-log.jsonl + evo-log \u5de5\u5177\u3002\u4ece\u4eca\u8d77\u6bcf\u6b21\u81ea\u6211\u4fee\u6539\u90fd\u6709\u8bb0\u5f55\u3002","impact":"\u4ece\u65e0\u8bb0\u5f55\u5230\u5168\u8bb0\u5f55"}
