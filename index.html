@@ -469,13 +469,21 @@ function renderTimeline(events){
     tl.appendChild(item);
   }
 
-  // Scroll animation
+  // Scroll animation with staggered reveal
   const observer = new IntersectionObserver((entries)=>{
     entries.forEach(entry=>{
       if(entry.isIntersecting) entry.target.classList.add('visible');
     });
-  },{threshold:0.1});
-  document.querySelectorAll('.tl-item').forEach(el=>observer.observe(el));
+  },{threshold:0.05, rootMargin:'50px'});
+  document.querySelectorAll('.tl-item').forEach((el,i)=>{
+    // Stagger initial reveal for items in/near viewport
+    setTimeout(()=>{
+      observer.observe(el);
+      // Force-reveal if already in viewport or near it
+      const rect = el.getBoundingClientRect();
+      if(rect.top < window.innerHeight + 200) el.classList.add('visible');
+    }, i * 80);
+  });
   window._tlObserver = observer;
 }
 
