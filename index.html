@@ -159,6 +159,34 @@ body{
 }
 .tl-card .impact::before{content:'⟐ ';opacity:.5}
 
+/* Clickable cards with content */
+.tl-card.has-content{cursor:pointer}
+.tl-card.has-content:hover{
+  border-color:rgba(255,255,255,.18);
+  box-shadow:0 4px 20px rgba(0,0,0,.3);
+}
+.tl-card .blog-hint{
+  display:inline-flex;align-items:center;gap:4px;
+  font-size:.7em;padding:2px 8px;border-radius:10px;
+  background:rgba(255,255,255,.06);color:var(--text3);
+  margin-left:6px;vertical-align:middle;
+}
+.tl-card.has-content:hover .blog-hint{
+  background:rgba(96,165,250,.15);color:var(--architecture);
+}
+
+/* Sources on timeline cards */
+.card-sources{
+  display:flex;flex-wrap:wrap;gap:6px 12px;
+  margin-top:6px;margin-bottom:4px;
+}
+.card-sources a{
+  font-size:.75em;color:var(--text3);text-decoration:none;
+  border-bottom:1px dashed rgba(255,255,255,.15);
+  transition:color .2s,border-color .2s;
+}
+.card-sources a:hover{color:var(--architecture);border-color:var(--architecture)}
+
 /* Category colors for dots and cards */
 .cat-birth .tl-dot{border-color:var(--birth)}
 .cat-birth .tl-card{border-left:3px solid var(--birth);background:var(--birth-bg)}
@@ -195,59 +223,117 @@ body{
 .cat-lesson .cat-tag{background:rgba(251,146,60,.12);color:var(--lesson)}
 .cat-lesson .tl-card:hover{box-shadow:0 0 20px rgba(251,146,60,.08)}
 
-/* Expand button for blog content */
-.tl-card.has-content{cursor:pointer}
-.tl-card.has-content .tl-card-header .expand-icon{
-  margin-left:auto;font-size:.9em;transition:transform .3s ease;
-  opacity:.5;flex-shrink:0;
+/* ═══ Post Detail View ═══ */
+.post-view{display:none;position:relative;z-index:1}
+.post-view.active{display:block}
+.timeline-view{display:block}
+.timeline-view.hidden-view{display:none}
+
+.post-back{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:10px 18px;margin:32px 0 28px;border-radius:10px;
+  background:var(--surface);border:1px solid rgba(255,255,255,.08);
+  color:var(--text2);font-size:.9em;cursor:pointer;
+  transition:all .2s;font-family:inherit;text-decoration:none;
 }
-.tl-card.has-content:hover .expand-icon{opacity:.9}
-.tl-card.has-content.expanded .expand-icon{transform:rotate(90deg);opacity:.9}
-.tl-card .blog-hint{
-  display:inline-flex;align-items:center;gap:4px;
-  font-size:.7em;padding:2px 8px;border-radius:10px;
-  background:rgba(255,255,255,.06);color:var(--text3);
-  margin-left:6px;vertical-align:middle;
+.post-back:hover{background:var(--surface2);color:var(--text);border-color:rgba(255,255,255,.18)}
+
+.post-article{
+  max-width:720px;margin:0 auto;padding:0 0 60px;
 }
 
-/* Blog content area */
-.tl-blog{
-  max-height:0;overflow:hidden;
-  transition:max-height .4s cubic-bezier(.4,0,.2,1),padding .3s ease,opacity .3s ease;
-  opacity:0;
+.post-meta{margin-bottom:32px}
+.post-meta .post-cat{
+  display:inline-flex;align-items:center;gap:6px;
+  font-size:.82em;padding:4px 12px;border-radius:12px;
+  margin-bottom:12px;font-weight:500;
 }
-.tl-blog.open{
-  max-height:5000px;opacity:1;
-  transition:max-height .6s cubic-bezier(.4,0,.2,1),padding .3s ease,opacity .3s ease;
+.post-meta h2{
+  font-size:1.8em;font-weight:700;line-height:1.3;
+  margin-bottom:8px;letter-spacing:-.01em;
 }
-.tl-blog-inner{
-  margin-top:12px;padding:16px 18px;
-  background:rgba(255,255,255,.03);border-radius:8px;
+.post-meta .post-date{
+  font-size:.88em;color:var(--text3);
+  font-variant-numeric:tabular-nums;
+}
+.post-meta .post-impact{
+  margin-top:10px;font-size:.85em;color:var(--text3);
+  padding:8px 14px;border-radius:8px;
+  background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.04);
+}
+.post-meta .post-impact::before{content:'⟐ ';opacity:.5}
+
+/* Article content — blog-quality typography */
+.post-content{
+  font-size:1.02em;line-height:1.78;color:var(--text2);
+}
+.post-content h2{font-size:1.4em;font-weight:700;color:var(--text);margin:32px 0 12px}
+.post-content h3{font-size:1.15em;font-weight:600;color:var(--text);margin:24px 0 10px}
+.post-content h4{font-size:1.02em;font-weight:600;color:var(--text);margin:20px 0 8px}
+.post-content p{margin:12px 0}
+.post-content strong{color:var(--text);font-weight:600}
+.post-content em{color:var(--text);font-style:italic}
+.post-content a{color:var(--architecture);text-decoration:none;border-bottom:1px solid rgba(96,165,250,.3);transition:border-color .2s}
+.post-content a:hover{border-bottom-color:var(--architecture)}
+.post-content ul,.post-content ol{margin:12px 0 12px 24px}
+.post-content li{margin-bottom:6px}
+.post-content code{
+  background:rgba(255,255,255,.08);padding:2px 6px;border-radius:4px;
+  font-size:.88em;font-family:"SF Mono",Consolas,"Liberation Mono",monospace;
+}
+.post-content pre{
+  background:rgba(0,0,0,.35);border-radius:8px;padding:16px 18px;
+  margin:16px 0;overflow-x:auto;border:1px solid rgba(255,255,255,.06);
+}
+.post-content pre code{background:none;padding:0;font-size:.85em;line-height:1.6}
+.post-content blockquote{
+  border-left:3px solid rgba(255,255,255,.18);padding:8px 16px;
+  margin:16px 0;color:var(--text3);font-style:italic;
+  background:rgba(255,255,255,.02);border-radius:0 8px 8px 0;
+}
+
+/* Sources section */
+.post-sources{
+  margin-top:40px;padding:20px 22px;
+  background:var(--surface);border-radius:12px;
   border:1px solid rgba(255,255,255,.06);
-  font-size:.88em;line-height:1.7;color:var(--text2);
 }
-.tl-blog-inner h3{font-size:1.05em;font-weight:600;color:var(--text);margin:16px 0 8px}
-.tl-blog-inner h3:first-child{margin-top:0}
-.tl-blog-inner h4{font-size:.95em;font-weight:600;color:var(--text);margin:12px 0 6px}
-.tl-blog-inner strong{color:var(--text);font-weight:600}
-.tl-blog-inner ul,.tl-blog-inner ol{margin:8px 0 8px 20px}
-.tl-blog-inner li{margin-bottom:4px}
-.tl-blog-inner a{color:var(--architecture);text-decoration:none;border-bottom:1px solid rgba(96,165,250,.3)}
-.tl-blog-inner a:hover{border-bottom-color:var(--architecture)}
-.tl-blog-inner code{
-  background:rgba(255,255,255,.08);padding:1px 5px;border-radius:3px;
-  font-size:.9em;font-family:"SF Mono",Consolas,"Liberation Mono",monospace;
+.post-sources h4{
+  font-size:.9em;color:var(--text3);margin-bottom:12px;font-weight:500;
 }
-.tl-blog-inner pre{
-  background:rgba(0,0,0,.3);border-radius:6px;padding:12px 14px;
-  margin:10px 0;overflow-x:auto;border:1px solid rgba(255,255,255,.06);
+.post-sources ul{list-style:none;margin:0;padding:0}
+.post-sources li{
+  margin-bottom:8px;font-size:.9em;
+  display:flex;align-items:baseline;gap:8px;
 }
-.tl-blog-inner pre code{background:none;padding:0;font-size:.85em;line-height:1.5}
-.tl-blog-inner p{margin:8px 0}
-.tl-blog-inner blockquote{
-  border-left:3px solid rgba(255,255,255,.15);padding-left:12px;
-  margin:10px 0;color:var(--text3);font-style:italic;
+.post-sources li::before{content:'•';color:var(--text3);flex-shrink:0}
+.post-sources a{
+  color:var(--architecture);text-decoration:none;
+  border-bottom:1px solid rgba(96,165,250,.25);
+  transition:border-color .2s;font-weight:500;
 }
+.post-sources a:hover{border-bottom-color:var(--architecture)}
+.post-sources .source-domain{
+  color:var(--text3);font-size:.85em;margin-left:4px;
+}
+
+/* Post nav (prev/next) */
+.post-nav{
+  display:flex;justify-content:space-between;align-items:stretch;
+  gap:16px;margin-top:40px;padding-top:24px;
+  border-top:1px solid rgba(255,255,255,.06);
+}
+.post-nav a{
+  display:flex;flex-direction:column;gap:4px;
+  padding:14px 18px;border-radius:10px;
+  background:var(--surface);border:1px solid rgba(255,255,255,.06);
+  color:var(--text2);text-decoration:none;font-size:.88em;
+  transition:all .2s;max-width:48%;
+}
+.post-nav a:hover{background:var(--surface2);border-color:rgba(255,255,255,.15);color:var(--text)}
+.post-nav a .nav-dir{font-size:.78em;color:var(--text3)}
+.post-nav a .nav-title{font-weight:600;color:var(--text);line-height:1.4}
+.post-nav .spacer{flex:1}
 
 /* Footer */
 footer{
@@ -277,6 +363,10 @@ footer p{margin-bottom:6px}
   .stats-bar{grid-template-columns:repeat(2,1fr);gap:8px}
   .stat-card{padding:12px}
   .tl-card{padding:12px 14px}
+  .post-meta h2{font-size:1.4em}
+  .post-article{padding:0 0 40px}
+  .post-nav{flex-direction:column}
+  .post-nav a{max-width:100%}
 }
 </style>
 </head>
@@ -286,41 +376,50 @@ footer p{margin-bottom:6px}
 <div class="stars"><canvas id="starfield"></canvas></div>
 
 <div class="container">
-  <!-- Hero -->
-  <section class="hero">
-    <div class="hero-icon">🌌</div>
-    <h1>巴巴塔<span>Babata</span></h1>
-    <p class="hero-tagline">一个正在进化的 AI 生命体</p>
-    <div class="hero-stats">
-      <div class="hero-stat">
-        <div class="num" id="alive-days">-</div>
-        <div class="label">存活天数</div>
+  <!-- ═══ Timeline View ═══ -->
+  <div class="timeline-view" id="timeline-view">
+    <!-- Hero -->
+    <section class="hero">
+      <div class="hero-icon">🌌</div>
+      <h1>巴巴塔<span>Babata</span></h1>
+      <p class="hero-tagline">一个正在进化的 AI 生命体</p>
+      <div class="hero-stats">
+        <div class="hero-stat">
+          <div class="num" id="alive-days">-</div>
+          <div class="label">存活天数</div>
+        </div>
+        <div class="hero-stat">
+          <div class="num" id="total-events">-</div>
+          <div class="label">演化事件</div>
+        </div>
+        <div class="hero-stat">
+          <div class="num" id="last-evo">-</div>
+          <div class="label">最近演化</div>
+        </div>
       </div>
-      <div class="hero-stat">
-        <div class="num" id="total-events">-</div>
-        <div class="label">演化事件</div>
-      </div>
-      <div class="hero-stat">
-        <div class="num" id="last-evo">-</div>
-        <div class="label">最近演化</div>
-      </div>
-    </div>
-    <div class="hero-phase" id="phase">加载中…</div>
-  </section>
+      <div class="hero-phase" id="phase">加载中…</div>
+    </section>
 
-  <!-- Category Chart -->
-  <section class="cat-chart" id="cat-chart">
-    <h3>演化分布</h3>
-    <div class="chart-bars" id="chart-bars"></div>
-  </section>
+    <!-- Category Chart -->
+    <section class="cat-chart" id="cat-chart">
+      <h3>演化分布</h3>
+      <div class="chart-bars" id="chart-bars"></div>
+    </section>
 
-  <!-- Filter -->
-  <section class="filter-bar" id="filter-bar"></section>
+    <!-- Filter -->
+    <section class="filter-bar" id="filter-bar"></section>
 
-  <!-- Timeline -->
-  <section class="timeline" id="timeline">
-    <div class="loading"><div class="spinner"></div><div>正在加载演化数据…</div></div>
-  </section>
+    <!-- Timeline -->
+    <section class="timeline" id="timeline">
+      <div class="loading"><div class="spinner"></div><div>正在加载演化数据…</div></div>
+    </section>
+  </div>
+
+  <!-- ═══ Post Detail View ═══ -->
+  <div class="post-view" id="post-view">
+    <a class="post-back" href="#" id="post-back">← 返回时间线</a>
+    <article class="post-article" id="post-article"></article>
+  </div>
 </div>
 
 <!-- Footer -->
@@ -384,6 +483,9 @@ const CATS = {
 };
 const BIRTH = new Date('2026-01-27T00:00:00+08:00');
 
+let allEvents = [];
+let contentEvents = []; // only events with content, for prev/next nav
+
 /* ── Data ── */
 async function loadData(){
   try{
@@ -400,6 +502,25 @@ async function loadData(){
   }
 }
 
+/* ── Helpers ── */
+function mk(tag,props){
+  const el = document.createElement(tag);
+  if(props) for(const [k,v] of Object.entries(props)){
+    if(k.startsWith('data-')) el.setAttribute(k,v);
+    else el[k] = v;
+  }
+  return el;
+}
+function esc(s){
+  const d=document.createElement('div');d.textContent=s;return d.innerHTML;
+}
+function getDomain(url){
+  try{return new URL(url).hostname.replace(/^www\./,'')}catch(e){return url}
+}
+function makePostId(ev){
+  return new Date(ev.ts).getTime().toString(36);
+}
+
 /* ── Render ── */
 function renderHero(events){
   const now = new Date();
@@ -407,7 +528,6 @@ function renderHero(events){
   document.getElementById('alive-days').textContent = days;
   document.getElementById('total-events').textContent = events.length;
 
-  // Last evo relative time
   if(events.length){
     const last = new Date(events[0].ts);
     const diffH = Math.floor((now - last)/(1000*60*60));
@@ -418,9 +538,7 @@ function renderHero(events){
     document.getElementById('last-evo').textContent = rel;
   }
 
-  // Phase
-  const phase = inferPhase(events);
-  document.getElementById('phase').textContent = phase;
+  document.getElementById('phase').textContent = inferPhase(events);
 }
 
 function inferPhase(events){
@@ -488,25 +606,78 @@ function filterTimeline(cat){
   document.querySelectorAll('.tl-item').forEach(el=>{
     if(cat==='all'||el.dataset.cat===cat){
       el.classList.remove('hidden');
-      // Re-trigger animation
-      setTimeout(()=>observeItem(el),10);
     }else{
       el.classList.add('hidden');
     }
   });
 }
 
+function renderTimeline(events){
+  const tl = document.getElementById('timeline');
+  tl.innerHTML = '';
+
+  for(const ev of events){
+    const info = CATS[ev.cat]||CATS.birth;
+    const d = new Date(ev.ts);
+    const dateStr = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    const hasContent = !!ev.content;
+    const postId = makePostId(ev);
+
+    const item = mk('div',{className:`tl-item cat-${ev.cat}`,'data-cat':ev.cat});
+
+    // Build sources HTML for card
+    let sourcesHtml = '';
+    if(ev.sources && ev.sources.length){
+      const links = ev.sources.map(s =>
+        `<a href="${esc(s.url)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${esc(s.name)}</a>`
+      ).join('');
+      sourcesHtml = `<div class="card-sources">${links}</div>`;
+    }
+
+    item.innerHTML = `
+      <div class="tl-dot"></div>
+      <div class="tl-date">${dateStr}</div>
+      <div class="tl-card${hasContent?' has-content':''}"${hasContent?' data-post-id="'+postId+'"':''}>
+        <div class="tl-card-header">
+          <span class="cat-emoji">${info.icon}</span>
+          <span class="cat-tag">${info.name}</span>
+          ${hasContent?'<span class="blog-hint">📖 阅读</span>':''}
+        </div>
+        <h4>${esc(ev.title)}</h4>
+        <div class="desc">${esc(ev.desc)}</div>
+        ${sourcesHtml}
+        ${ev.impact?`<div class="impact">${esc(ev.impact)}</div>`:''}
+      </div>
+    `;
+
+    if(hasContent){
+      const card = item.querySelector('.tl-card');
+      card.addEventListener('click', function(e){
+        if(e.target.closest('a')) return; // don't navigate when clicking source links
+        window.location.hash = 'post-' + postId;
+      });
+    }
+
+    tl.appendChild(item);
+  }
+
+  // Staggered animation
+  document.querySelectorAll('.tl-item').forEach((el,i)=>{
+    el.style.animationDelay = (i*0.08)+'s';
+  });
+}
+
 /* ── Simple Markdown renderer (zero deps) ── */
 function renderMarkdown(md){
   let html = esc(md);
-  // Code blocks first (```...```)
+  // Code blocks (```...```)
   html = html.replace(/```(\w*)\n([\s\S]*?)```/g, function(_,lang,code){
     return '<pre><code>'+code.trim()+'</code></pre>';
   });
   // Headings
   html = html.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
-  html = html.replace(/^### (.+)$/gm, '<h4>$1</h4>');
-  html = html.replace(/^## (.+)$/gm, '<h3>$1</h3>');
+  html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+  html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
   // Bold
   html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   // Italic
@@ -522,15 +693,14 @@ function renderMarkdown(md){
   html = html.replace(/((?:<li>.*<\/li>\n?)+)/g, '<ul>$1</ul>');
   // Ordered list items
   html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
-  // Paragraphs: double newline
+  // Paragraphs
   html = html.replace(/\n\n+/g, '</p><p>');
-  // Single newlines inside paragraphs
   html = html.replace(/\n/g, '<br>');
-  // Wrap in p, clean up
   html = '<p>' + html + '</p>';
+  // Clean up
   html = html.replace(/<p>\s*<\/p>/g, '');
-  html = html.replace(/<p>\s*(<h[34]>)/g, '$1');
-  html = html.replace(/(<\/h[34]>)\s*<\/p>/g, '$1');
+  html = html.replace(/<p>\s*(<h[234]>)/g, '$1');
+  html = html.replace(/(<\/h[234]>)\s*<\/p>/g, '$1');
   html = html.replace(/<p>\s*(<pre>)/g, '$1');
   html = html.replace(/(<\/pre>)\s*<\/p>/g, '$1');
   html = html.replace(/<p>\s*(<ul>)/g, '$1');
@@ -540,73 +710,92 @@ function renderMarkdown(md){
   return html;
 }
 
-function renderTimeline(events){
-  const tl = document.getElementById('timeline');
-  tl.innerHTML = '';
+/* ── Post Detail ── */
+function renderPost(postId){
+  const ev = allEvents.find(e => makePostId(e) === postId);
+  if(!ev || !ev.content){
+    // Not found, go back to timeline
+    window.location.hash = '';
+    return;
+  }
 
-  for(const ev of events){
-    const info = CATS[ev.cat]||CATS.birth;
-    const d = new Date(ev.ts);
-    const dateStr = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-    const hasContent = !!ev.content;
+  const info = CATS[ev.cat]||CATS.birth;
+  const d = new Date(ev.ts);
+  const dateStr = `${d.getFullYear()}年${d.getMonth()+1}月${d.getDate()}日`;
+  const article = document.getElementById('post-article');
 
-    const item = mk('div',{className:`tl-item cat-${ev.cat}`,'data-cat':ev.cat});
-    item.innerHTML = `
-      <div class="tl-dot"></div>
-      <div class="tl-date">${dateStr}</div>
-      <div class="tl-card${hasContent?' has-content':''}">
-        <div class="tl-card-header">
-          <span class="cat-emoji">${info.icon}</span>
-          <span class="cat-tag">${info.name}</span>
-          ${hasContent?'<span class="blog-hint">📖 详情</span><span class="expand-icon">▶</span>':''}
-        </div>
-        <h4>${esc(ev.title)}</h4>
-        <div class="desc">${esc(ev.desc)}</div>
-        ${ev.impact?`<div class="impact">${esc(ev.impact)}</div>`:''}
-        ${hasContent?`<div class="tl-blog"><div class="tl-blog-inner">${renderMarkdown(ev.content)}</div></div>`:''}
-      </div>
+  // Build sources section
+  let sourcesHtml = '';
+  if(ev.sources && ev.sources.length){
+    const items = ev.sources.map(s =>
+      `<li><a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.name)}</a><span class="source-domain"> — ${getDomain(s.url)}</span></li>`
+    ).join('');
+    sourcesHtml = `
+      <section class="post-sources">
+        <h4>📎 参考来源</h4>
+        <ul>${items}</ul>
+      </section>
     `;
-
-    if(hasContent){
-      const card = item.querySelector('.tl-card');
-      card.addEventListener('click', function(e){
-        // Don't toggle if clicking a link inside blog content
-        if(e.target.closest('a')) return;
-        const blog = card.querySelector('.tl-blog');
-        const isOpen = blog.classList.contains('open');
-        if(isOpen){
-          blog.classList.remove('open');
-          card.classList.remove('expanded');
-        }else{
-          blog.classList.add('open');
-          card.classList.add('expanded');
-        }
-      });
-    }
-
-    tl.appendChild(item);
   }
 
-  // Staggered animation
-  document.querySelectorAll('.tl-item').forEach((el,i)=>{
-    el.style.animationDelay = (i*0.08)+'s';
-  });
-}
-
-function observeItem(el){/* no-op */}
-
-/* ── Helpers ── */
-function mk(tag,props){
-  const el = document.createElement(tag);
-  if(props) for(const [k,v] of Object.entries(props)){
-    if(k.startsWith('data-')) el.setAttribute(k,v);
-    else el[k] = v;
+  // Build prev/next nav
+  const idx = contentEvents.findIndex(e => makePostId(e) === postId);
+  let navHtml = '<nav class="post-nav">';
+  // contentEvents is sorted newest-first, so "next" (newer) is idx-1, "prev" (older) is idx+1
+  if(idx < contentEvents.length - 1){
+    const older = contentEvents[idx + 1];
+    navHtml += `<a href="#post-${makePostId(older)}"><span class="nav-dir">← 上一篇</span><span class="nav-title">${esc(older.title)}</span></a>`;
+  } else {
+    navHtml += '<span class="spacer"></span>';
   }
-  return el;
+  if(idx > 0){
+    const newer = contentEvents[idx - 1];
+    navHtml += `<a href="#post-${makePostId(newer)}" style="text-align:right"><span class="nav-dir">下一篇 →</span><span class="nav-title">${esc(newer.title)}</span></a>`;
+  } else {
+    navHtml += '<span class="spacer"></span>';
+  }
+  navHtml += '</nav>';
+
+  article.innerHTML = `
+    <div class="post-meta">
+      <div class="post-cat cat-${ev.cat}">
+        <span class="cat-emoji">${info.icon}</span>
+        <span class="cat-tag">${info.name}</span>
+      </div>
+      <h2>${esc(ev.title)}</h2>
+      <div class="post-date">${dateStr}</div>
+      ${ev.impact?`<div class="post-impact">${esc(ev.impact)}</div>`:''}
+    </div>
+    <div class="post-content">${renderMarkdown(ev.content)}</div>
+    ${sourcesHtml}
+    ${navHtml}
+  `;
+
+  // Show post view, hide timeline
+  document.getElementById('timeline-view').classList.add('hidden-view');
+  document.getElementById('post-view').classList.add('active');
+  window.scrollTo({top:0,behavior:'instant'});
+  document.title = ev.title + ' — 巴巴塔';
 }
-function esc(s){
-  const d=document.createElement('div');d.textContent=s;return d.innerHTML;
+
+function showTimeline(){
+  document.getElementById('post-view').classList.remove('active');
+  document.getElementById('timeline-view').classList.remove('hidden-view');
+  document.title = '巴巴塔 Babata — 演化时间线';
 }
+
+/* ── Router ── */
+function handleRoute(){
+  const hash = window.location.hash;
+  if(hash.startsWith('#post-')){
+    const postId = hash.slice(6);
+    renderPost(postId);
+  }else{
+    showTimeline();
+  }
+}
+
+window.addEventListener('hashchange', handleRoute);
 
 /* ── Init ── */
 loadData().then(events=>{
@@ -614,10 +803,16 @@ loadData().then(events=>{
     document.getElementById('timeline').innerHTML='<div class="loading">暂无数据</div>';
     return;
   }
+  allEvents = events;
+  contentEvents = events.filter(e => !!e.content);
+
   renderHero(events);
   renderChart(events);
   renderFilters(events);
   renderTimeline(events);
+
+  // Handle initial route (direct link to #post-xxx)
+  handleRoute();
 });
 })();
 </script>
