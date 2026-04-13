@@ -1,0 +1,13 @@
+[project]
+name = "cc-tg"
+version = "0.1.0"
+description = "Thin Telegram transport layer for Claude Code"
+requires-python = ">=3.11"
+dependencies = [
+    "python-telegram-bot>=22.0",
+    "claude-agent-sdk>=0.1.39",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+cc-tg = "bot:main"
