@@ -55,6 +55,7 @@ class CC:
             cwd=str(Path.home()),
             cli_path=os.environ.get("CLAUDE_CLI_PATH"),
             include_partial_messages=on_stream is not None,
+            system_prompt="Source: Telegram.",
             mcp_servers={
                 "tg": {
                     "command": _VENV_PYTHON,

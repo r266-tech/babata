@@ -241,12 +241,17 @@ async def on_button_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     msg_id = query.message.message_id
     label = parts[2] if len(parts) > 2 else str(option_index)
 
-    if bridge.resolve(msg_id, option_index, label):
-        try:
-            original = query.message.text or ""
-            await query.edit_message_text(f"{original}\n\n\u2705 {label}")
-        except Exception:
-            pass
+    # Always remove buttons and show selection
+    try:
+        original = query.message.text or ""
+        await query.edit_message_text(f"{original}\n\n\u2705 {label}")
+    except Exception:
+        pass
+
+    # Try to resolve MCP future (CC is waiting for this)
+    if not bridge.resolve(msg_id, option_index, label):
+        # MCP future gone (timeout/session ended) — send choice as new message to CC
+        await _process(update, ctx, label)
 
 
 # ── Core flow ─────────────────────────────────────────────────────────
@@ -348,7 +353,7 @@ async def _post_init(app: Application) -> None:
 
 
 def main() -> None:
-    app = Application.builder().token(TOKEN).post_init(_post_init).build()
+    app = Application.builder().token(TOKEN).concurrent_updates(True).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("new", cmd_new))
