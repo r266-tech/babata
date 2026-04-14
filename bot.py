@@ -267,6 +267,21 @@ async def _process(
     msg = update.effective_message
     await chat.send_action("typing")
 
+    # Physical: reply/quote content isn't in msg.text, must prepend
+    reply = getattr(msg, "reply_to_message", None)
+    if reply:
+        quote = getattr(msg, "quote", None)
+        quoted = (
+            (quote and quote.text)
+            or reply.text or reply.caption
+            or (reply.document and f"[a file: {reply.document.file_name}]")
+            or (reply.photo and "[a photo]")
+            or (reply.voice and "[a voice]")
+            or (reply.audio and "[an audio]")
+            or "[a message]"
+        )
+        text = f"[Replying to]: {quoted}\n\n{text}"
+
     # Set bridge context so MCP tools can send to this chat
     bridge.set_context(ctx.bot, chat.id, msg.message_id)
 
