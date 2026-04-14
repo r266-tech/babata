@@ -39,7 +39,7 @@ log = logging.getLogger("cc-tg")
 cc = CC()
 
 # User preferences persisted across restarts
-_STATE_PATH = Path.home() / ".cc-tg-state.json"
+_STATE_PATH = Path.home() / "cc-workspace" / "state" / "cc-tg-state.json"
 
 
 def _load_state() -> dict:

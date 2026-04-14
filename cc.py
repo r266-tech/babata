@@ -55,6 +55,7 @@ class CC:
             cli_path=os.environ.get("CLAUDE_CLI_PATH"),
             include_partial_messages=on_stream is not None,
             system_prompt="Source: Telegram.",
+            setting_sources=["user"],  # 读 ~/.claude/{settings.json, CLAUDE.md, skills/} - 统一身份跨终端/TG/cron
             mcp_servers={
                 "tg": {
                     "command": _VENV_PYTHON,
