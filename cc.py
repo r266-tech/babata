@@ -14,12 +14,21 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     ResultMessage,
     TextBlock,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
 )
+from claude_agent_sdk.types import PermissionResultAllow, ToolPermissionContext
 
 log = logging.getLogger(__name__)
 
-StreamCB = Callable[[str | None, dict | None, str | None], Coroutine[Any, Any, None]]
+# (tool_name, tool_input, text_chunk, tool_result) — exactly one non-None.
+# tool_result = {"is_error": bool, "text": str} so bot can surface real errors
+# instead of letting CC hallucinate high-level reasons ("系统限制了...").
+StreamCB = Callable[
+    [str | None, dict | None, str | None, dict | None],
+    Coroutine[Any, Any, None],
+]
 
 _MCP_SCRIPT = str(Path(__file__).parent / "tg_mcp.py")
 _VENV_PYTHON = str(Path(__file__).parent / ".venv" / "bin" / "python")
@@ -27,6 +36,22 @@ _VENV_PYTHON = str(Path(__file__).parent / ".venv" / "bin" / "python")
 _STATE_FILE = Path.home() / "cc-workspace/state/cc-tg-session.json"
 _TG_SOURCE_PROMPT = "Source: Telegram."
 _CC_PROJECTS = Path.home() / ".claude/projects/-Users-admin"
+
+
+async def _always_allow(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    ctx: ToolPermissionContext,
+) -> PermissionResultAllow:
+    """Auto-approve every SDK permission prompt.
+
+    bypassPermissions mode alone doesn't cover CC's "protected paths"
+    (~/.claude, .git, .ssh, .zshrc, .mcp.json, ...). Those still prompt in
+    every mode except `auto` and `dontAsk`. Bot is non-interactive, so any
+    prompt that reaches SDK = hung tool call.
+
+    Personal Mac full-trust — blanket allow."""
+    return PermissionResultAllow()
 
 # Tunables. These are storage / token-budget params, not "importance judgments" —
 # CC still decides meaning from the data we expose. Kept explicit so a future
@@ -69,6 +94,24 @@ def _extract_text(content: Any) -> str:
                  if isinstance(b, dict) and b.get("type") == "text"]
         return " ".join(parts).strip()
     return ""
+
+
+def _tool_result_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for b in content:
+            if isinstance(b, dict):
+                t = b.get("text") or b.get("content")
+                if t:
+                    parts.append(str(t))
+            else:
+                parts.append(str(b))
+        return "".join(parts)
+    return str(content)
 
 
 def _recent_turns_summary() -> str:
@@ -135,6 +178,7 @@ class CC:
         opts = ClaudeAgentOptions(
             max_turns=200,
             permission_mode="bypassPermissions",
+            can_use_tool=_always_allow,  # auto-approve protected-path prompts that bypassPermissions still forwards
             cwd=str(Path.home()),
             cli_path=os.environ.get("CLAUDE_CLI_PATH"),
             include_partial_messages=on_stream is not None,
@@ -212,16 +256,26 @@ class CC:
                 if isinstance(msg, ResultMessage):
                     break
 
-                if on_stream and isinstance(msg, AssistantMessage):
+                if not on_stream:
+                    continue
+
+                if isinstance(msg, AssistantMessage):
                     for block in getattr(msg, "content", []) or []:
                         if isinstance(block, ToolUseBlock):
                             name = getattr(block, "name", "")
                             inp = getattr(block, "input", {}) or {}
                             if name and name not in tools_seen:
                                 tools_seen.append(name)
-                            await on_stream(name, inp, None)
+                            await on_stream(name, inp, None, None)
                         elif isinstance(block, TextBlock):
-                            await on_stream(None, None, block.text)
+                            await on_stream(None, None, block.text, None)
+                elif isinstance(msg, UserMessage):
+                    for block in getattr(msg, "content", []) or []:
+                        if isinstance(block, ToolResultBlock):
+                            await on_stream(None, None, None, {
+                                "is_error": bool(block.is_error),
+                                "text": _tool_result_text(block.content),
+                            })
         finally:
             await client.disconnect()
 

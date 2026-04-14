@@ -372,11 +372,21 @@ async def _process(
         tool_name: str | None,
         tool_input: dict | None,
         text_chunk: str | None,
+        tool_result: dict | None = None,
     ) -> None:
         nonlocal last_edit, status
-        if not tool_name or _verbose == 0:
+        if _verbose == 0:
             return
-        entries.append(_fmt_tool(tool_name, tool_input or {}))
+        if tool_name:
+            entries.append(_fmt_tool(tool_name, tool_input or {}))
+        elif tool_result and tool_result.get("is_error"):
+            # Surface real tool errors so CC can't hallucinate high-level reasons
+            err = (tool_result.get("text") or "").replace("\n", " ").strip()
+            if not err:
+                return
+            entries.append(f"  \u274c {err[:200]}")
+        else:
+            return
 
         body = "\n".join(entries[-30:])[:_MAX_TG]
 
