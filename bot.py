@@ -57,23 +57,12 @@ def _save_state() -> None:
 
 
 _state = _load_state()
-# Tool display mode: 0=hidden, 1=show then delete, 2=show and keep
-_verbose = _state.get("verbose", 1)
+# Tool display: show ephemeral status listing tools used (auto-deleted on completion).
+_verbose = bool(_state.get("verbose", 1))
 
 # ── Formatting (physical: TG requires HTML, max 4096 chars) ──────────
 
 _MAX_TG = 4000
-
-_TOOL_ICONS = {
-    "Read": "\U0001f4d6", "Write": "\u270f\ufe0f", "Edit": "\u270f\ufe0f",
-    "Bash": "\U0001f4bb", "Glob": "\U0001f50d", "Grep": "\U0001f50d",
-    "WebFetch": "\U0001f310", "WebSearch": "\U0001f310",
-    "Agent": "\U0001f916", "Task": "\U0001f9e0",
-}
-
-
-def _icon(name: str) -> str:
-    return _TOOL_ICONS.get(name, "\U0001f527")
 
 
 def _to_html(md: str) -> str:
@@ -160,13 +149,12 @@ async def cmd_verbose(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
         return
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    labels = {0: "hidden", 1: "flash", 2: "keep"}
-    buttons = [
-        [InlineKeyboardButton(
-            f"{'> ' if _verbose == i else ''}{v}",
-            callback_data=f"verbose:{i}",
-        ) for i, v in labels.items()]
-    ]
+    buttons = [[
+        InlineKeyboardButton(
+            f"{'> ' if _verbose == v else ''}{'on' if v else 'off'}",
+            callback_data=f"verbose:{1 if v else 0}",
+        ) for v in (True, False)
+    ]]
     await update.message.reply_text(
         "Tool display:", reply_markup=InlineKeyboardMarkup(buttons),
     )
@@ -215,7 +203,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     images = [image_to_base64(path)]
     path.unlink(missing_ok=True)
 
-    caption = update.message.caption or "What's in this image?"
+    caption = update.message.caption or ""
     await _process(update, ctx, caption, images=images)
 
 
@@ -260,7 +248,7 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     save_path = save_dir / doc.file_name
     await file.download_to_drive(save_path)
 
-    caption = update.message.caption or f"File saved to {save_path}"
+    caption = update.message.caption or f"[received file: {save_path}]"
     await _process(update, ctx, caption)
 
 
@@ -268,11 +256,10 @@ async def on_verbose_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     query = update.callback_query
     await query.answer()
     global _verbose
-    _verbose = int((query.data or "verbose:1").split(":")[1])
-    _state["verbose"] = _verbose
+    _verbose = (query.data or "verbose:1").endswith(":1")
+    _state["verbose"] = 1 if _verbose else 0
     _save_state()
-    labels = {0: "hidden", 1: "flash", 2: "keep"}
-    await query.edit_message_text(f"Tool display: {labels[_verbose]}")
+    await query.edit_message_text(f"Tool display: {'on' if _verbose else 'off'}")
 
 
 async def on_button_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -339,8 +326,8 @@ async def _process(
     # React: eyes = processing
     await _react(msg, "\U0001f440")
 
-    # Status message for streaming tool names
-    status = await msg.reply_text("\u23f3") if _verbose > 0 else None
+    # Ephemeral status message listing tool names as CC uses them.
+    status = await msg.reply_text("\u23f3") if _verbose else None
     tools: list[str] = []
     last_edit = 0.0
 
@@ -351,7 +338,7 @@ async def _process(
         if tool_name not in tools:
             tools.append(tool_name)
 
-        if not status or _verbose == 0:
+        if not status:
             return
 
         now = time.monotonic()
@@ -359,9 +346,8 @@ async def _process(
             return
         last_edit = now
 
-        line = " \u2192 ".join(f"{_icon(t)} {t}" for t in tools)
         try:
-            await status.edit_text(line)
+            await status.edit_text(" \u2192 ".join(tools))
         except Exception:
             pass
         try:
@@ -378,8 +364,7 @@ async def _process(
             await status.edit_text(f"Error: {e}")
         return
 
-    # Clean up status: delete if mode 1, keep if mode 2, absent if mode 0
-    if status and _verbose == 1:
+    if status:
         try:
             await status.delete()
         except Exception:
@@ -399,9 +384,8 @@ async def _process(
         try:
             await msg.reply_text(part, parse_mode="HTML")
         except Exception:
-            plain_parts = _split(resp.content)
-            for pp in plain_parts:
-                await msg.reply_text(pp[:_MAX_TG])
+            for pp in _split(resp.content):
+                await msg.reply_text(pp)
             break
 
     if resp.cost > 0:
@@ -417,7 +401,7 @@ async def _post_init(app: Application) -> None:
         bridge.set_context(app.bot, ALLOWED_USER, None)
     await app.bot.set_my_commands([
         ("new", "Start a fresh session"),
-        ("verbose", "Tool display: 0=hidden 1=flash 2=keep"),
+        ("verbose", "Tool display: on/off"),
     ])
 
 

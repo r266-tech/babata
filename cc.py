@@ -15,7 +15,6 @@ from claude_agent_sdk import (
     TextBlock,
     ToolUseBlock,
 )
-from claude_agent_sdk._internal.message_parser import parse_message
 
 log = logging.getLogger(__name__)
 
@@ -103,7 +102,8 @@ class CC:
                     }
                     for img in images
                 ]
-                blocks.append({"type": "text", "text": prompt})
+                if prompt:
+                    blocks.append({"type": "text", "text": prompt})
 
                 async def _multi():
                     yield {"type": "user", "message": {"role": "user", "content": blocks}}
@@ -112,12 +112,7 @@ class CC:
             else:
                 await client.query(prompt)
 
-            async for raw in client._query.receive_messages():
-                try:
-                    msg = parse_message(raw)
-                except Exception:
-                    continue
-
+            async for msg in client.receive_messages():
                 messages.append(msg)
 
                 if isinstance(msg, ResultMessage):

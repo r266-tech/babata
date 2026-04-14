@@ -17,12 +17,16 @@ _MEDIA_TYPES = {
     ".webp": "image/webp",
 }
 
+_WHISPER_MODEL = os.environ.get(
+    "WHISPER_MODEL",
+    str(Path.home() / ".cache/whisper-cpp/ggml-base.bin"),
+)
+
 
 async def _whisper(wav_path: Path) -> str | None:
     """Run whisper-cli on a 16kHz mono wav → text."""
     proc = await asyncio.create_subprocess_exec(
-        "whisper-cli", "-m",
-        str(Path.home() / ".cache/whisper-cpp/ggml-base.bin"),
+        "whisper-cli", "-m", _WHISPER_MODEL,
         "-f", str(wav_path), "--no-timestamps", "-l", "auto",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,

@@ -86,4 +86,4 @@ Without these, text and image still work. Voice messages will fail gracefully.
 
 ## Commands
 - `/new` — reset session
-- `/verbose` — cycle tool display: hidden / flash / keep
+- `/verbose` — toggle tool display (on = ephemeral status showing tools used)

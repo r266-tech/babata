@@ -7,6 +7,7 @@ CC CLI connects via stdio; we relay requests to the bot through Unix socket.
 import asyncio
 import json
 import logging
+import os
 import sys
 
 from mcp.server import Server
@@ -18,6 +19,27 @@ log = logging.getLogger(__name__)
 SOCKET_PATH = "/tmp/cc-tg-bridge.sock"
 
 server = Server("tg")
+
+
+def _voice_description() -> str:
+    """Facts about the actual TTS backend so CC can decide how to use markup."""
+    base = (
+        "Synthesize text to speech and send as a TG voice message. "
+        "text may include backend-specific expressive markup."
+    )
+    backend = os.environ.get("TTS_BACKEND", "openai").lower()
+    has_custom_url = bool(os.environ.get("TTS_URL"))
+
+    if backend == "mimo" and has_custom_url:
+        return (
+            f"{base} Current backend (mimo-v2-tts) recognizes "
+            "<style>arbitrary natural-language description</style> prefix "
+            "(emotion/dialect/role/singing/free combinations), and full-width "
+            "paren inline cues like （笑）/（咳嗽）/（叹气）/（停顿） for sound events."
+        )
+    if has_custom_url:
+        return f"{base} Current backend is OpenAI-compatible /audio/speech (plain text, no markup)."
+    return f"{base} Current backend is edge-tts (plain text, no markup)."
 
 
 @server.list_tools()
@@ -58,11 +80,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="tg_send_text",
-            description=(
-                "Send a plain text message to the user's Telegram. "
-                "Use for proactive/out-of-band notifications (e.g. from terminal CC "
-                "or scheduled tasks). Normal TG conversation replies happen automatically."
-            ),
+            description="Send a plain text message to the user's Telegram.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -115,15 +133,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="tg_send_voice",
-            description=(
-                "Synthesize text to speech and send as a TG voice message. "
-                "text may include backend-specific expressive markup. "
-                "Facts about current backend (mimo-v2-tts): it recognizes "
-                "<style>arbitrary natural-language description</style> prefix for style "
-                "(emotion/dialect/role/singing/free combinations), and full-width "
-                "paren inline cues like （笑）/（咳嗽）/（叹气）/（停顿） for sound events. "
-                "Other backends may differ; consult their docs."
-            ),
+            description=_voice_description(),
             inputSchema={
                 "type": "object",
                 "properties": {
