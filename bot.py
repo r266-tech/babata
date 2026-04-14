@@ -5,6 +5,7 @@ Bot only does what CC physically cannot: TG transport, media conversion, UI feed
 """
 
 import html
+import json
 import logging
 import os
 import re
@@ -12,6 +13,9 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+load_dotenv(override=True)  # Must run before importing media (which reads env at import time)
+
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -24,9 +28,7 @@ from telegram.ext import (
 
 from bridge import bridge
 from cc import CC
-from media import image_to_base64, transcribe_voice
-
-load_dotenv(override=True)
+from media import image_to_base64, transcribe_voice, understand_video
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_USER = int(os.environ.get("ALLOWED_USER_ID", "0"))
@@ -36,8 +38,27 @@ log = logging.getLogger("cc-tg")
 
 cc = CC()
 
+# User preferences persisted across restarts
+_STATE_PATH = Path.home() / ".cc-tg-state.json"
+
+
+def _load_state() -> dict:
+    try:
+        return json.loads(_STATE_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _save_state() -> None:
+    try:
+        _STATE_PATH.write_text(json.dumps(_state))
+    except Exception:
+        pass
+
+
+_state = _load_state()
 # Tool display mode: 0=hidden, 1=show then delete, 2=show and keep
-_verbose = 1
+_verbose = _state.get("verbose", 1)
 
 # ── Formatting (physical: TG requires HTML, max 4096 chars) ──────────
 
@@ -198,6 +219,34 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _process(update, ctx, caption, images=images)
 
 
+async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed(update):
+        return
+    video = update.message.video or update.message.video_note
+    if not video:
+        return
+
+    file = await ctx.bot.get_file(video.file_id)
+    path = Path(f"/tmp/video_{video.file_id}.mp4")
+    await file.download_to_drive(path)
+
+    caption = update.message.caption or ""
+    summary = await understand_video(path, caption)
+    path.unlink(missing_ok=True)
+
+    if not summary:
+        await update.message.reply_text(
+            "Video understanding unavailable. Set VIDEO_API_URL or keep video <10MB."
+        )
+        return
+
+    user_text = caption or "我发了一段视频给你。"
+    await _process(
+        update, ctx,
+        f"{user_text}\n\n[Video summary (mimo-v2-omni)]: {summary}",
+    )
+
+
 async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
         return
@@ -220,6 +269,8 @@ async def on_verbose_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     await query.answer()
     global _verbose
     _verbose = int((query.data or "verbose:1").split(":")[1])
+    _state["verbose"] = _verbose
+    _save_state()
     labels = {0: "hidden", 1: "flash", 2: "keep"}
     await query.edit_message_text(f"Tool display: {labels[_verbose]}")
 
@@ -361,6 +412,9 @@ async def _process(
 
 async def _post_init(app: Application) -> None:
     await bridge.start()
+    # Default context so terminal CC (no TG message yet) can push to user's TG
+    if ALLOWED_USER:
+        bridge.set_context(app.bot, ALLOWED_USER, None)
     await app.bot.set_my_commands([
         ("new", "Start a fresh session"),
         ("verbose", "Tool display: 0=hidden 1=flash 2=keep"),
@@ -378,6 +432,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, on_video))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
 
     log.info("Bot starting (user: %s)", ALLOWED_USER)
