@@ -212,12 +212,13 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     path = Path(f"/tmp/voice_{voice.file_id}.ogg")
     await file.download_to_drive(path)
 
-    text = await transcribe_voice(path)
-    path.unlink(missing_ok=True)
-
-    if not text:
-        await update.message.reply_text("Could not transcribe voice.")
+    try:
+        text = await transcribe_voice(path)
+    except Exception as e:
+        await update.message.reply_text(f"\u274c 转录失败: {e}")
         return
+    finally:
+        path.unlink(missing_ok=True)
 
     await update.message.reply_text(f"\U0001f3a4 {text}")
     await _process(update, ctx, text)
@@ -362,8 +363,8 @@ async def _process(
     # React: eyes = processing
     await _react(msg, "\U0001f440")
 
-    # Status message: one line per tool call with arg preview.
-    status = await msg.reply_text("\u23f3") if _verbose > 0 else None
+    # Status message: lazy-created on first tool call, one line per tool.
+    status = None
     entries: list[str] = []
     last_edit = 0.0
 
@@ -372,12 +373,16 @@ async def _process(
         tool_input: dict | None,
         text_chunk: str | None,
     ) -> None:
-        nonlocal last_edit
-        if not tool_name:
+        nonlocal last_edit, status
+        if not tool_name or _verbose == 0:
             return
         entries.append(_fmt_tool(tool_name, tool_input or {}))
 
-        if not status:
+        body = "\n".join(entries[-30:])[:_MAX_TG]
+
+        if status is None:
+            status = await msg.reply_text(body)
+            last_edit = time.monotonic()
             return
 
         now = time.monotonic()
@@ -385,9 +390,8 @@ async def _process(
             return
         last_edit = now
 
-        body = "\n".join(entries[-30:])
         try:
-            await status.edit_text(body[:_MAX_TG])
+            await status.edit_text(body)
         except Exception:
             pass
         try:
@@ -402,12 +406,21 @@ async def _process(
         await _react(msg, "\U0001f44e")
         if status:
             await status.edit_text(f"Error: {e}")
+        else:
+            await msg.reply_text(f"Error: {e}")
         return
 
     # Clean up status: delete if flash (1), keep if 2, absent if 0
     if status and _verbose == 1:
         try:
             await status.delete()
+        except Exception:
+            pass
+
+    # Surface any session-resume note loud
+    if resp.resume_note:
+        try:
+            await msg.reply_text(resp.resume_note)
         except Exception:
             pass
 

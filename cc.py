@@ -1,6 +1,7 @@
 """Thin wrapper around Claude Code SDK. One session, streaming."""
 
 import asyncio
+import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -20,9 +21,90 @@ log = logging.getLogger(__name__)
 
 StreamCB = Callable[[str | None, dict | None, str | None], Coroutine[Any, Any, None]]
 
-# Path to our MCP server script
 _MCP_SCRIPT = str(Path(__file__).parent / "tg_mcp.py")
 _VENV_PYTHON = str(Path(__file__).parent / ".venv" / "bin" / "python")
+
+_STATE_FILE = Path.home() / "cc-workspace/state/cc-tg-session.json"
+_TG_SOURCE_PROMPT = "Source: Telegram."
+_CC_PROJECTS = Path.home() / ".claude/projects/-Users-admin"
+
+# Tunables. These are storage / token-budget params, not "importance judgments" —
+# CC still decides meaning from the data we expose. Kept explicit so a future
+# reader sees the cost model instead of magic numbers.
+_MAX_RECENT_SIDS = 200          # ring buffer of past session_ids (~1y at 5/day, ~15KB state file)
+_RESUME_INJECT_PAIRS = 3        # last N user+assistant pairs to inject on resume failure
+_RESUME_INJECT_CHARS = 300      # per-turn char cap (3 pairs × 300 × 2 ≈ 1.8KB, fits any system_prompt)
+
+
+def _load_state() -> dict:
+    try:
+        return json.loads(_STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    try:
+        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _STATE_FILE.write_text(json.dumps(state))
+    except Exception as e:
+        log.warning("Failed to persist session state: %s", e)
+
+
+def _record_sid(sid: str | None) -> None:
+    state = _load_state()
+    state["session_id"] = sid
+    if sid:
+        hist = [s for s in state.get("recent_sids", []) if s != sid]
+        hist.insert(0, sid)
+        state["recent_sids"] = hist[:_MAX_RECENT_SIDS]
+    _save_state(state)
+
+
+def _extract_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        return " ".join(parts).strip()
+    return ""
+
+
+def _recent_turns_summary() -> str:
+    """Take the most recent cc-tg session (tracked in state.recent_sids) and
+    extract last _RESUME_INJECT_PAIRS user+assistant pairs. Returns '' if state
+    empty or no session file usable."""
+    sids = _load_state().get("recent_sids") or []
+    for sid in sids:
+        target = _CC_PROJECTS / f"{sid}.jsonl"
+        if not target.is_file():
+            continue
+        turns: list[tuple[str, str]] = []
+        try:
+            for line in target.read_text().splitlines():
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                msg = d.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                text = _extract_text(msg.get("content"))
+                if text:
+                    turns.append((role, text))
+        except Exception:
+            continue
+        if not turns:
+            continue
+        recent = turns[-(2 * _RESUME_INJECT_PAIRS):]
+        lines = [f"{'V' if r == 'user' else 'CC'}: {t[:_RESUME_INJECT_CHARS]}"
+                 for r, t in recent]
+        return "会话从 TG 历史归档恢复, 最近几轮:\n" + "\n".join(lines)
+    return ""
 
 
 @dataclass
@@ -31,16 +113,18 @@ class Response:
     session_id: str
     cost: float
     tools: list[str] = field(default_factory=list)
+    resume_note: str | None = None  # populated when SDK resume failed + we recovered
 
 
 class CC:
     """Single-session Claude Code interface."""
 
     def __init__(self) -> None:
-        self._session_id: str | None = None
+        self._session_id: str | None = _load_state().get("session_id")
 
     def reset(self) -> None:
         self._session_id = None
+        _record_sid(None)
 
     async def query(
         self,
@@ -54,7 +138,7 @@ class CC:
             cwd=str(Path.home()),
             cli_path=os.environ.get("CLAUDE_CLI_PATH"),
             include_partial_messages=on_stream is not None,
-            system_prompt="Source: Telegram.",
+            system_prompt=_TG_SOURCE_PROMPT,
             setting_sources=["user"],  # 读 ~/.claude/{settings.json, CLAUDE.md, skills/} - 统一身份跨终端/TG/cron
             mcp_servers={
                 "tg": {
@@ -70,12 +154,21 @@ class CC:
         try:
             return await self._run(opts, prompt, images, on_stream)
         except Exception as e:
-            if self._session_id:
-                log.warning("Session resume failed (%s), starting fresh", e)
-                self._session_id = None
-                opts.resume = None
-                return await self._run(opts, prompt, images, on_stream)
-            raise
+            if not self._session_id:
+                raise
+            log.warning("Session resume failed (%s), injecting recent history", e)
+            self._session_id = None
+            _record_sid(None)
+            opts.resume = None
+            ctx = _recent_turns_summary()
+            if ctx:
+                opts.system_prompt = f"{_TG_SOURCE_PROMPT}\n\n{ctx}"
+                note = f"⚠️ 会话重置 ({type(e).__name__}), 已从归档注入最近 {_RESUME_INJECT_PAIRS} 轮"
+            else:
+                note = f"⚠️ 会话重置 ({type(e).__name__}), 历史归档也没找到"
+            resp = await self._run(opts, prompt, images, on_stream)
+            resp.resume_note = note
+            return resp
 
     async def _run(
         self,
@@ -159,5 +252,6 @@ class CC:
 
         if sid:
             self._session_id = sid
+            _record_sid(sid)
 
         return Response(content=content, session_id=sid or "", cost=cost, tools=tools_seen)

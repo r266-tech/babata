@@ -51,7 +51,7 @@ Create a launchd plist at `~/Library/LaunchAgents/com.cc-tg.plist` with:
 - ProgramArguments: path to `.venv/bin/python` and `bot.py`
 - WorkingDirectory: this project's path
 - KeepAlive: true
-- PATH must include the directory containing `claude`, `ffmpeg`, `whisper-cli`
+- PATH must include the directory containing `claude`, `ffmpeg`
 
 Then: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cc-tg.plist`
 
@@ -64,7 +64,7 @@ TG message → bot.py (transport) → cc.py (SDK) → your terminal's Claude Cod
                                       ↕ unix socket
                               bridge.py (renders buttons in TG, returns user choice)
 
-media.py: voice → whisper-cli → text, image → base64
+media.py: voice → MiMo-v2-Omni STT → text, image → base64
 ```
 
 ## Files
@@ -78,11 +78,10 @@ media.py: voice → whisper-cli → text, image → base64
 | media.py | 71 | Voice transcription, image base64 (physical: CC can't receive OGG) |
 
 ## Voice Requirements (optional)
-- `ffmpeg` — converts TG voice (OGG) to WAV
-- `whisper-cli` (whisper.cpp) — local speech-to-text
-- Model file at `~/.cache/whisper-cpp/ggml-base.bin`
+- `ffmpeg` — converts TG voice (OGG) to 16kHz mono WAV
+- `VIDEO_API_URL` + `VIDEO_API_KEY` in `.env` — MiMo-v2-Omni endpoint (same as video understanding)
 
-Without these, text and image still work. Voice messages will fail gracefully.
+Without these, text and image still work. Voice messages fail loud (reply 转录失败: <reason>) — no silent fallback.
 
 ## Commands
 - `/new` — reset session
