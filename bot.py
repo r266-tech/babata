@@ -57,12 +57,46 @@ def _save_state() -> None:
 
 
 _state = _load_state()
-# Tool display: show ephemeral status listing tools used (auto-deleted on completion).
-_verbose = bool(_state.get("verbose", 1))
+# Tool display mode: 0=hidden, 1=show then delete, 2=show and keep
+_verbose = int(_state.get("verbose", 1))
 
 # ── Formatting (physical: TG requires HTML, max 4096 chars) ──────────
 
 _MAX_TG = 4000
+
+_TOOL_EMOJI = {
+    "Bash": "\U0001f4bb",           # 💻 terminal
+    "Read": "\U0001f4d6",           # 📖 book
+    "Write": "\u270d\ufe0f",        # ✍️ writing hand
+    "Edit": "\U0001f527",           # 🔧 patch
+    "MultiEdit": "\U0001f527",      # 🔧
+    "Glob": "\U0001f4c2",           # 📂 file match
+    "Grep": "\U0001f50d",           # 🔍 content search
+    "WebFetch": "\U0001f4c4",       # 📄 page fetch
+    "WebSearch": "\U0001f310",      # 🌐 web search
+    "Task": "\U0001f500",           # 🔀 delegate
+    "TodoWrite": "\u2705",          # ✅
+    "NotebookEdit": "\U0001f4d3",   # 📓
+    "Skill": "\U0001f4da",          # 📚 skill library
+    "ToolSearch": "\U0001f9f0",     # 🧰 toolbox
+}
+
+def _fmt_tool(name: str, inp: dict) -> str:
+    if name.startswith("mcp__"):
+        parts = name.split("__", 2)
+        display = f"{parts[1]}/{parts[2]}" if len(parts) >= 3 else name
+        emoji = "\U0001f9e9"  # 🧩 MCP plugin
+    else:
+        display = name
+        emoji = _TOOL_EMOJI.get(name, "\U0001f527")
+    # First non-empty string value — dict is insertion-ordered, SDK emits schema order.
+    preview = next((str(v) for v in inp.values() if isinstance(v, str) and v), "")
+    preview = preview.replace("\n", " ").strip()
+    if not preview:
+        return f"{emoji} {display}"
+    if len(preview) > 40:
+        preview = preview[:40] + "..."
+    return f'{emoji} {display}: "{preview}"'
 
 
 def _to_html(md: str) -> str:
@@ -149,11 +183,12 @@ async def cmd_verbose(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
         return
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    labels = {0: "hidden", 1: "flash", 2: "keep"}
     buttons = [[
         InlineKeyboardButton(
-            f"{'> ' if _verbose == v else ''}{'on' if v else 'off'}",
-            callback_data=f"verbose:{1 if v else 0}",
-        ) for v in (True, False)
+            f"{'> ' if _verbose == i else ''}{v}",
+            callback_data=f"verbose:{i}",
+        ) for i, v in labels.items()
     ]]
     await update.message.reply_text(
         "Tool display:", reply_markup=InlineKeyboardMarkup(buttons),
@@ -256,10 +291,11 @@ async def on_verbose_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     query = update.callback_query
     await query.answer()
     global _verbose
-    _verbose = (query.data or "verbose:1").endswith(":1")
-    _state["verbose"] = 1 if _verbose else 0
+    _verbose = int((query.data or "verbose:1").split(":")[1])
+    _state["verbose"] = _verbose
     _save_state()
-    await query.edit_message_text(f"Tool display: {'on' if _verbose else 'off'}")
+    labels = {0: "hidden", 1: "flash", 2: "keep"}
+    await query.edit_message_text(f"Tool display: {labels[_verbose]}")
 
 
 async def on_button_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -326,17 +362,20 @@ async def _process(
     # React: eyes = processing
     await _react(msg, "\U0001f440")
 
-    # Ephemeral status message listing tool names as CC uses them.
-    status = await msg.reply_text("\u23f3") if _verbose else None
-    tools: list[str] = []
+    # Status message: one line per tool call with arg preview.
+    status = await msg.reply_text("\u23f3") if _verbose > 0 else None
+    entries: list[str] = []
     last_edit = 0.0
 
-    async def _on_stream(tool_name: str | None, text_chunk: str | None) -> None:
+    async def _on_stream(
+        tool_name: str | None,
+        tool_input: dict | None,
+        text_chunk: str | None,
+    ) -> None:
         nonlocal last_edit
         if not tool_name:
             return
-        if tool_name not in tools:
-            tools.append(tool_name)
+        entries.append(_fmt_tool(tool_name, tool_input or {}))
 
         if not status:
             return
@@ -346,8 +385,9 @@ async def _process(
             return
         last_edit = now
 
+        body = "\n".join(entries[-30:])
         try:
-            await status.edit_text(" \u2192 ".join(tools))
+            await status.edit_text(body[:_MAX_TG])
         except Exception:
             pass
         try:
@@ -364,7 +404,8 @@ async def _process(
             await status.edit_text(f"Error: {e}")
         return
 
-    if status:
+    # Clean up status: delete if flash (1), keep if 2, absent if 0
+    if status and _verbose == 1:
         try:
             await status.delete()
         except Exception:
@@ -401,7 +442,7 @@ async def _post_init(app: Application) -> None:
         bridge.set_context(app.bot, ALLOWED_USER, None)
     await app.bot.set_my_commands([
         ("new", "Start a fresh session"),
-        ("verbose", "Tool display: on/off"),
+        ("verbose", "Tool display: 0=hidden 1=flash 2=keep"),
     ])
 
 

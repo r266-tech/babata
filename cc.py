@@ -18,7 +18,7 @@ from claude_agent_sdk import (
 
 log = logging.getLogger(__name__)
 
-StreamCB = Callable[[str | None, str | None], Coroutine[Any, Any, None]]
+StreamCB = Callable[[str | None, dict | None, str | None], Coroutine[Any, Any, None]]
 
 # Path to our MCP server script
 _MCP_SCRIPT = str(Path(__file__).parent / "tg_mcp.py")
@@ -122,11 +122,12 @@ class CC:
                     for block in getattr(msg, "content", []) or []:
                         if isinstance(block, ToolUseBlock):
                             name = getattr(block, "name", "")
+                            inp = getattr(block, "input", {}) or {}
                             if name and name not in tools_seen:
                                 tools_seen.append(name)
-                            await on_stream(name, None)
+                            await on_stream(name, inp, None)
                         elif isinstance(block, TextBlock):
-                            await on_stream(None, block.text)
+                            await on_stream(None, None, block.text)
         finally:
             await client.disconnect()
 
