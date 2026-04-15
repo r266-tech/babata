@@ -21,13 +21,47 @@ _STT_MODEL = os.environ.get("STT_MODEL", "mimo-v2-omni")
 _STT_PROMPT = os.environ.get("STT_PROMPT", "转录这段语音, 只输出文本, 不要解释。")
 
 
-async def transcribe_voice(ogg_path: Path) -> str:
-    """OGG voice → text via MiMo omni. Fail loud — raises with reason, no fallback."""
+async def _stt_wav(wav_path: Path) -> str:
+    """POST a WAV file to MiMo Omni, return the transcription. Fail loud."""
     api_url = os.environ.get("MIMO_API_URL")
     api_key = os.environ.get("MIMO_API_KEY")
     if not api_url or not api_key:
         raise RuntimeError("STT 未配置: 需要 MIMO_API_URL + MIMO_API_KEY")
 
+    audio_b64 = base64.b64encode(wav_path.read_bytes()).decode()
+    import httpx
+    headers = {
+        "Content-Type": "application/json",
+        "api-key": api_key,
+        "Authorization": f"Bearer {api_key}",
+    }
+    body = {
+        "model": _STT_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": _STT_PROMPT},
+                {"type": "input_audio",
+                 "input_audio": {"data": audio_b64, "format": "wav"}},
+            ],
+        }],
+        "max_tokens": 2048,
+    }
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"{api_url.rstrip('/')}/chat/completions",
+            json=body, headers=headers,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"MiMo STT HTTP {r.status_code}: {r.text[:200]}")
+        content = r.json()["choices"][0]["message"].get("content", "").strip()
+        if not content:
+            raise RuntimeError("MiMo 返回空转录")
+        return content
+
+
+async def transcribe_voice(ogg_path: Path) -> str:
+    """TG OGG voice → text via ffmpeg + MiMo. Fail loud, no fallback."""
     wav_path = ogg_path.with_suffix(".wav")
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -39,38 +73,45 @@ async def transcribe_voice(ogg_path: Path) -> str:
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
         if proc.returncode != 0 or not wav_path.exists():
             raise RuntimeError(f"ffmpeg 转码失败: {stderr.decode()[:200]}")
+        return await _stt_wav(wav_path)
+    finally:
+        wav_path.unlink(missing_ok=True)
 
-        audio_b64 = base64.b64encode(wav_path.read_bytes()).decode()
 
-        import httpx
-        headers = {
-            "Content-Type": "application/json",
-            "api-key": api_key,
-            "Authorization": f"Bearer {api_key}",
-        }
-        body = {
-            "model": _STT_MODEL,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _STT_PROMPT},
-                    {"type": "input_audio",
-                     "input_audio": {"data": audio_b64, "format": "wav"}},
-                ],
-            }],
-            "max_tokens": 2048,
-        }
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(
-                f"{api_url.rstrip('/')}/chat/completions",
-                json=body, headers=headers,
-            )
-            if r.status_code != 200:
-                raise RuntimeError(f"MiMo STT HTTP {r.status_code}: {r.text[:200]}")
-            content = r.json()["choices"][0]["message"].get("content", "").strip()
-            if not content:
-                raise RuntimeError("MiMo 返回空转录")
-            return content
+def silk_to_wav(silk_path: Path, sample_rate: int = 24000) -> Path:
+    """Decode WeChat SILK v3 voice → WAV file next to the input.
+
+    Requires `pilk` (pip install pilk). WeChat voice is always 24kHz mono s16le
+    after SILK decode; we wrap the raw PCM in a WAV container so STT can ingest.
+    """
+    try:
+        import pilk
+    except ImportError as e:
+        raise RuntimeError("SILK 解码缺依赖: .venv/bin/pip install pilk") from e
+    import wave
+
+    pcm_path = silk_path.with_suffix(".pcm")
+    wav_path = silk_path.with_suffix(".wav")
+    try:
+        pilk.decode(str(silk_path), str(pcm_path), pcm_rate=sample_rate)
+        if not pcm_path.exists():
+            raise RuntimeError("pilk decode 未生成 PCM")
+        pcm = pcm_path.read_bytes()
+        with wave.open(str(wav_path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)  # 16-bit
+            w.setframerate(sample_rate)
+            w.writeframes(pcm)
+    finally:
+        pcm_path.unlink(missing_ok=True)
+    return wav_path
+
+
+async def transcribe_silk(silk_path: Path) -> str:
+    """WeChat SILK voice → text."""
+    wav_path = silk_to_wav(silk_path)
+    try:
+        return await _stt_wav(wav_path)
     finally:
         wav_path.unlink(missing_ok=True)
 

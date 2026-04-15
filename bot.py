@@ -27,7 +27,7 @@ from telegram.ext import (
 )
 
 from bridge import bridge
-from cc import CC
+from cc import CC, VENV_PYTHON
 from media import image_to_base64, transcribe_voice, understand_video
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -36,7 +36,18 @@ ALLOWED_USER = int(os.environ.get("ALLOWED_USER_ID", "0"))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 log = logging.getLogger("babata")
 
-cc = CC()
+_TG_MCP_SCRIPT = str(Path(__file__).parent / "tg_mcp.py")
+
+cc = CC(
+    state_file=Path.home() / "cc-workspace/state/babata-session.json",
+    source_prompt="Source: Telegram.",
+    mcp_servers={
+        "tg": {
+            "command": VENV_PYTHON,
+            "args": [_TG_MCP_SCRIPT],
+        },
+    },
+)
 
 # User preferences persisted across restarts
 _STATE_PATH = Path.home() / "cc-workspace" / "state" / "babata-state.json"

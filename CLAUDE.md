@@ -1,6 +1,6 @@
 # babata (CC 个人助手 — 通讯层)
 
-babata = CC 个人助手. 以 Claude Code 为内核, 围绕其构建记忆层 / skill 进化机制 / 通讯层. 本 repo 是**通讯层**部分, 第一渠道 TG (working), 下一个微信 (效仿 openclaw 有微信插件). 物理分工: 壳只做 CC 做不到的事 (格式转换 / UI / 渠道接入), 不替 CC 做决定.
+babata = CC 个人助手. 以 Claude Code 为内核, 围绕其构建记忆层 / skill 进化机制 / 通讯层. 本 repo 是**通讯层**部分, 两个独立渠道: TG (bot.py) + 微信 (weixin_bot.py). 两 channel 各自持有独立 CC session, 独立 MCP tool surface, 独立 bridge socket. 物理分工: 壳只做 CC 做不到的事 (格式转换 / UI / 渠道接入), 不替 CC 做决定.
 
 ## Philosophy
 
@@ -55,27 +55,68 @@ Create a launchd plist at `~/Library/LaunchAgents/com.babata.plist` with:
 
 Then: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.babata.plist`
 
+## WeChat Setup (optional — independent channel from TG)
+
+微信走腾讯官方 iLink bot 协议 (MIT, 官方支持), 扫码授权后拿 bot token 长轮询.
+
+### 1. Install Dependencies (if not already)
+`pilk` 解微信 SILK 语音, `qrcode` 终端渲 ASCII QR:
+```
+.venv/bin/pip install pilk qrcode
+```
+
+### 2. First-time Login
+```
+.venv/bin/python weixin_bot.py
+```
+- 终端打 ASCII QR → 用微信扫码确认授权
+- 扫码的微信号自动进 allowFrom (后续只有这个账号能给 bot 发消息触发 CC)
+- Token 存 `~/.babata/weixin/accounts/`, 重启自动复用
+- 再加一个微信号: `.venv/bin/python weixin_bot.py --login`
+
+### 3. Bot 出现在哪
+扫码后, 授权的微信里会有一个叫「微信 ClawBot」的对话 (腾讯后台默认名字, 可登 iLink 后台改名/头像). 发消息给它 = 触发 CC.
+
+### 4. Persistent (optional, macOS)
+类似 TG, 新建一个 `com.babata.weixin.plist`, `ProgramArguments` 指向 `weixin_bot.py`. TG 和微信是两个独立进程, 各自管自己的 state.
+
 ## Architecture
 
-```
-TG message → bot.py (transport) → cc.py (SDK) → your terminal's Claude Code CLI
-                                      ↕
-                              tg_mcp.py (stdio MCP server, gives CC TG capabilities)
-                                      ↕ unix socket
-                              bridge.py (renders buttons in TG, returns user choice)
+两 channel 独立跑, 各自持有 CC SDK 实例 + MCP server + bridge socket:
 
-media.py: voice → MiMo-v2-Omni STT → text, image → base64
+```
+TG message    → bot.py         → cc.py ──┐
+                  ↕                      │
+                tg_mcp.py (stdio)        ├── spawns Claude Code subprocess
+                  ↕ /tmp/babata-bridge.sock  │   (shares ~/.claude/ settings + skills)
+                bridge.py                │
+                                         │
+WeChat inbound → weixin_bot.py → cc.py ──┘
+  (getUpdates)    ↕
+                weixin_mcp.py (stdio)
+                  ↕ /tmp/babata-weixin-bridge.sock
+                weixin_bridge.py
+                  ↕
+                weixin_ilink.py (HTTP + AES-128-ECB + QR login)
+
+media.py: TG OGG → ffmpeg + MiMo STT, WeChat SILK → pilk + MiMo STT, images → base64
+weixin_account.py: ~/.babata/weixin/ (tokens, sync_buf, contextTokens, allowFrom)
 ```
 
 ## Files
 
-| File | Lines | Why it exists |
-|------|-------|---------------|
-| bot.py | 368 | TG transport, formatting (physical: TG HTML + 4096 limit), reactions, auth |
-| cc.py | 165 | CC SDK call, session resume, streaming |
-| bridge.py | 124 | Unix socket bridge between MCP process and TG bot (physical: cross-process) |
-| tg_mcp.py | 89 | MCP tool `tg_send_buttons` — capability for CC, not instructions |
-| media.py | 71 | Voice transcription, image base64 (physical: CC can't receive OGG) |
+| File | Why it exists |
+|------|---------------|
+| bot.py | TG transport, formatting (TG HTML + 4096 limit), reactions, auth |
+| cc.py | CC SDK wrapper, channel-agnostic (takes state_file + source_prompt + mcp_servers) |
+| bridge.py | Unix socket bridge for TG MCP actions (`/tmp/babata-bridge.sock`) |
+| tg_mcp.py | MCP tools `tg_send_*` — capability for CC, not instructions |
+| media.py | OGG/SILK voice transcription, image base64, video understanding |
+| weixin_bot.py | WeChat long-poll main loop, inbound decode, stream coalesce, auth |
+| weixin_ilink.py | iLink bot protocol (5 HTTP endpoints + QR login + CDN AES) |
+| weixin_bridge.py | Unix socket bridge for WeChat MCP actions (`/tmp/babata-weixin-bridge.sock`) |
+| weixin_mcp.py | MCP tools `wx_send_*` |
+| weixin_account.py | Per-account persistence (token/sync/contextTokens/allowFrom) |
 
 ## Voice Requirements (optional)
 - `ffmpeg` — converts TG voice (OGG) to 16kHz mono WAV

@@ -1,4 +1,9 @@
-"""Thin wrapper around Claude Code SDK. One session, streaming."""
+"""Thin wrapper around Claude Code SDK. One session, streaming.
+
+Channel-agnostic: caller passes the channel-specific state file, source prompt,
+and MCP servers. This lets the TG bot and the WeChat bot share one class while
+keeping session state and exposed tools isolated per channel.
+"""
 
 import asyncio
 import json
@@ -30,11 +35,8 @@ StreamCB = Callable[
     Coroutine[Any, Any, None],
 ]
 
-_MCP_SCRIPT = str(Path(__file__).parent / "tg_mcp.py")
-_VENV_PYTHON = str(Path(__file__).parent / ".venv" / "bin" / "python")
+VENV_PYTHON = str(Path(__file__).parent / ".venv" / "bin" / "python")
 
-_STATE_FILE = Path.home() / "cc-workspace/state/babata-session.json"
-_TG_SOURCE_PROMPT = "Source: Telegram."
 _CC_PROJECTS = Path.home() / ".claude/projects/-Users-admin"
 
 
@@ -59,31 +61,6 @@ async def _always_allow(
 _MAX_RECENT_SIDS = 200          # ring buffer of past session_ids (~1y at 5/day, ~15KB state file)
 _RESUME_INJECT_PAIRS = 3        # last N user+assistant pairs to inject on resume failure
 _RESUME_INJECT_CHARS = 300      # per-turn char cap (3 pairs × 300 × 2 ≈ 1.8KB, fits any system_prompt)
-
-
-def _load_state() -> dict:
-    try:
-        return json.loads(_STATE_FILE.read_text())
-    except Exception:
-        return {}
-
-
-def _save_state(state: dict) -> None:
-    try:
-        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _STATE_FILE.write_text(json.dumps(state))
-    except Exception as e:
-        log.warning("Failed to persist session state: %s", e)
-
-
-def _record_sid(sid: str | None) -> None:
-    state = _load_state()
-    state["session_id"] = sid
-    if sid:
-        hist = [s for s in state.get("recent_sids", []) if s != sid]
-        hist.insert(0, sid)
-        state["recent_sids"] = hist[:_MAX_RECENT_SIDS]
-    _save_state(state)
 
 
 def _extract_text(content: Any) -> str:
@@ -114,42 +91,6 @@ def _tool_result_text(content: Any) -> str:
     return str(content)
 
 
-def _recent_turns_summary() -> str:
-    """Take the most recent babata session (tracked in state.recent_sids) and
-    extract last _RESUME_INJECT_PAIRS user+assistant pairs. Returns '' if state
-    empty or no session file usable."""
-    sids = _load_state().get("recent_sids") or []
-    for sid in sids:
-        target = _CC_PROJECTS / f"{sid}.jsonl"
-        if not target.is_file():
-            continue
-        turns: list[tuple[str, str]] = []
-        try:
-            for line in target.read_text().splitlines():
-                try:
-                    d = json.loads(line)
-                except Exception:
-                    continue
-                msg = d.get("message")
-                if not isinstance(msg, dict):
-                    continue
-                role = msg.get("role")
-                if role not in ("user", "assistant"):
-                    continue
-                text = _extract_text(msg.get("content"))
-                if text:
-                    turns.append((role, text))
-        except Exception:
-            continue
-        if not turns:
-            continue
-        recent = turns[-(2 * _RESUME_INJECT_PAIRS):]
-        lines = [f"{'V' if r == 'user' else 'CC'}: {t[:_RESUME_INJECT_CHARS]}"
-                 for r, t in recent]
-        return "会话从 TG 历史归档恢复, 最近几轮:\n" + "\n".join(lines)
-    return ""
-
-
 @dataclass
 class Response:
     content: str
@@ -160,14 +101,88 @@ class Response:
 
 
 class CC:
-    """Single-session Claude Code interface."""
+    """Single-session Claude Code interface for one channel.
 
-    def __init__(self) -> None:
-        self._session_id: str | None = _load_state().get("session_id")
+    Each channel (TG / WeChat) owns its own CC instance: separate state file,
+    separate resume history, separate MCP tool surface.
+    """
+
+    def __init__(
+        self,
+        *,
+        state_file: Path,
+        source_prompt: str,
+        mcp_servers: dict[str, Any] | None = None,
+    ) -> None:
+        self._state_file = state_file
+        self._source_prompt = source_prompt
+        self._mcp_servers = mcp_servers or {}
+        self._session_id: str | None = self._load_state().get("session_id")
+
+    # ── state persistence (per-channel) ──────────────────────────────
+
+    def _load_state(self) -> dict:
+        try:
+            return json.loads(self._state_file.read_text())
+        except Exception:
+            return {}
+
+    def _save_state(self, state: dict) -> None:
+        try:
+            self._state_file.parent.mkdir(parents=True, exist_ok=True)
+            self._state_file.write_text(json.dumps(state))
+        except Exception as e:
+            log.warning("Failed to persist session state: %s", e)
+
+    def _record_sid(self, sid: str | None) -> None:
+        state = self._load_state()
+        state["session_id"] = sid
+        if sid:
+            hist = [s for s in state.get("recent_sids", []) if s != sid]
+            hist.insert(0, sid)
+            state["recent_sids"] = hist[:_MAX_RECENT_SIDS]
+        self._save_state(state)
+
+    def _recent_turns_summary(self) -> str:
+        """Take the most recent session (tracked in state.recent_sids) and
+        extract last _RESUME_INJECT_PAIRS user+assistant pairs. Returns '' if
+        state empty or no session file usable."""
+        sids = self._load_state().get("recent_sids") or []
+        for sid in sids:
+            target = _CC_PROJECTS / f"{sid}.jsonl"
+            if not target.is_file():
+                continue
+            turns: list[tuple[str, str]] = []
+            try:
+                for line in target.read_text().splitlines():
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+                    msg = d.get("message")
+                    if not isinstance(msg, dict):
+                        continue
+                    role = msg.get("role")
+                    if role not in ("user", "assistant"):
+                        continue
+                    text = _extract_text(msg.get("content"))
+                    if text:
+                        turns.append((role, text))
+            except Exception:
+                continue
+            if not turns:
+                continue
+            recent = turns[-(2 * _RESUME_INJECT_PAIRS):]
+            lines = [f"{'V' if r == 'user' else 'CC'}: {t[:_RESUME_INJECT_CHARS]}"
+                     for r, t in recent]
+            return "会话从历史归档恢复, 最近几轮:\n" + "\n".join(lines)
+        return ""
 
     def reset(self) -> None:
         self._session_id = None
-        _record_sid(None)
+        self._record_sid(None)
+
+    # ── query ────────────────────────────────────────────────────────
 
     async def query(
         self,
@@ -182,14 +197,9 @@ class CC:
             cwd=str(Path.home()),
             cli_path=os.environ.get("CLAUDE_CLI_PATH"),
             include_partial_messages=on_stream is not None,
-            system_prompt=_TG_SOURCE_PROMPT,
+            system_prompt=self._source_prompt,
             setting_sources=["user"],  # 读 ~/.claude/{settings.json, CLAUDE.md, skills/} - 统一身份跨终端/TG/cron
-            mcp_servers={
-                "tg": {
-                    "command": _VENV_PYTHON,
-                    "args": [_MCP_SCRIPT],
-                },
-            },
+            mcp_servers=self._mcp_servers,
         )
 
         if self._session_id:
@@ -202,11 +212,11 @@ class CC:
                 raise
             log.warning("Session resume failed (%s), injecting recent history", e)
             self._session_id = None
-            _record_sid(None)
+            self._record_sid(None)
             opts.resume = None
-            ctx = _recent_turns_summary()
+            ctx = self._recent_turns_summary()
             if ctx:
-                opts.system_prompt = f"{_TG_SOURCE_PROMPT}\n\n{ctx}"
+                opts.system_prompt = f"{self._source_prompt}\n\n{ctx}"
                 note = f"⚠️ 会话重置 ({type(e).__name__}), 已从归档注入最近 {_RESUME_INJECT_PAIRS} 轮"
             else:
                 note = f"⚠️ 会话重置 ({type(e).__name__}), 历史归档也没找到"
@@ -306,6 +316,6 @@ class CC:
 
         if sid:
             self._session_id = sid
-            _record_sid(sid)
+            self._record_sid(sid)
 
         return Response(content=content, session_id=sid or "", cost=cost, tools=tools_seen)
