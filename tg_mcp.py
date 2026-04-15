@@ -16,7 +16,7 @@ from mcp.types import TextContent, Tool
 
 log = logging.getLogger(__name__)
 
-SOCKET_PATH = "/tmp/cc-tg-bridge.sock"
+SOCKET_PATH = "/tmp/babata-bridge.sock"
 
 server = Server("tg")
 

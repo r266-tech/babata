@@ -33,7 +33,7 @@ StreamCB = Callable[
 _MCP_SCRIPT = str(Path(__file__).parent / "tg_mcp.py")
 _VENV_PYTHON = str(Path(__file__).parent / ".venv" / "bin" / "python")
 
-_STATE_FILE = Path.home() / "cc-workspace/state/cc-tg-session.json"
+_STATE_FILE = Path.home() / "cc-workspace/state/babata-session.json"
 _TG_SOURCE_PROMPT = "Source: Telegram."
 _CC_PROJECTS = Path.home() / ".claude/projects/-Users-admin"
 
@@ -115,7 +115,7 @@ def _tool_result_text(content: Any) -> str:
 
 
 def _recent_turns_summary() -> str:
-    """Take the most recent cc-tg session (tracked in state.recent_sids) and
+    """Take the most recent babata session (tracked in state.recent_sids) and
     extract last _RESUME_INJECT_PAIRS user+assistant pairs. Returns '' if state
     empty or no session file usable."""
     sids = _load_state().get("recent_sids") or []

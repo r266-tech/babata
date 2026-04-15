@@ -34,12 +34,12 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_USER = int(os.environ.get("ALLOWED_USER_ID", "0"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
-log = logging.getLogger("cc-tg")
+log = logging.getLogger("babata")
 
 cc = CC()
 
 # User preferences persisted across restarts
-_STATE_PATH = Path.home() / "cc-workspace" / "state" / "cc-tg-state.json"
+_STATE_PATH = Path.home() / "cc-workspace" / "state" / "babata-state.json"
 
 
 def _load_state() -> dict:

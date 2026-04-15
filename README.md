@@ -1,13 +1,13 @@
-# cc-tg
+# babata
 
-Telegram as a thin wire for Claude Code. 817 lines. Same CC, different channel.
+CC 个人助手 — 通讯层 (TG + 微信). Claude Code 是内核, babata 是围绕它构建的记忆/skill/通讯壳. 当前 repo 是通讯层 (TG 优先, 微信 WIP).
 
 ## Quick Start
 
 Give this repo to your Claude Code:
 
 ```
-clone https://github.com/anthropics/cc-tg and set it up for me
+clone https://github.com/r266-tech/babata and set it up for me
 ```
 
 CC will read `CLAUDE.md` and walk you through everything.

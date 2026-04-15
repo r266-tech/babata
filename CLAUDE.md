@@ -1,6 +1,6 @@
-# CC TG Bot
+# babata (CC 个人助手 — 通讯层)
 
-Thin Telegram transport for Claude Code. 817 lines, 5 files. TG is just a wire — same CC, different channel.
+babata = CC 个人助手. 以 Claude Code 为内核, 围绕其构建记忆层 / skill 进化机制 / 通讯层. 本 repo 是**通讯层**部分, 第一渠道 TG (working), 下一个微信 (效仿 openclaw 有微信插件). 物理分工: 壳只做 CC 做不到的事 (格式转换 / UI / 渠道接入), 不替 CC 做决定.
 
 ## Philosophy
 
@@ -47,13 +47,13 @@ python -m venv .venv && .venv/bin/pip install python-telegram-bot python-dotenv 
 ```
 
 ### 6. Persistent (optional, macOS)
-Create a launchd plist at `~/Library/LaunchAgents/com.cc-tg.plist` with:
+Create a launchd plist at `~/Library/LaunchAgents/com.babata.plist` with:
 - ProgramArguments: path to `.venv/bin/python` and `bot.py`
 - WorkingDirectory: this project's path
 - KeepAlive: true
 - PATH must include the directory containing `claude`, `ffmpeg`
 
-Then: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cc-tg.plist`
+Then: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.babata.plist`
 
 ## Architecture
 
