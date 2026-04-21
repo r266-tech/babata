@@ -11,9 +11,15 @@ import logging
 import os
 from pathlib import Path
 
+from constants import BRIDGE_SOCKET, PROJECT
+
 log = logging.getLogger(__name__)
 
-SOCKET_PATH = "/tmp/babata-bridge.sock"
+# Per-instance socket path. bot.py pre-sets BABATA_BRIDGE_SOCKET before
+# importing this module (plus constants.py reads it), and the tg_mcp
+# subprocess inherits the same via mcp_servers["tg"]["env"]. Fall back to
+# the derived namespace-based default when not pre-set (terminal CC case).
+SOCKET_PATH = BRIDGE_SOCKET
 
 
 class TGBridge:
@@ -68,6 +74,7 @@ class TGBridge:
                 "send_location": self._handle_send_location,
                 "send_voice": self._handle_send_voice,
                 "send_video": self._handle_send_video,
+                "send_page": self._handle_send_page,
             }
             handler = handlers.get(action)
             if not handler:
@@ -227,6 +234,37 @@ class TGBridge:
                 reply_to_message_id=self.reply_to,
             )
         await self._respond(writer, f"Video sent: {path.name}")
+
+    async def _handle_send_page(self, request, writer) -> None:
+        """Publish markdown as a Telegraph page and push URL to TG.
+
+        The TG client auto-generates an Instant View preview for telegra.ph
+        URLs, giving full rich-layout rendering (h3/h4 / real lists /
+        blockquote / highlighted code) that TG inline HTML can't.
+        """
+        from telegraph import create_page
+
+        title = request.get("title", PROJECT) or PROJECT
+        content_md = request["content_md"]
+        caption = (request.get("caption") or "").strip()
+
+        # Telegraph HTTP calls are sync; offload to executor so the event loop
+        # keeps serving other bridge actions and TG updates.
+        loop = asyncio.get_event_loop()
+        try:
+            url = await loop.run_in_executor(None, create_page, title, content_md)
+        except Exception as e:
+            await self._respond(writer, f"Error creating page: {e}")
+            return
+
+        # Compose TG message. Keep it short — the Instant View card will carry
+        # the full content; a long caption would just compete with the preview.
+        text = f"{caption}\n\n{url}" if caption else url
+        await self.bot.send_message(
+            chat_id=self.chat_id, text=text,
+            reply_to_message_id=self.reply_to,
+        )
+        await self._respond(writer, f"Page: {url}")
 
     async def _handle_send_voice(self, request, writer) -> None:
         from media import text_to_voice

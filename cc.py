@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Coroutine
@@ -23,21 +24,203 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
-from claude_agent_sdk.types import PermissionResultAllow, ToolPermissionContext
+from claude_agent_sdk.types import (
+    PermissionResultAllow,
+    StreamEvent,
+    ToolPermissionContext,
+)
 
 log = logging.getLogger(__name__)
 
 # (tool_name, tool_input, text_chunk, tool_result) — exactly one non-None.
 # tool_result = {"is_error": bool, "text": str} so bot can surface real errors
 # instead of letting CC hallucinate high-level reasons ("系统限制了...").
+# text_chunk is a *delta* (not a snapshot) — bot must accumulate it. Driven by
+# StreamEvent.content_block_delta.text_delta (CLI --include-partial-messages).
 StreamCB = Callable[
     [str | None, dict | None, str | None, dict | None],
     Coroutine[Any, Any, None],
 ]
 
+from constants import (
+    HOOKS_DIR as _HOOKS_DIR,
+    INSTANCE,
+    INSTANCE_LABELS,
+    PROJECT,
+    SKILL_HOOKS_DIR as _SKILL_HOOKS_DIR,
+    STATE_DIR as _STATE_DIR,
+)
+
 VENV_PYTHON = str(Path(__file__).parent / ".venv" / "bin" / "python")
 
 _CC_PROJECTS = Path.home() / ".claude/projects/-Users-admin"
+
+# _STATE_DIR: all channel state files land here. Cross-channel session picker
+# scans this dir, so it's a soft coupling — cc.py isn't fully channel-agnostic
+# anymore, but /resume can list sessions from every channel (TG / WX / terminal
+# bb) in one picker, sorted by bucket mtime with non-local channels tagged.
+# _SKILL_HOOKS_DIR: SDK doesn't fire settings.json SessionEnd/SessionStart
+# hooks (those are CC CLI-native), so babata fires them explicitly on
+# reset()/init so TG/WeChat channels can plug into skill evolution (v3).
+
+
+def _channel_label_from_state_file(fp: Path) -> str:
+    """state file name → human-readable channel label for the /resume picker.
+
+    Labels come from constants.INSTANCE_LABELS (single source of truth). Stem
+    format: ``<PROJECT>-session.json`` for main instance, ``<PROJECT>-<inst>-
+    session.json`` for named instances. Unknown instances fall back to the raw
+    suffix so new bots show up with a best-effort label instead of disappearing.
+
+    Example (PROJECT=babata, default map):
+        babata-session.json        → "巴巴塔"
+        babata-vvv-session.json    → "巴巴塔2"
+        babata-vvvv-session.json   → "巴巴塔3"
+        babata-weixin-session.json → "wx"
+    """
+    core = fp.stem  # strip .json
+    if core.endswith("-session"):
+        core = core[: -len("-session")]
+    if core == PROJECT:
+        return INSTANCE_LABELS.get("", PROJECT)
+    if core.startswith(f"{PROJECT}-"):
+        suffix = core[len(f"{PROJECT}-"):]
+        return INSTANCE_LABELS.get(suffix, suffix)
+    return core or "unknown"
+
+
+_SUMMARY_CACHE_FILE = _STATE_DIR / "session-summaries.json"
+
+# Summary subprocess 的专用 CWD. claude -p 会按 CWD 把 session jsonl 写到对应
+# bucket (~/.claude/projects/<cwd-hash>/); 如果 summary 进程跟 babata 日常用同
+# 一个 CWD ($HOME), 它产生的 "用一句话总结..." session 会污染主 bucket, 反过来
+# 被 list_recent_sessions 扫到显示给 V. 用专用 sandbox CWD 物理隔离.
+_SUMMARY_SANDBOX = _STATE_DIR / "summary-sandbox"
+
+
+def _load_summary_cache() -> dict:
+    try:
+        return json.loads(_SUMMARY_CACHE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _save_summary_cache(cache: dict) -> None:
+    """原子写 (tmp + rename) 避免跟并发 generator 互踩."""
+    try:
+        _SUMMARY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _SUMMARY_CACHE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cache, ensure_ascii=False))
+        tmp.replace(_SUMMARY_CACHE_FILE)
+    except Exception as e:
+        log.warning("Failed to persist summary cache: %s", e)
+
+
+def _extract_session_text_for_summary(jsonl_path: Path, max_chars: int = 6000) -> str:
+    """把 session jsonl 里 user + assistant 真实文本拼成给 claude -p 总结的输入.
+
+    max_chars 控制上限, 避免长会话一次塞爆 (haiku 便宜但仍是成本). 优先拿开头
+    + 结尾 —— 开头锚定主题, 结尾反映当前状态. 中间大量 tool-call / context dump
+    对"一句话总结"没增量.
+    """
+    lines = []
+    try:
+        for raw in jsonl_path.read_text().splitlines():
+            try:
+                d = json.loads(raw)
+            except Exception:
+                continue
+            if d.get("type") not in ("user", "assistant"):
+                continue
+            msg = d.get("message")
+            if not isinstance(msg, dict):
+                continue
+            text = _extract_text(msg.get("content"))
+            if not text or _is_synthetic_user_text(text):
+                continue
+            role = d.get("type")
+            lines.append(f"[{role}] {text[:500]}")
+    except Exception:
+        return ""
+    if not lines:
+        return ""
+    joined = "\n".join(lines)
+    if len(joined) <= max_chars:
+        return joined
+    # 头 60% + 尾 40%
+    head_n = int(max_chars * 0.6)
+    tail_n = max_chars - head_n
+    return joined[:head_n] + "\n...[省略中段]...\n" + joined[-tail_n:]
+
+
+def _spawn_summary_generation(sid: str, source_mtime: float) -> None:
+    """Fire-and-forget: 后台线程跑 claude -p haiku 生成 session 一句话总结, 写缓存.
+
+    调用方不等结果 — 本次 /resume 仍用 first_user fallback, 下次 /resume 命中缓存.
+    Haiku 一句话总结典型 1-3 秒, 10 session 并发大约 3-5 秒写完缓存.
+    """
+    jsonl = _CC_PROJECTS / f"{sid}.jsonl"
+    if not jsonl.is_file():
+        return
+
+    def worker() -> None:
+        import subprocess
+        try:
+            text = _extract_session_text_for_summary(jsonl)
+            if not text:
+                return
+            prompt = (
+                "用一句话 (不超过 20 个中文字) 总结下面这段 CC session 的核心主题, "
+                "让用户一眼认出是哪个对话. 只输出一句话, 不加任何前缀 / 引号 / 解释.\n\n"
+                + text
+            )
+            cli = os.environ.get("CLAUDE_CLI_PATH") or "claude"
+            # Model 不写死, 跟随 ~/.claude/settings.json 全局默认 (babata 哲学:
+            # 模型会随 CC 升级, 代码里写死 'haiku' 将来可能指向弃用 tier).
+            # 若 V 觉得总结任务用 opus 太慢, 改 settings.json 或加 env override.
+            #
+            # CWD 用 _SUMMARY_SANDBOX 而不是 $HOME, 避免 subprocess session jsonl
+            # 污染主 bucket (2026-04-20 踩过的坑).
+            _SUMMARY_SANDBOX.mkdir(parents=True, exist_ok=True)
+            result = subprocess.run(
+                [cli, "-p", prompt,
+                 "--output-format", "text",
+                 "--permission-mode", "bypassPermissions"],
+                capture_output=True, text=True, timeout=60,
+                cwd=str(_SUMMARY_SANDBOX),
+            )
+            summary = (result.stdout or "").strip().strip('"').strip("「」")
+            if not summary or len(summary) > 60:
+                # haiku 偶尔抗命给长输出 / 空输出 — 丢弃不写缓存, 下次再试
+                return
+            cache = _load_summary_cache()
+            cache[sid] = {"summary": summary, "source_mtime": source_mtime}
+            _save_summary_cache(cache)
+        except Exception as e:
+            log.debug("summary gen failed for %s: %s", sid[:8], e)
+
+    import threading
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _scan_peer_sids() -> dict[str, list[str]]:
+    """扫 _STATE_DIR 所有 *-session.json, 返回 {sid: [channel_label, ...]}.
+
+    一个 sid 如果被多个 channel 的 recent_sids 收录 (例 V 从 TG /resume 了 bb 开的
+    session → 两个 state 都会有它), 列表里会有多个来源.
+    """
+    out: dict[str, list[str]] = {}
+    if not _STATE_DIR.is_dir():
+        return out
+    for fp in sorted(_STATE_DIR.glob("*-session.json")):
+        label = _channel_label_from_state_file(fp)
+        try:
+            data = json.loads(fp.read_text())
+        except Exception:
+            continue
+        for sid in data.get("recent_sids") or []:
+            out.setdefault(sid, []).append(label)
+    return out
 
 
 async def _always_allow(
@@ -61,6 +244,34 @@ async def _always_allow(
 _MAX_RECENT_SIDS = 200          # ring buffer of past session_ids (~1y at 5/day, ~15KB state file)
 _RESUME_INJECT_PAIRS = 3        # last N user+assistant pairs to inject on resume failure
 _RESUME_INJECT_CHARS = 300      # per-turn char cap (3 pairs × 300 × 2 ≈ 1.8KB, fits any system_prompt)
+
+
+# CC CLI writes synthetic `type:"user"` entries for its own housekeeping:
+#   <local-command-caveat>…</local-command-caveat>  — inserted before slash commands
+#   <command-name>/foo</command-name>                — the slash command itself
+#   <command-message>foo</command-message>           — plain-language label
+#   <command-args></command-args>                    — args after the slash
+#   <bash-input>…</bash-input>                       — CC's Bash tool calls
+#   <local-command-stdout>…                          — command captures
+# Any of these as the first "user" message of a session makes the /resume
+# preview useless. Match tag-prefixed content so V sees her real first prompt.
+_SYNTHETIC_USER_PREFIXES = (
+    "<local-command-",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<command-stdout>",
+    "<command-stderr>",
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+)
+
+
+def _is_synthetic_user_text(text: str) -> bool:
+    """True if `text` is CC-injected scaffolding rather than a V-authored turn."""
+    stripped = text.lstrip()
+    return stripped.startswith(_SYNTHETIC_USER_PREFIXES)
 
 
 def _extract_text(content: Any) -> str:
@@ -98,6 +309,15 @@ class Response:
     cost: float
     tools: list[str] = field(default_factory=list)
     resume_note: str | None = None  # populated when SDK resume failed + we recovered
+    # Model + token accounting, from ResultMessage.model_usage (first key = actual
+    # model CC used this turn). None when SDK didn't report (e.g. /new shortcut).
+    model: str | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
 
 
 class CC:
@@ -179,8 +399,273 @@ class CC:
         return ""
 
     def reset(self) -> None:
+        old_sid = self._session_id
+        if old_sid:
+            self._fire_hook(_SKILL_HOOKS_DIR, "session-end.sh", old_sid)
+            self._fire_hook(_HOOKS_DIR, "session-end.sh", old_sid)
         self._session_id = None
         self._record_sid(None)
+        # skill-evolve SessionStart: 处理 pending + surface 上次 evolve 给 V (空
+        # sid, 它不关心新 sid 是啥). babata-local session-start 不在这里 fire —
+        # 新 sid 要等下一次 query 的 ResultMessage 才拿得到, 见 _run().
+        self._fire_hook(_SKILL_HOOKS_DIR, "session-start.sh", "")
+
+    def list_recent_sessions(
+        self, limit: int = 10, channel_filter: list[str] | None = None,
+    ) -> list[dict]:
+        """Return recent sessions for `/resume` picker — 跨渠道可见.
+
+        channel_filter: 白名单 channel label 列表. None = 不过滤 (默认, 扫全部).
+        传 ['巴巴塔', '巴巴塔2', '巴巴塔3'] (见 constants.INSTANCE_LABELS) = 只列 TG 类 session.
+        'term' / 'oneshot' 是特殊 label = 所有 channel state 都没收录过的 orphan
+        session, 按 JSONL 的 entrypoint 字段细分:
+          - entrypoint=sdk-cli → 'oneshot' (claude -p 一次性, cron / 手敲 -p)
+          - 其他 (cli / claude-desktop / sdk-py orphan / 未知) → 'term' (交互或异常)
+        这样 /resume 里 "终端" 和 "一次性" 能分开, V 找 bb 交互 session 不再被
+        cron 一次性塞满列表.
+
+        行为变更 (2026-04-20): 从"扫本 channel state.recent_sids"改成"扫整个
+        _CC_PROJECTS bucket 的 *.jsonl 按 mtime 排序". 原因: V 的设计是多渠道
+        共享一个 CC 内核, TG / WX / 终端 bb 开的 session 应互相可见. 旧实现
+        依赖 per-channel state, bb/WX 开的 session TG 永远看不到.
+
+        每条结果附带 `channel` 字段 = 首个归属来源 (or "term" 表示没有 channel
+        state 收录过, 典型是 bb/原生 claude/cron 开的) 和 `is_own_channel`
+        标记, 供 UI 决定是否给非本渠道的 session 加 prefix 提示来源.
+
+        过滤: jsonl 文件丢失 / 首条真实 user 消息找不到 (纯 synthetic scaffolding)
+        的 session 跳过. CC CLI 的 synthetic user 消息见 _SYNTHETIC_USER_PREFIXES.
+        """
+        peer_map = _scan_peer_sids()
+        summary_cache = _load_summary_cache()
+        own_channel = _channel_label_from_state_file(self._state_file)
+        try:
+            files = sorted(
+                _CC_PROJECTS.glob("*.jsonl"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except Exception:
+            return []
+
+        out: list[dict] = []
+        for fp in files:
+            sid = fp.stem
+            first_user: str | None = None
+            entrypoint: str | None = None
+            try:
+                for line in fp.read_text().splitlines():
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+                    if d.get("type") != "user":
+                        continue
+                    msg = d.get("message")
+                    if not isinstance(msg, dict):
+                        continue
+                    text = _extract_text(msg.get("content"))
+                    if not text or _is_synthetic_user_text(text):
+                        continue
+                    first_user = text
+                    # entrypoint 在同一条 user record 上 (cli / sdk-py / sdk-cli /
+                    # claude-desktop). 用来区分 "终端交互" vs "一次性 -p".
+                    ep = d.get("entrypoint")
+                    if isinstance(ep, str):
+                        entrypoint = ep
+                    break
+            except Exception:
+                continue
+            if not first_user:
+                continue
+            try:
+                mtime = fp.stat().st_mtime
+            except Exception:
+                mtime = 0.0
+
+            # Summary cache: 按 jsonl mtime 失效. 命中用缓存, miss/过期后台生成
+            # + 本次 fallback first_user. 下次 /resume 就能看见总结.
+            cached = summary_cache.get(sid)
+            if cached and cached.get("source_mtime") == mtime:
+                preview = cached.get("summary") or first_user
+            else:
+                preview = first_user
+                _spawn_summary_generation(sid, mtime)
+
+            owners = peer_map.get(sid, [])
+            if owners:
+                channel_label = owners[0]
+            elif entrypoint == "sdk-cli":
+                # claude -p 一次性 (cron wrapper / 手敲 -p). 和 bb 交互拆开.
+                channel_label = "oneshot"
+            else:
+                # cli (bb / 原生 claude 交互) / claude-desktop / sdk-py orphan / 未知.
+                channel_label = "term"
+
+            # channel_filter 白名单过滤. 'term'/'oneshot' 匹配 "无 owner" 的 orphan.
+            if channel_filter is not None and channel_label not in channel_filter:
+                continue
+
+            is_own = own_channel in owners
+            out.append({
+                "sid": sid,
+                "first_user": first_user,
+                "preview": preview,      # summary (命中缓存) or first_user (fallback)
+                "mtime": mtime,
+                "is_current": sid == self._session_id,
+                "channel": channel_label,
+                "is_own_channel": is_own,
+            })
+            if len(out) >= limit:
+                break
+        return out
+
+    def resume(self, sid: str) -> bool:
+        """Switch active session to `sid`. False if JSONL missing.
+
+        Bumps the sid to the front of recent_sids (same rule as a fresh
+        ResultMessage would), so subsequent /status / /resume lists see it as
+        most-recent. Skill-evolve hooks: skipped (pointer switch inside an
+        ongoing channel, not a skill-tracked session boundary). Babata-local
+        hooks: fired — V wants /resume to also announce the new sid on TG.
+        """
+        if not (_CC_PROJECTS / f"{sid}.jsonl").is_file():
+            return False
+        old_sid = self._session_id
+        self._session_id = sid
+        self._record_sid(sid)
+        if old_sid != sid:
+            if old_sid:
+                self._fire_hook(_HOOKS_DIR, "session-end.sh", old_sid)
+            self._fire_hook(_HOOKS_DIR, "session-start.sh", sid)
+        return True
+
+    def get_recent_turns(
+        self,
+        sid: str,
+        pairs: int = 2,
+        char_cap: int = 400,
+    ) -> list[tuple[str, str]]:
+        """Return last `pairs` user+assistant messages from a session JSONL.
+
+        Filters CC CLI's synthetic user scaffolding (caveats, slash-command
+        blocks, bash wrappers — same rules as list_recent_sessions preview)
+        and assistant turns that contain only tool_use with no text. Each
+        text truncated to char_cap chars with ellipsis.
+
+        Returns up to 2 * pairs (role, text) entries in chronological order,
+        or empty list if sid has no JSONL or no meaningful turns. Used by
+        the bot's `/resume` button click to show V what she just resumed
+        into — selecting by 48-char first-user preview isn't enough to tell
+        two nearby threads apart.
+        """
+        fp = _CC_PROJECTS / f"{sid}.jsonl"
+        if not fp.is_file():
+            return []
+        collected: list[tuple[str, str]] = []
+        try:
+            for line in fp.read_text().splitlines():
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                msg = d.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                text = _extract_text(msg.get("content"))
+                if not text:
+                    continue
+                if role == "user" and _is_synthetic_user_text(text):
+                    continue
+                collected.append((role, text))
+        except Exception:
+            return []
+        tail = collected[-(2 * pairs):]
+        out: list[tuple[str, str]] = []
+        for role, text in tail:
+            if len(text) > char_cap:
+                text = text[:char_cap].rstrip() + "…"
+            out.append((role, text))
+        return out
+
+    def is_last_turn_orphan(self, sid: str | None = None) -> bool:
+        """True 当 session jsonl 最后一条真实 turn 是 user 且没有 assistant 回复.
+
+        典型场景: bot 在 cc.query 跑到一半被 SIGKILL (launchd 异常重启 / OOM /
+        硬崩), CC CLI 子进程来不及 flush assistant turn 就死了. user 消息 CC
+        一收到就写 jsonl, 所以 jsonl 里会留下孤儿 user turn.
+
+        过滤 synthetic scaffolding (caveats / slash-cmd blocks) —— 跟 /resume
+        picker 的判定逻辑一致. assistant 只要写过任何一条 (含纯 tool_use) 就不
+        算孤儿, 说明 CC 至少开始响应了.
+
+        用于 bot _post_init 上线通知: 孤儿 = 附加 ⚠️ 告警让 V 决定 /resume 或
+        /new. 不自动重试 (工具可能有副作用).
+        """
+        sid = sid or self._session_id
+        if not sid:
+            return False
+        fp = _CC_PROJECTS / f"{sid}.jsonl"
+        if not fp.is_file():
+            return False
+        last_role: str | None = None
+        try:
+            for line in fp.read_text().splitlines():
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                t = d.get("type")
+                if t not in ("user", "assistant"):
+                    continue
+                msg = d.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                if t == "user":
+                    text = _extract_text(msg.get("content"))
+                    if text and _is_synthetic_user_text(text):
+                        continue
+                    last_role = "user"
+                else:
+                    last_role = "assistant"
+        except Exception:
+            return False
+        return last_role == "user"
+
+    @staticmethod
+    def _fire_hook(hook_dir: Path, script: str, session_id: str) -> None:
+        """Fire a lifecycle hook asynchronously (non-blocking).
+
+        Two hook dirs in play (see constants): SKILL_HOOKS_DIR (V-private
+        skill-evolve) and HOOKS_DIR (repo-local babata hooks, e.g. push sid
+        to TG). Fire site picks which dir(s) to hit — skill-evolve has a
+        different "session-start" semantic (fired with empty sid, for pending
+        scan), so we don't auto-fire both on every event.
+        """
+        hook_path = hook_dir / script
+        if not hook_path.is_file():
+            return
+        # BABATA_INSTANCE_LABEL: 把当前 bot 的人话昵称 (巴巴塔 / 巴巴塔2 / ...) 暴
+        # 露给 hook 脚本, 省得 shell 层再 import constants 反查映射. skill-evolve
+        # hooks 不用这个 env 但多塞一个无害.
+        env = {
+            **os.environ,
+            "CLAUDE_SESSION_ID": session_id,
+            "BABATA_INSTANCE_LABEL": INSTANCE_LABELS.get(INSTANCE, INSTANCE or PROJECT),
+        }
+        try:
+            subprocess.Popen(
+                [str(hook_path)],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as e:
+            log.warning("hook %s/%s spawn failed: %s", hook_dir.name, script, e)
 
     # ── query ────────────────────────────────────────────────────────
 
@@ -190,6 +675,13 @@ class CC:
         images: list[dict[str, str]] | None = None,
         on_stream: StreamCB | None = None,
     ) -> Response:
+        # Channel-agnostic reset command. Any channel (TG/WX/future) whose
+        # transport layer doesn't have its own command dispatch still gets
+        # /new + /reset for free — and reset() fires the skill-evolve hooks.
+        if prompt.strip() in ("/new", "/reset") and not images:
+            self.reset()
+            return Response(content="会话已重置。", session_id="", cost=0.0)
+
         opts = ClaudeAgentOptions(
             max_turns=200,
             permission_mode="bypassPermissions",
@@ -211,6 +703,10 @@ class CC:
             if not self._session_id:
                 raise
             log.warning("Session resume failed (%s), injecting recent history", e)
+            # Resume failed → old sid is effectively ending (SDK will spawn a
+            # fresh one on retry). Fire session-end so TG gets closure; the new
+            # sid's session-start fires from _run's ResultMessage path.
+            self._fire_hook(_HOOKS_DIR, "session-end.sh", self._session_id)
             self._session_id = None
             self._record_sid(None)
             opts.resume = None
@@ -277,8 +773,17 @@ class CC:
                             if name and name not in tools_seen:
                                 tools_seen.append(name)
                             await on_stream(name, inp, None, None)
-                        elif isinstance(block, TextBlock):
-                            await on_stream(None, None, block.text, None)
+                        # TextBlock not streamed here — it's the *final* full
+                        # text, would duplicate what we already sent via
+                        # StreamEvent text deltas below.
+                elif isinstance(msg, StreamEvent):
+                    ev = msg.event or {}
+                    if ev.get("type") == "content_block_delta":
+                        delta = ev.get("delta") or {}
+                        if delta.get("type") == "text_delta":
+                            chunk = delta.get("text") or ""
+                            if chunk:
+                                await on_stream(None, None, chunk, None)
                 elif isinstance(msg, UserMessage):
                     for block in getattr(msg, "content", []) or []:
                         if isinstance(block, ToolResultBlock):
@@ -292,6 +797,10 @@ class CC:
         content = ""
         cost = 0.0
         sid = None
+        model: str | None = None
+        context_window: int | None = None
+        max_output_tokens: int | None = None
+        in_tok = out_tok = cache_r = cache_c = 0
 
         for msg in messages:
             if isinstance(msg, ResultMessage):
@@ -300,6 +809,19 @@ class CC:
                 result = getattr(msg, "result", None)
                 if result:
                     content = str(result).strip()
+                # model_usage shape: {"claude-opus-4-N[1m]": {inputTokens, outputTokens,
+                # cacheReadInputTokens, cacheCreationInputTokens, contextWindow,
+                # maxOutputTokens, ...}}. First key = the model CC actually ran.
+                mu = getattr(msg, "model_usage", None) or {}
+                if mu:
+                    model = next(iter(mu.keys()))
+                    stats = mu[model] or {}
+                    context_window = stats.get("contextWindow")
+                    max_output_tokens = stats.get("maxOutputTokens")
+                    in_tok = int(stats.get("inputTokens") or 0)
+                    out_tok = int(stats.get("outputTokens") or 0)
+                    cache_r = int(stats.get("cacheReadInputTokens") or 0)
+                    cache_c = int(stats.get("cacheCreationInputTokens") or 0)
                 break
 
         if not content:
@@ -312,10 +834,28 @@ class CC:
             content = "\n".join(parts).strip()
 
         if not content and tools_seen:
-            content = f"Done. Tools used: {', '.join(tools_seen)}"
+            content = "(done)"
 
         if sid:
+            # Detect session boundary: SDK starts a fresh sid on first turn,
+            # after /reset, or when resume failed and a new session was created
+            # implicitly. Fire babata session-start so TG sees the new sid.
+            # Skipped when sid is unchanged (same session continuing).
+            if sid != self._session_id:
+                self._fire_hook(_HOOKS_DIR, "session-start.sh", sid)
             self._session_id = sid
             self._record_sid(sid)
 
-        return Response(content=content, session_id=sid or "", cost=cost, tools=tools_seen)
+        return Response(
+            content=content,
+            session_id=sid or "",
+            cost=cost,
+            tools=tools_seen,
+            model=model,
+            context_window=context_window,
+            max_output_tokens=max_output_tokens,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            cache_read_tokens=cache_r,
+            cache_creation_tokens=cache_c,
+        )

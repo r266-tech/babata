@@ -6,6 +6,22 @@ babata = CC 个人助手. 以 Claude Code 为内核, 围绕其构建记忆层 / 
 
 Bot only does what CC physically cannot. Give CC capabilities, never tell it how to use them. Test: if AI were 100x smarter, would this line of code still need to exist? Yes → keep. No → delete.
 
+## 铁律: Self-modification 必须走 `scripts/self-ops.sh`
+
+bot 在自己运行时改写自己赖以存在的基础设施 (launchd service / claude binary / deps) → **self-destruct**: 命令跑一半 bot 被 SIGTERM / binary 被替换 / service 被 unload.
+
+### 禁止 vs 必须
+
+| 禁止 (self-destruct) | 必须 (detached helper) |
+|---|---|
+| `launchctl bootout gui/$UID/com.babata` | `scripts/self-ops.sh restart [<label>]` |
+| `launchctl kickstart -k gui/$UID/com.babata` (对自己) | `scripts/self-ops.sh restart` |
+| `claude install` / `claude update` | `scripts/self-ops.sh update-claude` |
+| `npm install/uninstall -g @anthropic-ai/claude-code` | 不允许 — auto-update.sh 已清 npm 回潮, 统一 native |
+| 手改 `~/.local/bin/claude` / plist 里 `CLAUDE_CLI_PATH` | 改完走 `scripts/self-ops.sh restart` |
+
+判据: **这条命令会改 `~/.local/bin/claude` / `~/.local/share/claude/` / `~/Library/LaunchAgents/com.babata*.plist` / bot `ProgramArguments` 指向的文件吗?** 会 → 走 helper. 不会 → 直接跑.
+
 ## Setup Guide (for CC helping a new user)
 
 When a user clones this repo and asks for help setting it up, follow these steps:
@@ -126,4 +142,7 @@ Without these, text and image still work. Voice messages fail loud (reply 转录
 
 ## Commands
 - `/new` — reset session
+- `/resume` — pick a recent session to continue (mirrors CC CLI `/resume`: inline buttons built from `recent_sids` + `~/.claude/projects/<cwd>/<sid>.jsonl`; click switches `cc._session_id` so the next query resumes)
+- `/status` — model / session / verbose
+- `/context` — forwards CC CLI `/context` output
 - `/verbose` — cycle tool display: 0=hidden / 1=flash / 2=keep

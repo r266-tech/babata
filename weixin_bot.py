@@ -27,12 +27,13 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+from constants import PROJECT, STATE_DIR
 from cc import CC, VENV_PYTHON
 from media import transcribe_silk, understand_video
 from weixin_account import (
-    add_allow_from, clear_stale_for_user, is_allowed, list_account_ids,
-    load_account, load_sync_buf, register_account, save_account,
-    save_sync_buf, set_context_token,
+    add_allow_from, clear_stale_for_user, get_context_token, is_allowed,
+    list_account_ids, load_account, load_allow_from, load_sync_buf,
+    register_account, save_account, save_sync_buf, set_context_token,
 )
 from weixin_bridge import bridge
 from weixin_ilink import (
@@ -42,14 +43,53 @@ from weixin_ilink import (
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
-log = logging.getLogger("babata.weixin")
+log = logging.getLogger(f"{PROJECT}.weixin")
+
+# ── Heartbeat (双 bot 互监控, 零 LLM 成本, 镜像 bot.py 同段) ──────────
+# 自己每 30s touch; 看主 TG bot 心跳, stale > 3 min 通过微信推 V (allowFrom[0]).
+_HEARTBEAT_DIR = Path.home() / "cc-workspace" / "state"
+_HEARTBEAT_ME = _HEARTBEAT_DIR / "babata-weixin-heartbeat"
+_HEARTBEAT_PEER = _HEARTBEAT_DIR / "babata-tg-heartbeat"
+_HEARTBEAT_STALE_S = 180
+_HEARTBEAT_INTERVAL_S = 30
+
+
+async def _heartbeat_loop(client: "WeixinClient", account_id: str) -> None:
+    _HEARTBEAT_DIR.mkdir(parents=True, exist_ok=True)
+    alerted = False
+    while True:
+        try:
+            _HEARTBEAT_ME.touch()
+            if _HEARTBEAT_PEER.exists():
+                age = time.time() - _HEARTBEAT_PEER.stat().st_mtime
+                if age > _HEARTBEAT_STALE_S and not alerted:
+                    allow = load_allow_from(account_id)
+                    target = allow[0] if allow else None
+                    if target:
+                        try:
+                            await client.send_message(
+                                target,
+                                [text_item(
+                                    f"⚠️ TG bot 心跳已 {int(age)}s 未更新 "
+                                    f"(阈值 {_HEARTBEAT_STALE_S}s)"
+                                )],
+                                context_token=get_context_token(account_id, target),
+                            )
+                            alerted = True
+                        except Exception as e:
+                            log.warning("heartbeat alert send failed: %s", e)
+                elif age <= 60:
+                    alerted = False
+        except Exception as e:
+            log.warning("heartbeat loop error: %s", e)
+        await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
 
 # ── CC instance (WeChat-scoped) ───────────────────────────────────────
 
 _WEIXIN_MCP_SCRIPT = str(Path(__file__).parent / "weixin_mcp.py")
 
 cc = CC(
-    state_file=Path.home() / "cc-workspace/state/babata-weixin-session.json",
+    state_file=STATE_DIR / f"{PROJECT}-weixin-session.json",
     source_prompt="Source: WeChat.",
     mcp_servers={
         "weixin": {
@@ -110,7 +150,7 @@ def chunk_text(text: str, limit: int = _MAX_WX) -> list[str]:
 
 # ── inbound media decode ─────────────────────────────────────────────
 
-_INBOUND_DIR = Path.home() / ".babata" / "weixin" / "media" / "inbound"
+_INBOUND_DIR = Path.home() / f".{PROJECT}" / "weixin" / "media" / "inbound"
 
 
 # Per-user typing_ticket cache. Mirrors plugin's config-cache.ts: cache the
@@ -194,9 +234,13 @@ async def _decode_item(
         except Exception as e:
             log.warning("image download failed: %s", e)
             return (f"[图片下载失败: {e}]", [])
+        mime = _sniff_image_mime(raw)
+        ext = "jpg" if mime == "image/jpeg" else mime.split("/")[-1]
+        img_path = _inbound_tmp(f".{ext}")
+        img_path.write_bytes(raw)
         return (
-            "",
-            [{"media_type": _sniff_image_mime(raw),
+            f"[图片: {img_path}]",
+            [{"media_type": mime,
               "data": base64.b64encode(raw).decode()}],
         )
 
@@ -249,14 +293,23 @@ def _describe_ref(ref: dict[str, Any] | None) -> str:
     return f"[引用 {label}: {title}]" if title else f"[引用了一条{label}]"
 
 
-# ── per-message dispatch ─────────────────────────────────────────────
+# ── per-user burst coalescing ────────────────────────────────────────
+# WeChat has no album grouping (unlike TG's media_group_id), so image +
+# caption arrive as separate msgs. Rule: image is a "comma" (wait for
+# follow-up), any non-image (text/voice/video/file) is a "period" (end of
+# burst). Non-image without a pending burst bypasses debounce entirely.
+_MESSAGE_DEBOUNCE_S = 3.0
+_pending: dict[tuple[str, str], dict[str, Any]] = {}
+# Single-flight across all users/accounts: concurrent CC queries would race
+# on the shared session resume (session_id written per query end).
+_cc_lock = asyncio.Lock()
 
-async def _process_inbound_msg(
+
+async def _enqueue_inbound_msg(
     client: WeixinClient, msg: dict[str, Any], account_id: str
 ) -> None:
     from_user = msg.get("from_user_id") or ""
     ctx_token = msg.get("context_token")
-    items = msg.get("item_list") or []
 
     if from_user and ctx_token:
         set_context_token(account_id, from_user, ctx_token)
@@ -265,7 +318,83 @@ async def _process_inbound_msg(
         log.warning("ignoring unauthorized from=%s", from_user)
         return
 
-    # Decode all items
+    items = msg.get("item_list") or []
+    has_image = any(item.get("type") == ITEM_IMAGE for item in items)
+
+    key = (account_id, from_user)
+    pending = _pending.get(key)
+
+    if pending is not None:
+        # Inside an active burst: always append, and if this is non-image
+        # (text/voice/video/file) mark the burst complete for immediate flush.
+        pending["msgs"].append(msg)
+        pending["last_arrival_at"] = time.monotonic()
+        if not has_image:
+            pending["non_image_arrived"].set()
+        return
+
+    if not has_image:
+        # No pending burst + no image — straight to CC, no debounce.
+        async with _cc_lock:
+            try:
+                await _process_combined_msgs(client, [msg], account_id)
+            except Exception:
+                log.exception("msg processing crashed")
+        return
+
+    # Image starts a burst that waits for the follow-up.
+    pending = {
+        "msgs": [msg],
+        "client": client,
+        "account_id": account_id,
+        "last_arrival_at": time.monotonic(),
+        "non_image_arrived": asyncio.Event(),
+    }
+    _pending[key] = pending
+    asyncio.create_task(_flush_pending(key))
+
+
+async def _flush_pending(key: tuple[str, str]) -> None:
+    pending = _pending.get(key)
+    if pending is None:
+        return
+    event = pending["non_image_arrived"]
+    while True:
+        try:
+            await asyncio.wait_for(event.wait(), timeout=_MESSAGE_DEBOUNCE_S)
+            break  # non-image arrived → burst complete
+        except asyncio.TimeoutError:
+            pending = _pending.get(key)
+            if pending is None:
+                return
+            if time.monotonic() - pending["last_arrival_at"] < _MESSAGE_DEBOUNCE_S:
+                continue  # more images still arriving, keep waiting
+            break  # true quiet window — flush what we have
+
+    _pending.pop(key, None)
+    async with _cc_lock:
+        try:
+            await _process_combined_msgs(
+                pending["client"], pending["msgs"], pending["account_id"],
+            )
+        except Exception:
+            log.exception("combined msg processing crashed")
+
+
+async def _process_combined_msgs(
+    client: WeixinClient, msgs: list[dict[str, Any]], account_id: str
+) -> None:
+    if not msgs:
+        return
+
+    from_user = msgs[0].get("from_user_id") or ""
+    ctx_token = next(
+        (m.get("context_token") for m in reversed(msgs) if m.get("context_token")),
+        None,
+    )
+    items = [item for m in msgs for item in (m.get("item_list") or [])]
+
+    # Decode all items (across the whole burst)
     texts: list[str] = []
     images: list[dict[str, str]] = []
     ref_note = ""
@@ -284,7 +413,7 @@ async def _process_inbound_msg(
         log.info("inbound from %s: no decodable content", from_user)
         return
 
-    log.info("← %s: %s (imgs=%d)", from_user, combined[:80], len(images))
+    log.info("← %s: %s (imgs=%d, msgs=%d)", from_user, combined[:80], len(images), len(msgs))
 
     # Hand bridge the current conversation context so wx_mcp actions can reply
     bridge.set_context(client, from_user, ctx_token, account_id)
@@ -335,7 +464,7 @@ async def _process_inbound_msg(
 
     try:
         resp = await cc.query(
-            combined or "(仅图片)", images=images or None, on_stream=_on_stream,
+            combined or "[图片]", images=images or None, on_stream=_on_stream,
         )
     except Exception as e:
         log.exception("CC query failed")
@@ -443,6 +572,8 @@ async def _run_account(account_id: str) -> None:
     )
     log.info("long-poll starting for %s", account_id)
 
+    asyncio.create_task(_heartbeat_loop(client, account_id))
+
     buf = load_sync_buf(account_id)
     fails = 0
 
@@ -473,9 +604,9 @@ async def _run_account(account_id: str) -> None:
             if m.get("message_type") != 1:  # USER only (ignore BOT echoes)
                 continue
             try:
-                await _process_inbound_msg(client, m, account_id)
+                await _enqueue_inbound_msg(client, m, account_id)
             except Exception:
-                log.exception("msg processing crashed")
+                log.exception("msg enqueue crashed")
 
 
 async def main() -> None:
