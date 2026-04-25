@@ -765,22 +765,19 @@ class ChannelWorker:
                         resp.session_id[:8] if resp.session_id else "new",
                     )
             finally:
-                # 消息状态: 先 fire 👌 给本 turn 的 active_marks, 再 reset
-                # (reset 会清空 active_marks; 必须在 reset 前抢先 fire).
-                if self._active_marks:
-                    done_marks = self._active_marks
-                    self._active_marks = []
-                    self._schedule_marks(done_marks, "👌")
+                # SDK 在 V 快速连发时会把多条 V msg batch 成一个 turn (实测:
+                # bot 一个 reply 同时回 m1+m2). 这种情况下 turn_end 处理了所有
+                # 累积 V msg, 给它们都 fire 👌. per-msg case (理想 SDK 行为)
+                # pending=[], active=[m_current] — 也兼容.
+                all_done = self._active_marks + self._pending_marks
+                self._active_marks = []
+                self._pending_marks = []
+                if all_done:
+                    self._schedule_marks(all_done, "👌")
                 self._reset_turn_state(exit_inflight=True)
-                # P1.4: if a submit landed during this turn (latest_payload diverged
-                # from the turn's original anchor), another SDK turn is on the way —
-                # promote latest_payload as the anchor so its text/tool events have
-                # somewhere to render.
-                if (
-                    self._latest_payload is not None
-                    and self._latest_payload is not anchor_at_start
-                ):
-                    self._begin_turn(self._latest_payload)
+                # 不再 P1.4 promote — batch 模式 SDK 不会发第二个 turn_end,
+                # promote 会让 in_flight 永久卡死. per-msg 模式后续 SDK ev
+                # 通过 _handle_text_delta 的 _latest_payload fallback 渲染.
 
     async def _handle_error(self, exc: Exception) -> None:
         log.error("CC stream failed: %s", exc)

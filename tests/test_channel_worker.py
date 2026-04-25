@@ -191,12 +191,11 @@ def test_channel_worker_single_turn_clean_reset(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
-def test_channel_worker_back_to_back_submits_promote_next_anchor(monkeypatch, tmp_path):
-    """P1.4 + per-message reply anchor:
-    - SDK turn anchor (P1.4): turn_end 后 promote latest_payload 给下个 SDK turn.
-    - V-visible reply anchor: 每条 V 消息进来立刻把流式输出切到自己的 reply.
-      所以 first_msg 的 SDK turn 期间, 如果第二条 V msg 已经 submit, 后续的
-      text_delta 会 reply 到 second_msg (V 视角"活跃消息"), 不是 first_msg.
+def test_channel_worker_back_to_back_submits_finalize_in_one_turn_end(monkeypatch, tmp_path):
+    """SDK 在 V 快速连发时把多条 V msg batch 成一个 turn_end (实测).
+    新行为: turn_end 时一并 finalize 所有累积 (active + pending) marks,
+    不再 P1.4 promote 给下个 SDK turn (会卡死 in_flight).
+    Per-message reply anchor 仍生效 — text_delta 流到最新 V msg 的 reply.
     """
     async def run():
         reset_bot_globals(monkeypatch, tmp_path)
@@ -218,7 +217,7 @@ def test_channel_worker_back_to_back_submits_promote_next_anchor(monkeypatch, tm
 
         assert session.submitted == [("hello", None), ("more", None)]
         assert bot._in_flight == 1
-        # SDK turn anchor 仍是 msg1 (P1.4: 等 turn_end 才 promote)
+        # SDK turn anchor 仍是 msg1 (_begin_turn 时设的, 后续 submit 不动)
         assert worker._turn_anchor == 1
         assert bot.bridge.contexts[-1][2] == 2
 
@@ -251,29 +250,14 @@ def test_channel_worker_back_to_back_submits_promote_next_anchor(monkeypatch, tm
                 ),
             )
         )
-        # P1.4: turn_end 后 promote, _turn_anchor 切到 msg2
-        await wait_for(lambda: worker._turn_anchor == 2)
-        assert bot._in_flight == 1  # next turn pre-armed
+        # 新行为: turn_end 后 in_flight=0, 不 promote 第二个 turn
+        await wait_for(lambda: bot._in_flight == 0)
         # final response 编辑当前 _text_message (= second_msg.replies[0])
         assert live_text.edits[-1][0] == "<b>done</b>"
         assert tool_status.deleted is True
         assert bot._session_turns == 1
         assert bot._last_used_tokens == 8
-
-        # 第二个 SDK turn: _begin_turn 重置 _text_message=None, 又新开 reply 到 msg2
-        session.queue.put_nowait(Event(kind="text_delta", chunk="ok"))
-        await wait_for(lambda: len(second_msg.replies) == 3)
-        assert second_msg.replies[2].text == "ok"
-
-        # Finalize the second turn cleanly
-        session.queue.put_nowait(
-            Event(
-                kind="turn_end",
-                response=Response(content="ok2", session_id="sid-2", cost=0.05),
-            )
-        )
-        await wait_for(lambda: bot._in_flight == 0)
-        assert bot._session_turns == 2
+        assert worker._turn_active is False
 
         await worker.stop()
         assert session.closed
@@ -314,8 +298,9 @@ def test_channel_worker_reaction_eye_then_ok_single_turn(monkeypatch, tmp_path):
 
 
 def test_channel_worker_reaction_back_to_back_messages(monkeypatch, tmp_path):
-    """V 连发两条: 第一条 👀 立即, 第二条等. turn_end 后第一条 👌 + 第二条 👀
-    自动接管 (P1.4 promote 路径). 下个 turn_end → 第二条 👌."""
+    """V 连发两条 (SDK batch 一个 turn): 第一条 👀 立即, 第二条等 turn_end.
+    新行为: turn_end 一并 fire 👌 给 [m1, m2] (因为 SDK batch 处理了两条).
+    避免 m2 卡 👀 永远 (旧 P1.4 promote 路径会卡死)."""
     async def run():
         reset_bot_globals(monkeypatch, tmp_path)
         session = FakeSession()
@@ -335,12 +320,12 @@ def test_channel_worker_reaction_back_to_back_messages(monkeypatch, tmp_path):
         await worker.submit(
             bot.Payload(update=FakeUpdate(m2, chat), ctx=ctx, text="second")
         )
-        # 第二条还没被 picked_up — 当前 turn 还在跑第一条
+        # m2 没立即 fire 👀 (等 turn_end 跟 m1 一起 fire 👌)
         await asyncio.sleep(0.05)
         assert (42, 2, "👀") not in ctx.bot.reactions
         assert (42, 2, "👌") not in ctx.bot.reactions
 
-        # turn 1 结束 → 第一条 👌, P1.4 promote 第二条 → 👀
+        # turn_end → m1 + m2 都 fire 👌 (SDK batch finalize)
         session.queue.put_nowait(
             Event(
                 kind="turn_end",
@@ -348,24 +333,10 @@ def test_channel_worker_reaction_back_to_back_messages(monkeypatch, tmp_path):
             )
         )
         await wait_for(lambda: (42, 1, "👌") in ctx.bot.reactions)
-        await wait_for(lambda: (42, 2, "👀") in ctx.bot.reactions)
-        assert (42, 2, "👌") not in ctx.bot.reactions
-
-        # turn 2 结束 → 第二条 👌
-        session.queue.put_nowait(
-            Event(
-                kind="turn_end",
-                response=Response(content="ok2", session_id="sid-2", cost=0.01),
-            )
-        )
         await wait_for(lambda: (42, 2, "👌") in ctx.bot.reactions)
 
-        # 顺序: 1👀 → 2 等待 → 1👌 → 2👀 → 2👌
-        # (👀 调度 vs 👌 调度顺序在 turn_end finally 里是先 👌 后 _begin_turn 触发 👀)
-        assert ctx.bot.reactions[0] == (42, 1, "👀")
-        assert ctx.bot.reactions[-1] == (42, 2, "👌")
-        assert (42, 1, "👌") in ctx.bot.reactions
-        assert (42, 2, "👀") in ctx.bot.reactions
+        # in_flight 必须回 0 — promote 路径删掉, 不再卡死
+        await wait_for(lambda: bot._in_flight == 0)
 
         await worker.stop()
 
