@@ -91,12 +91,18 @@ def fix_orphans(root: Path, orphans: list[dict[str, Any]]) -> list[dict[str, Any
 
 
 def run(root: Path, *, json_mode: bool, fix_mode: bool, strict_mode: bool) -> int:
+    # NOTE: missing_frontmatter intentionally absent — V's vault has meta docs
+    # (e.g. babata_philosophy.md) that begin with `# title` and skip YAML
+    # frontmatter on purpose. The retrieval signal that matters is the
+    # MEMORY.md hook (covered by orphan / broken_link checks), not the file's
+    # own frontmatter. Other frontmatter-derived checks (missing_field /
+    # invalid_type / empty_body) still run, but only for files that DO have
+    # frontmatter — the absence itself isn't a signal worth reporting.
     issues: dict[str, list[dict[str, Any]]] = {
         "broken_link": [],
         "orphan": [],
         "duplicate_index": [],
         "cross_dir_link": [],
-        "missing_frontmatter": [],
         "missing_field": [],
         "invalid_type": [],
         "empty_body": [],
@@ -169,12 +175,8 @@ def run(root: Path, *, json_mode: bool, fix_mode: bool, strict_mode: bool) -> in
         lines = text.splitlines()
 
         fm = parse_frontmatter(text)
-        if fm is None:
-            issues["missing_frontmatter"].append(
-                {"file": p.name, "line": 0, "detail": "missing or malformed YAML frontmatter"}
-            )
-        else:
-            # Check 4: required fields + type enum
+        if fm is not None:
+            # Check 4: required fields + type enum (only when frontmatter exists)
             for field in ("name", "description", "type"):
                 if field not in fm or not fm[field]:
                     issues["missing_field"].append(
@@ -191,6 +193,7 @@ def run(root: Path, *, json_mode: bool, fix_mode: bool, strict_mode: bool) -> in
                 issues["empty_body"].append(
                     {"file": p.name, "line": 0, "detail": "no content after frontmatter"}
                 )
+        # else: meta doc without frontmatter — only universal length check below applies.
 
         # Check 5: excessive length
         if len(lines) > LENGTH_THRESHOLD_LINES:
