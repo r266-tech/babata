@@ -14,7 +14,12 @@ import shutil
 import signal
 import subprocess
 import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -42,7 +47,7 @@ from telegram.ext import (
 )
 
 from bridge import bridge
-from cc import CC, VENV_PYTHON
+from cc import Event, LiveSession, Response, VENV_PYTHON
 from media import image_to_base64, transcribe_voice, understand_video
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -55,7 +60,7 @@ _TG_MCP_SCRIPT = str(Path(__file__).parent / "tg_mcp.py")
 
 _TG_SOURCE_PROMPT = "Source: Telegram."
 
-cc = CC(
+cc = LiveSession(
     state_file=SESSION_FILE,
     source_prompt=_TG_SOURCE_PROMPT,
     mcp_servers={
@@ -68,15 +73,16 @@ cc = CC(
         },
     },
 )
+_channel_worker: "ChannelWorker | None" = None
 
 # ── Graceful shutdown ─────────────────────────────────────────────────
 # SIGTERM / SIGINT / /restart 都走 _graceful_shutdown: 若有 CC 任务在跑
 # (_in_flight > 0), 先推 TG 告知, 等跑完再退. launchd plist 的 ExitTimeOut
 # 必须调高 (默认 20s, babata 设 600s) 否则 SIGKILL 会强杀.
 #
-# 只保护 cc.query 的 await 期间 —— 后续 TG 消息 finalize 是毫秒级, 即便被
-# 打断 CC session jsonl 已 flush, V 从 /resume 仍能完整读到.
-_in_flight = 0                  # concurrent CC queries (PTB concurrent_updates)
+# Live worker 当前是否有 turn 在跑。PTB handler 现在只 enqueue; 真正需要
+# graceful drain 的是后台 worker 从首条 user input 到 ResultMessage 的区间.
+_in_flight = 0                  # active live CC turns
 _shutdown_requested = False     # debounce: 第二次信号 → 强退
 
 
@@ -96,7 +102,7 @@ async def _wait_inflight_drain(poll: float = 0.5) -> None:
 
 
 async def _graceful_shutdown(app: "Application", reason: str) -> None:
-    """Wait for in-flight CC queries, notify V via TG, then exit."""
+    """Wait for the live turn, notify V via TG, then exit."""
     global _shutdown_requested
     if _shutdown_requested:
         log.warning("Second shutdown signal (%s), force exit", reason)
@@ -114,6 +120,12 @@ async def _graceful_shutdown(app: "Application", reason: str) -> None:
             log.warning("Pre-shutdown notice failed: %s", e)
 
     await _wait_inflight_drain()
+
+    if _channel_worker is not None:
+        try:
+            await _channel_worker.stop()
+        except Exception as e:
+            log.warning("Channel worker stop failed: %s", e)
 
     if ALLOWED_USER:
         try:
@@ -212,6 +224,10 @@ _last_model: str | None = _state.get("last_model")
 _last_context_window: int | None = _state.get("last_context_window")
 _last_used_tokens: int = int(_state.get("last_used_tokens", 0))
 _last_cost: float = float(_state.get("last_cost", 0.0))
+# Today's cost — this bot instance only. Date-stamped so it self-resets across
+# day rollover (instead of silently accumulating into yesterday's bucket).
+_today_cost: float = float(_state.get("today_cost", 0.0))
+_today_cost_date: str = _state.get("today_cost_date", "")
 
 # ── Formatting (physical: TG requires HTML, max 4096 chars) ──────────
 
@@ -377,6 +393,425 @@ def _allowed(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == ALLOWED_USER)
 
 
+@dataclass
+class Payload:
+    update: Update
+    ctx: ContextTypes.DEFAULT_TYPE
+    text: str
+    images: list[dict[str, str]] | None = None
+
+
+class ChannelWorker:
+    """Per-process TG channel worker for one long-lived LiveSession."""
+
+    def __init__(self, session: LiveSession, *, instance_label: str) -> None:
+        self.session = session
+        self.instance_label = instance_label
+        self._consume_task: asyncio.Task[None] | None = None
+        self._state_lock = asyncio.Lock()
+        self._turn_active = False
+        self._turn_payload: Payload | None = None
+        # P1.4: most-recent submitted payload; used as a fallback anchor when
+        # _turn_payload was reset by turn_end before the next turn's events
+        # land (race between submit() and _handle_turn_end acquiring _state_lock).
+        self._latest_payload: Payload | None = None
+        self._last_user_msg_id: int | None = None
+        self._turn_anchor: int | None = None
+        self._tool_status: Any | None = None
+        self._tool_entries: list[str] = []
+        self._tool_last_edit = 0.0
+        self._text_message: Any | None = None
+        self._text_buffer = ""
+        self._text_last_edit = 0.0
+        self._stopping = False  # set on graceful shutdown to break supervisor loop
+
+    async def start(self) -> None:
+        await self.session.connect()
+        self._consume_task = asyncio.create_task(self._consume_events())
+
+    async def stop(self) -> None:
+        self._stopping = True
+        await self.session.close()
+        if self._consume_task:
+            try:
+                await asyncio.wait_for(self._consume_task, timeout=5)
+            except asyncio.TimeoutError:
+                self._consume_task.cancel()
+                try:
+                    await self._consume_task
+                except asyncio.CancelledError:
+                    pass
+
+    async def submit(self, payload: Payload) -> None:
+        chat = payload.update.effective_chat
+        msg = payload.update.effective_message
+        if chat is None or msg is None:
+            return
+
+        bridge.set_context(payload.ctx.bot, chat.id, msg.message_id)
+        self._last_user_msg_id = msg.message_id
+
+        async with self._state_lock:
+            if payload.text.strip() in ("/new", "/reset") and not payload.images:
+                await self._handle_reset(payload)
+                return
+
+            # P1.4: always update latest_payload so a mid-turn submit (which
+            # doesn't trigger _begin_turn) still leaves a valid anchor for the
+            # next SDK turn if the race between submit and turn_end leaves
+            # _turn_payload unset.
+            self._latest_payload = payload
+            if not self._turn_active:
+                self._begin_turn(payload)
+
+            try:
+                self.session.submit(payload.text, payload.images)
+            except RuntimeError:
+                log.warning("LiveSession was disconnected; reconnecting before submit")
+                await self.session.connect()
+                self.session.submit(payload.text, payload.images)
+
+    async def interrupt(self) -> None:
+        await self.session.interrupt()
+
+    async def resume(self, sid: str) -> bool:
+        async with self._state_lock:
+            if self._turn_active:
+                await self._surface_error(RuntimeError("会话已切换。"))
+                self._reset_turn_state(exit_inflight=True)
+            return await self.session.resume_live(sid)
+
+    async def _handle_reset(self, payload: Payload) -> None:
+        if self._turn_active:
+            await self._surface_error(RuntimeError("会话已重置。"))
+            self._reset_turn_state(exit_inflight=True)
+        resp = await self.session.reset_live()
+        await self._deliver_response(payload, resp)
+        self._apply_accounting(resp)
+
+    def _begin_turn(self, payload: Payload) -> None:
+        msg = payload.update.effective_message
+        self._turn_active = True
+        self._turn_payload = payload
+        self._latest_payload = payload  # keep latest in sync
+        self._turn_anchor = msg.message_id if msg else None
+        self._tool_status = None
+        self._tool_entries = []
+        self._tool_last_edit = 0.0
+        self._text_message = None
+        self._text_buffer = ""
+        self._text_last_edit = 0.0
+        _inflight_enter()
+
+    async def _consume_events(self) -> None:
+        """P1.2 supervisor: re-establish the LiveSession when events() exits
+        on un-recovered error so V's next message still gets processed instead
+        of vanishing into a dead inbox.
+        """
+        backoff = 1.0
+        while not self._stopping:
+            try:
+                async for ev in self.session.events():
+                    if ev.kind == "text_delta":
+                        await self._handle_text_delta(ev.chunk or "")
+                    elif ev.kind in ("tool_use", "tool_result"):
+                        await self._handle_tool_event(ev)
+                    elif ev.kind == "turn_end" and ev.response:
+                        await self._handle_turn_end(ev.response)
+                    elif ev.kind == "session_changed":
+                        log.info(
+                            "Session changed: %s -> %s",
+                            (ev.old_sid or "")[:8],
+                            (ev.new_sid or "")[:8],
+                        )
+                    elif ev.kind == "error":
+                        await self._handle_error(
+                            ev.exception or RuntimeError("CC stream error")
+                        )
+                        break  # events() will exit after error; supervisor reconnects
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.exception("ChannelWorker consume loop crashed: %s", e)
+                # Make sure turn-bound state doesn't leak across reconnect
+                async with self._state_lock:
+                    if self._turn_active:
+                        await self._surface_error(e)
+                        self._reset_turn_state(exit_inflight=True)
+
+            if self._stopping:
+                return
+            # Reconnect with backoff. session is marked closed after un-recovered
+            # error, so connect() will start a fresh CLI subprocess.
+            try:
+                await self.session.connect()
+                backoff = 1.0
+            except Exception as e:
+                log.warning("LiveSession reconnect failed: %s; retry in %.1fs", e, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+
+    async def _handle_text_delta(self, chunk: str) -> None:
+        if not chunk:
+            return
+        # P1.4: tolerate brief windows where _turn_payload was reset but
+        # _latest_payload still has the most-recent user message anchor.
+        payload = self._turn_payload or self._latest_payload
+        if payload is None:
+            return
+        chat = payload.update.effective_chat
+        msg = payload.update.effective_message
+        if chat is None or msg is None:
+            return
+
+        self._text_buffer += chunk
+        now = time.monotonic()
+        if len(self._text_buffer) <= _MAX_TG:
+            display = self._text_buffer
+        else:
+            display = "…" + self._text_buffer[-(_MAX_TG - 1):]
+
+        if self._text_message is None:
+            try:
+                self._text_message = await msg.reply_text(display or "…")
+                self._text_last_edit = now
+            except Exception:
+                pass
+            return
+
+        if now - self._text_last_edit < 2.0:
+            return
+        self._text_last_edit = now
+        try:
+            await self._text_message.edit_text(display)
+        except Exception:
+            pass
+        try:
+            await chat.send_action("typing")
+        except Exception:
+            pass
+
+    async def _handle_tool_event(self, ev: Event) -> None:
+        if _verbose == 0:
+            return
+        # P1.4: same fallback as _handle_text_delta — keep tool status visible
+        # even when the payload anchor briefly slipped between turns.
+        payload = self._turn_payload or self._latest_payload
+        if payload is None:
+            return
+        chat = payload.update.effective_chat
+        msg = payload.update.effective_message
+        if chat is None or msg is None:
+            return
+
+        if ev.kind == "tool_use" and ev.name:
+            self._tool_entries.append(_fmt_tool(ev.name, ev.input_dict or {}))
+        elif ev.kind == "tool_result" and ev.is_error:
+            err = (ev.text or "").replace("\n", " ").strip()
+            if not err:
+                return
+            self._tool_entries.append(f"  ❌ {err[:200]}")
+        else:
+            return
+
+        body = "\n".join(self._tool_entries[-30:])[:_MAX_TG]
+        if self._tool_status is None:
+            try:
+                self._tool_status = await msg.reply_text(body)
+            except Exception:
+                return
+            self._tool_last_edit = time.monotonic()
+            return
+
+        now = time.monotonic()
+        if now - self._tool_last_edit < 2.0:
+            return
+        self._tool_last_edit = now
+        try:
+            await self._tool_status.edit_text(body)
+        except Exception:
+            pass
+        try:
+            await chat.send_action("typing")
+        except Exception:
+            pass
+
+    async def _handle_turn_end(self, resp: Response) -> None:
+        async with self._state_lock:
+            # P1.4: race window — if submit() acquired _state_lock between SDK's
+            # ResultMessage and consume_events reaching here, _turn_payload may
+            # already point at a newer Payload. Either way, fall back to
+            # _latest_payload so V never sees a silent drop.
+            payload = self._turn_payload or self._latest_payload
+            anchor_at_start = self._turn_payload
+            # P1.3: try/finally guarantees turn state resets even if TG edits
+            # raise — otherwise _in_flight stays >0 and graceful shutdown hangs.
+            try:
+                if payload is None:
+                    log.warning(
+                        "turn_end without any payload anchor: sid=%s", resp.session_id
+                    )
+                    self._apply_accounting(resp)
+                    return
+                try:
+                    await self._deliver_response(payload, resp)
+                except Exception as e:
+                    log.exception("deliver_response failed: %s", e)
+                self._apply_accounting(resp)
+                if resp.cost > 0:
+                    log.info(
+                        "Cost: $%.4f | Session: %s",
+                        resp.cost,
+                        resp.session_id[:8] if resp.session_id else "new",
+                    )
+            finally:
+                self._reset_turn_state(exit_inflight=True)
+                # P1.4: if a submit landed during this turn (latest_payload diverged
+                # from the turn's original anchor), another SDK turn is on the way —
+                # promote latest_payload as the anchor so its text/tool events have
+                # somewhere to render.
+                if (
+                    self._latest_payload is not None
+                    and self._latest_payload is not anchor_at_start
+                ):
+                    self._begin_turn(self._latest_payload)
+
+    async def _handle_error(self, exc: Exception) -> None:
+        log.error("CC stream failed: %s", exc)
+        async with self._state_lock:
+            await self._surface_error(exc)
+            self._reset_turn_state(exit_inflight=True)
+
+    async def _surface_error(self, exc: Exception) -> None:
+        text = f"Error: {exc}"
+        surfaced = False
+        for target in (self._text_message, self._tool_status):
+            if target is None:
+                continue
+            try:
+                await target.edit_text(text)
+                surfaced = True
+                break
+            except Exception:
+                continue
+        if surfaced:
+            return
+        payload = self._turn_payload
+        if payload and payload.update.effective_message:
+            try:
+                await payload.update.effective_message.reply_text(text)
+            except Exception:
+                pass
+
+    async def _deliver_response(self, payload: Payload, resp: Response) -> None:
+        msg = payload.update.effective_message
+        if msg is None:
+            return
+
+        if self._tool_status and _verbose == 1:
+            try:
+                await self._tool_status.delete()
+            except Exception:
+                pass
+
+        if resp.resume_note:
+            try:
+                await msg.reply_text(resp.resume_note)
+            except Exception:
+                pass
+
+        if not resp.content:
+            await msg.reply_text("(no response)")
+            return
+
+        html_text = _to_html(resp.content)
+        parts = _split(html_text)
+        if self._text_message and parts:
+            try:
+                await self._text_message.edit_text(parts[0], parse_mode="HTML")
+            except Exception:
+                try:
+                    raw_parts = _split(resp.content)
+                    await self._text_message.edit_text(raw_parts[0])
+                    for pp in raw_parts[1:]:
+                        await msg.reply_text(pp)
+                    parts = []
+                except Exception:
+                    pass
+            for part in parts[1:]:
+                try:
+                    await msg.reply_text(part, parse_mode="HTML")
+                except Exception:
+                    await msg.reply_text(part)
+        else:
+            for part in parts:
+                try:
+                    await msg.reply_text(part, parse_mode="HTML")
+                except Exception:
+                    for pp in _split(resp.content):
+                        await msg.reply_text(pp)
+                    break
+
+    def _apply_accounting(self, resp: Response) -> None:
+        global _session_cost, _session_turns, _last_model, _last_context_window
+        global _last_used_tokens, _last_cost, _today_cost
+        if not resp.session_id and resp.cost == 0.0 and not resp.tools:
+            # /new shortcut — wipe per-session accumulators. _today_cost
+            # intentionally NOT reset: /new is a session boundary but today's
+            # spending is per-calendar-day.
+            _session_cost = 0.0
+            _session_turns = 0
+            _last_used_tokens = 0
+            _last_cost = 0.0
+        else:
+            _session_cost += resp.cost
+            _session_turns += 1
+            _last_cost = resp.cost
+            _roll_today_cost(datetime.now().strftime("%Y-%m-%d"))
+            _today_cost += resp.cost
+            if resp.model:
+                _last_model = resp.model
+            if resp.context_window:
+                _last_context_window = resp.context_window
+            _last_used_tokens = (
+                resp.input_tokens
+                + resp.cache_creation_tokens
+                + resp.cache_read_tokens
+            )
+
+        _state["session_cost"] = _session_cost
+        _state["session_turns"] = _session_turns
+        _state["last_cost"] = _last_cost
+        _state["last_used_tokens"] = _last_used_tokens
+        _state["today_cost"] = _today_cost
+        _state["today_cost_date"] = _today_cost_date
+        if _last_model:
+            _state["last_model"] = _last_model
+        if _last_context_window:
+            _state["last_context_window"] = _last_context_window
+        _save_state()
+
+    def _reset_turn_state(self, *, exit_inflight: bool) -> None:
+        was_active = self._turn_active
+        self._turn_active = False
+        self._turn_payload = None
+        self._turn_anchor = None
+        self._tool_status = None
+        self._tool_entries = []
+        self._tool_last_edit = 0.0
+        self._text_message = None
+        self._text_buffer = ""
+        self._text_last_edit = 0.0
+        if exit_inflight and was_active:
+            _inflight_exit()
+
+
+def _worker() -> ChannelWorker:
+    if _channel_worker is None:
+        raise RuntimeError("ChannelWorker is not started")
+    return _channel_worker
+
+
 # ── Handlers ──────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -469,6 +904,318 @@ def _sdk_version() -> str:
         return "—"
 
 
+# ── Status: quota / today cost / formatting helpers ──────────────────
+#
+# V's terminal CC /status shows:
+#   [bar] N% · <model> (<window> context)
+#   session N% · resets Npm  |  week N% · resets Mon DD  |  $X today
+#
+# Mirror it on the bot. Quota comes from api.anthropic.com/api/oauth/usage
+# (OAuth-scoped endpoint CC itself uses), which needs the account's OAuth
+# access token (lives in macOS keychain, auto-refreshed by /login).
+_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+
+def _claude_oauth_token() -> str | None:
+    """Pull the OAuth access token from keychain (same slot /login writes).
+    Single source; don't mirror it to .env (see memory reference on token
+    single-source). Returns None if keychain lookup fails."""
+    try:
+        p = subprocess.run(
+            ["security", "find-generic-password",
+             "-a", os.environ.get("USER", "admin"),
+             "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if p.returncode != 0 or not p.stdout.strip():
+            return None
+        return json.loads(p.stdout).get("claudeAiOauth", {}).get("accessToken")
+    except Exception:
+        return None
+
+
+def _fetch_usage_sync() -> dict | None:
+    """GET /api/oauth/usage. Blocking; call via run_in_executor from async.
+    Returns parsed JSON or None on any failure (wrong token / no net / 4xx)."""
+    token = _claude_oauth_token()
+    if not token:
+        return None
+    req = urllib.request.Request(
+        _USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception):
+        return None
+
+
+async def _fetch_usage() -> dict | None:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _fetch_usage_sync)
+
+
+def _fmt_reset(iso_str: str | None) -> str:
+    """ISO8601 UTC → local-time display.
+    Same local calendar date → '9pm' (hour, 12h lowercase).
+    Different date → 'Apr 24' (month + day)."""
+    if not iso_str:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00")).astimezone()
+    except Exception:
+        return "—"
+    now = datetime.now().astimezone()
+    if dt.date() == now.date():
+        h = dt.hour
+        ampm = "am" if h < 12 else "pm"
+        h12 = h % 12 or 12
+        if dt.minute == 0:
+            return f"{h12}{ampm}"
+        return f"{h12}:{dt.minute:02d}{ampm}"
+    return dt.strftime("%b %-d")
+
+
+def _progress_bar(pct: float, width: int = 15) -> str:
+    """Render a block progress bar. Uses █ (full) vs ░ (light) — solid contrast
+    renders cleanly in TG's iOS system font; ▓ (medium shade) gets rendered as
+    a noisy stipple pattern at display size and looks junk."""
+    pct = max(0.0, min(100.0, pct))
+    filled = int(round(pct / 100 * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+_MODEL_RE = re.compile(r"claude-(\w+)-(\d+)-(\d+)", re.I)
+
+
+def _short_model(full: str | None) -> str:
+    """'claude-opus-4-7[1m]' → 'Opus 4.7'. Alias suffix is dropped (shown
+    separately as context window)."""
+    if not full:
+        return "—"
+    m = _MODEL_RE.search(full)
+    if not m:
+        return full
+    name, maj, min_ = m.groups()
+    return f"{name.capitalize()} {maj}.{min_}"
+
+
+def _short_window(tokens: int | None) -> str:
+    """1_000_000 → '1M' / 200_000 → '200K'."""
+    if not tokens:
+        return "—"
+    if tokens >= 1_000_000:
+        n = tokens / 1_000_000
+        return f"{n:g}M"
+    if tokens >= 1_000:
+        return f"{tokens // 1_000}K"
+    return str(tokens)
+
+
+def _roll_today_cost(now_date: str) -> None:
+    """Zero the daily accumulator if we crossed midnight since last turn.
+    Called from both turn accumulation and /status display paths."""
+    global _today_cost, _today_cost_date
+    if _today_cost_date != now_date:
+        _today_cost = 0.0
+        _today_cost_date = now_date
+
+
+def _last_prompt_tokens(sid: str | None) -> int:
+    """Context tokens for the most recent API call — NOT the turn aggregate.
+
+    ResultMessage.model_usage sums cache_read across every tool iteration in a
+    turn; the same prompt cache can be re-read 5–10× per turn, so the aggregate
+    balloons past the context window (seen: 205% of 1M) even though each single
+    call sits at ~30%. The real context fill is the *last* assistant message's
+    usage. Scan the session jsonl backward for the most recent assistant entry
+    and sum its input + cache_read + cache_creation (matches CC terminal's bar).
+    """
+    if not sid:
+        return 0
+    projects = Path.home() / ".claude" / "projects"
+    for fp in projects.glob(f"*/{sid}.jsonl"):
+        try:
+            lines = fp.read_text().splitlines()
+        except Exception:
+            continue
+        for line in reversed(lines):
+            if '"type":"assistant"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            usage = (d.get("message") or {}).get("usage") or {}
+            if usage:
+                return int(
+                    (usage.get("input_tokens") or 0)
+                    + (usage.get("cache_creation_input_tokens") or 0)
+                    + (usage.get("cache_read_input_tokens") or 0)
+                )
+    return 0
+
+
+# ── Status: quota / today cost / formatting helpers ──────────────────
+#
+# V's terminal CC /status shows:
+#   [bar] N% · <model> (<window> context)
+#   session N% · resets Npm  |  week N% · resets Mon DD  |  $X today
+#
+# Mirror it on the bot. Quota comes from api.anthropic.com/api/oauth/usage
+# (OAuth-scoped endpoint CC itself uses), which needs the account's OAuth
+# access token (lives in macOS keychain, auto-refreshed by /login).
+_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+
+def _claude_oauth_token() -> str | None:
+    """Pull the OAuth access token from keychain (same slot /login writes).
+    Single source; don't mirror it to .env (see memory reference on token
+    single-source). Returns None if keychain lookup fails."""
+    try:
+        p = subprocess.run(
+            ["security", "find-generic-password",
+             "-a", os.environ.get("USER", "admin"),
+             "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if p.returncode != 0 or not p.stdout.strip():
+            return None
+        return json.loads(p.stdout).get("claudeAiOauth", {}).get("accessToken")
+    except Exception:
+        return None
+
+
+def _fetch_usage_sync() -> dict | None:
+    """GET /api/oauth/usage. Blocking; call via run_in_executor from async.
+    Returns parsed JSON or None on any failure (wrong token / no net / 4xx)."""
+    token = _claude_oauth_token()
+    if not token:
+        return None
+    req = urllib.request.Request(
+        _USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception):
+        return None
+
+
+async def _fetch_usage() -> dict | None:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _fetch_usage_sync)
+
+
+def _fmt_reset(iso_str: str | None) -> str:
+    """ISO8601 UTC → local-time display.
+    Same local calendar date → '9pm' (hour, 12h lowercase).
+    Different date → 'Apr 24' (month + day)."""
+    if not iso_str:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00")).astimezone()
+    except Exception:
+        return "—"
+    now = datetime.now().astimezone()
+    if dt.date() == now.date():
+        h = dt.hour
+        ampm = "am" if h < 12 else "pm"
+        h12 = h % 12 or 12
+        if dt.minute == 0:
+            return f"{h12}{ampm}"
+        return f"{h12}:{dt.minute:02d}{ampm}"
+    return dt.strftime("%b %-d")
+
+
+def _progress_bar(pct: float, width: int = 15) -> str:
+    """Render a block progress bar. Uses █ (full) vs ░ (light) — solid contrast
+    renders cleanly in TG's iOS system font; ▓ (medium shade) gets rendered as
+    a noisy stipple pattern at display size and looks junk."""
+    pct = max(0.0, min(100.0, pct))
+    filled = int(round(pct / 100 * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+_MODEL_RE = re.compile(r"claude-(\w+)-(\d+)-(\d+)", re.I)
+
+
+def _short_model(full: str | None) -> str:
+    """'claude-opus-4-7[1m]' → 'Opus 4.7'. Alias suffix is dropped (shown
+    separately as context window)."""
+    if not full:
+        return "—"
+    m = _MODEL_RE.search(full)
+    if not m:
+        return full
+    name, maj, min_ = m.groups()
+    return f"{name.capitalize()} {maj}.{min_}"
+
+
+def _short_window(tokens: int | None) -> str:
+    """1_000_000 → '1M' / 200_000 → '200K'."""
+    if not tokens:
+        return "—"
+    if tokens >= 1_000_000:
+        n = tokens / 1_000_000
+        return f"{n:g}M"
+    if tokens >= 1_000:
+        return f"{tokens // 1_000}K"
+    return str(tokens)
+
+
+def _roll_today_cost(now_date: str) -> None:
+    """Zero the daily accumulator if we crossed midnight since last turn.
+    Called from both turn accumulation and /status display paths."""
+    global _today_cost, _today_cost_date
+    if _today_cost_date != now_date:
+        _today_cost = 0.0
+        _today_cost_date = now_date
+
+
+def _last_prompt_tokens(sid: str | None) -> int:
+    """Context tokens for the most recent API call — NOT the turn aggregate.
+
+    ResultMessage.model_usage sums cache_read across every tool iteration in a
+    turn; the same prompt cache can be re-read 5–10× per turn, so the aggregate
+    balloons past the context window (seen: 205% of 1M) even though each single
+    call sits at ~30%. The real context fill is the *last* assistant message's
+    usage. Scan the session jsonl backward for the most recent assistant entry
+    and sum its input + cache_read + cache_creation (matches CC terminal's bar).
+    """
+    if not sid:
+        return 0
+    projects = Path.home() / ".claude" / "projects"
+    for fp in projects.glob(f"*/{sid}.jsonl"):
+        try:
+            lines = fp.read_text().splitlines()
+        except Exception:
+            continue
+        for line in reversed(lines):
+            if '"type":"assistant"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            usage = (d.get("message") or {}).get("usage") or {}
+            if usage:
+                return int(
+                    (usage.get("input_tokens") or 0)
+                    + (usage.get("cache_creation_input_tokens") or 0)
+                    + (usage.get("cache_read_input_tokens") or 0)
+                )
+    return 0
+
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Show current model, context usage, cost, session state."""
     if not _allowed(update):
@@ -499,32 +1246,51 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not actual:
         actual = cfg_model
 
-    # Context: prefer live numbers, else show window inferred from alias so V
-    # at least sees the tier (—/1.0M) instead of a bare dash.
     win = _last_context_window or _infer_window_from_alias(cfg_model)
-    if win:
-        used = _last_used_tokens
-        if used > 0:
-            pct = used / win * 100
-            ctx_line = f"{_fmt_tok(used)} / {_fmt_tok(win)} ({pct:.1f}%)"
-        else:
-            ctx_line = f"— / {_fmt_tok(win)}"
+    used = _last_prompt_tokens(cc._session_id) or _last_used_tokens
+    pct_ctx = (used / win * 100) if (win and used > 0) else 0.0
+    bar = _progress_bar(pct_ctx)
+    model_short = _short_model(actual)
+    window_short = _short_window(win)
+
+    # Quota: five_hour + seven_day utilization + $today from api/oauth/usage.
+    # Graceful fallback to "—" if OAuth/network fails.
+    usage = await _fetch_usage()
+    if usage:
+        fh = usage.get("five_hour") or {}
+        wk = usage.get("seven_day") or {}
+        s_pct = fh.get("utilization")
+        s_reset = _fmt_reset(fh.get("resets_at"))
+        w_pct = wk.get("utilization")
+        w_reset = _fmt_reset(wk.get("resets_at"))
+        session_line = f"session {s_pct:.0f}% · resets {s_reset}" if s_pct is not None else "session —"
+        week_line = f"week {w_pct:.0f}% · resets {w_reset}" if w_pct is not None else "week —"
     else:
-        ctx_line = "—"
+        session_line, week_line = "session —", "week —"
+
+    _roll_today_cost(datetime.now().strftime("%Y-%m-%d"))
+    today_line = f"${_today_cost:.2f} today"
 
     sids = cc._load_state().get("recent_sids") or []
-    sid_now = cc._session_id[:8] if cc._session_id else "(new)"
+    sid_now = cc._session_id if cc._session_id else "(new)"
 
     labels = {0: "hidden", 1: "flash", 2: "keep"}
 
+    # Layout: header two lines in default font (no <code> — TG renders ▓/░ as
+    # noisy stipple inside code blocks). Quota broken into 3 separate lines so
+    # mobile doesn't wrap awkwardly. Session UUID on its own line, same reason.
     lines = [
         "<b>📊 Status</b>",
         "",
-        f"<b>CC</b>        v{_cc_version()}",
-        f"<b>SDK</b>       v{_sdk_version()}",
-        f"<b>Model</b>     <code>{html.escape(actual)}</code>",
-        f"<b>Session</b>   {sid_now} ({len(sids)} recent)",
-        f"<b>Verbose</b>   {labels.get(_verbose, _verbose)}",
+        f"{bar} {pct_ctx:.0f}% · {html.escape(model_short)} ({window_short})",
+        "",
+        html.escape(session_line),
+        html.escape(week_line),
+        today_line,
+        "",
+        f"CC v{_cc_version()} · SDK v{_sdk_version()} · {labels.get(_verbose, _verbose)}",
+        f"<code>{html.escape(actual)}</code>",
+        f"<code>{sid_now}</code> · {len(sids)} recent",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -539,49 +1305,40 @@ def _fmt_tok(n: int) -> str:
 
 
 async def cmd_context(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """TG /context — forwards CC CLI's own /context slash command output.
-
-    /context is rendered locally by CC CLI (not the model), so passing it as a
-    prompt through the SDK returns the authoritative breakdown in ResultMessage.
-    Wrap in <pre> so TG preserves the table alignment."""
+    """TG /context — query the live SDK context-usage control API."""
     if not _allowed(update):
         return
 
     wait_msg = await update.message.reply_text("查询中…")
-    _inflight_enter()
     try:
-        resp = await cc.query("/context")
-        text = (resp.content or "").strip()
-        if not text:
-            await wait_msg.edit_text("/context 返回空, 可能 session 还没建立")
-            return
-        body = f"<pre>{html.escape(text)}</pre>"
-        # TG hard cap 4096 chars/message. /context can exceed when many MCP
-        # tools are listed — split on blank lines to keep tables intact.
-        if len(body) <= 4000:
-            await wait_msg.edit_text(body, parse_mode="HTML")
-            return
-        await wait_msg.delete()
-        chunks: list[str] = []
-        cur = ""
-        for para in text.split("\n\n"):
-            piece = (cur + "\n\n" + para).strip() if cur else para
-            if len(piece) > 3500:
-                if cur:
-                    chunks.append(cur)
-                cur = para
-            else:
-                cur = piece
-        if cur:
-            chunks.append(cur)
-        for chunk in chunks:
-            await update.message.reply_text(
-                f"<pre>{html.escape(chunk)}</pre>", parse_mode="HTML"
-            )
+        usage = await cc.context_usage()
+        total = int(usage.get("totalTokens") or 0)
+        max_tokens = int(usage.get("maxTokens") or 0)
+        pct = float(usage.get("percentage") or 0.0)
+        model = str(usage.get("model") or "—")
+        lines = [
+            f"Model: {model}",
+            f"Total: {_fmt_tok(total)} / {_fmt_tok(max_tokens)} ({pct:.1f}%)",
+            "",
+            "Categories:",
+        ]
+        for cat in usage.get("categories") or []:
+            name = cat.get("name", "?")
+            tokens = int(cat.get("tokens") or 0)
+            lines.append(f"- {name}: {_fmt_tok(tokens)}")
+        mcp_tools = usage.get("mcpTools") or []
+        if mcp_tools:
+            lines.extend(["", "MCP tools:"])
+            for item in mcp_tools[:30]:
+                name = item.get("name") or item.get("toolName") or "?"
+                server = item.get("serverName") or item.get("server") or "?"
+                tokens = int(item.get("tokens") or 0)
+                loaded = "" if item.get("isLoaded", True) else " (deferred)"
+                lines.append(f"- {server}/{name}: {_fmt_tok(tokens)}{loaded}")
+        body = f"<pre>{html.escape(chr(10).join(lines))}</pre>"
+        await wait_msg.edit_text(body[:4000], parse_mode="HTML")
     except Exception as e:
         await wait_msg.edit_text(f"/context 失败: {type(e).__name__}: {e}")
-    finally:
-        _inflight_exit()
 
 
 async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -605,6 +1362,16 @@ async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     asyncio.create_task(
         _graceful_shutdown(ctx.application, reason="收到 /restart")
     )
+
+
+async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed(update):
+        return
+    try:
+        await _worker().interrupt()
+        await update.message.reply_text("⏸  当前 turn 已请求中断")
+    except Exception as e:
+        await update.message.reply_text(f"/stop 失败: {type(e).__name__}: {e}")
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -893,7 +1660,15 @@ async def on_resume_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         return
     sid = data.split(":", 1)[1]
 
-    if not cc.resume(sid):
+    try:
+        resumed = await _worker().resume(sid)
+    except Exception as e:
+        try:
+            await query.edit_message_text(f"❌ resume 失败: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        return
+    if not resumed:
         try:
             await query.edit_message_text(f"❌ session {sid[:8]} 已失效 (JSONL 被清)")
         except Exception:
@@ -984,7 +1759,7 @@ async def _process(
     text: str,
     images: list[dict[str, str]] | None = None,
 ) -> None:
-    """Send to CC, stream tool activity, deliver response."""
+    """Enqueue user input into the live CC session and return immediately."""
     chat = update.effective_chat
     msg = update.effective_message
     await chat.send_action("typing")
@@ -1004,229 +1779,26 @@ async def _process(
         )
         text = f"[Replying to]: {quoted}\n\n{text}"
 
-    # Set bridge context so MCP tools can send to this chat
-    bridge.set_context(ctx.bot, chat.id, msg.message_id)
-
-    # Tool stream: lazy-created on first tool call, one line per tool.
-    # Text stream: lazy-created on first text delta, edited in place as CC
-    # generates. Two independent TG messages — no UI collision with tool status.
-    tool_status = None
-    entries: list[str] = []
-    last_edit = 0.0
-
-    # Text streaming state (text_chunk is a delta from StreamEvent; see cc.py)
-    text_message = None
-    text_buffer = ""
-    text_last_edit = 0.0
-
-    async def _on_stream(
-        tool_name: str | None,
-        tool_input: dict | None,
-        text_chunk: str | None,
-        tool_result: dict | None = None,
-    ) -> None:
-        nonlocal last_edit, tool_status
-        nonlocal text_message, text_buffer, text_last_edit
-
-        # Text delta stream → live-edit a TG message as CC generates
-        if text_chunk is not None:
-            text_buffer += text_chunk
-            now = time.monotonic()
-            # Plain text during streaming (HTML may have broken tags mid-stream).
-            # When buffer exceeds TG cap, show the *tail* as a live-scrolling
-            # preview; the final authoritative message is sent below as HTML.
-            if len(text_buffer) <= _MAX_TG:
-                display = text_buffer
-            else:
-                display = "\u2026" + text_buffer[-(_MAX_TG - 1):]
-
-            if text_message is None:
-                try:
-                    text_message = await msg.reply_text(display or "\u2026")
-                    text_last_edit = now
-                except Exception:
-                    pass
-                return
-
-            if now - text_last_edit < 2.0:
-                return
-            text_last_edit = now
-
-            try:
-                await text_message.edit_text(display)
-            except Exception:
-                pass  # FLOOD_WAIT / identical content / etc — skip
-            try:
-                await chat.send_action("typing")
-            except Exception:
-                pass
-            return
-
-        # Tool activity (existing behavior, gated by verbose)
-        if _verbose == 0:
-            return
-        if tool_name:
-            entries.append(_fmt_tool(tool_name, tool_input or {}))
-        elif tool_result and tool_result.get("is_error"):
-            # Surface real tool errors so CC can't hallucinate high-level reasons
-            err = (tool_result.get("text") or "").replace("\n", " ").strip()
-            if not err:
-                return
-            entries.append(f"  \u274c {err[:200]}")
-        else:
-            return
-
-        body = "\n".join(entries[-30:])[:_MAX_TG]
-
-        if tool_status is None:
-            try:
-                tool_status = await msg.reply_text(body)
-            except Exception:
-                return
-            last_edit = time.monotonic()
-            return
-
-        now = time.monotonic()
-        if now - last_edit < 2.0:
-            return
-        last_edit = now
-
-        try:
-            await tool_status.edit_text(body)
-        except Exception:
-            pass
-        try:
-            await chat.send_action("typing")
-        except Exception:
-            pass
-
-    _inflight_enter()
     try:
-        resp = await cc.query(text, images=images, on_stream=_on_stream)
+        await _worker().submit(Payload(update=update, ctx=ctx, text=text, images=images))
     except Exception as e:
-        log.error("CC query failed: %s", e)
-        # Surface error on whichever live message is most visible
-        surfaced = False
-        for target in (text_message, tool_status):
-            if target is None:
-                continue
-            try:
-                await target.edit_text(f"Error: {e}")
-                surfaced = True
-                break
-            except Exception:
-                continue
-        if not surfaced:
-            await msg.reply_text(f"Error: {e}")
-        return
-    finally:
-        _inflight_exit()
-
-    # Tool stream: flash deletes, keep preserves.
-    if tool_status and _verbose == 1:
-        try:
-            await tool_status.delete()
-        except Exception:
-            pass
-
-    # Surface any session-resume note loud
-    if resp.resume_note:
-        try:
-            await msg.reply_text(resp.resume_note)
-        except Exception:
-            pass
-
-    if not resp.content:
-        await msg.reply_text("(no response)")
-        return
-
-    html_text = _to_html(resp.content)
-    parts = _split(html_text)
-
-    # If streaming was active, promote the live text_message to the final
-    # HTML-formatted first part (in place), then append remaining parts as
-    # new messages. Avoids a duplicate "plain → formatted" double-send.
-    if text_message and parts:
-        try:
-            await text_message.edit_text(parts[0], parse_mode="HTML")
-        except Exception:
-            # HTML broke mid-stream edit (TG parser rejected) — fall back to
-            # raw content, same chunking
-            try:
-                raw_parts = _split(resp.content)
-                await text_message.edit_text(raw_parts[0])
-                for pp in raw_parts[1:]:
-                    await msg.reply_text(pp)
-                parts = []  # already delivered
-            except Exception:
-                pass
-        for part in parts[1:]:
-            try:
-                await msg.reply_text(part, parse_mode="HTML")
-            except Exception:
-                await msg.reply_text(part)
-    else:
-        for part in parts:
-            try:
-                await msg.reply_text(part, parse_mode="HTML")
-            except Exception:
-                for pp in _split(resp.content):
-                    await msg.reply_text(pp)
-                break
-
-    # Status accounting (populated by cc.py from ResultMessage.model_usage).
-    # /new reset is detected by session_id going empty while cc.reset() ran.
-    global _session_cost, _session_turns, _last_model, _last_context_window
-    global _last_used_tokens, _last_cost
-    if not resp.session_id and resp.cost == 0.0 and not resp.tools:
-        # cc.reset() shortcut — wipe accumulators (keep _last_model: V wants
-        # to know what model runs even right after /new, before next query)
-        _session_cost = 0.0
-        _session_turns = 0
-        _last_used_tokens = 0
-        _last_cost = 0.0
-    else:
-        _session_cost += resp.cost
-        _session_turns += 1
-        _last_cost = resp.cost
-        if resp.model:
-            _last_model = resp.model
-        if resp.context_window:
-            _last_context_window = resp.context_window
-        # Context fill = what was sent to the model this turn.
-        # Matches CC terminal's context indicator. Output is NOT part of context
-        # (it's this turn's response; it becomes context only in the next turn's
-        # input, at which point it shows up under input/cache_read).
-        _last_used_tokens = (
-            resp.input_tokens
-            + resp.cache_creation_tokens
-            + resp.cache_read_tokens
-        )
-    # Persist snapshot so /status survives bot restart
-    _state["session_cost"] = _session_cost
-    _state["session_turns"] = _session_turns
-    _state["last_cost"] = _last_cost
-    _state["last_used_tokens"] = _last_used_tokens
-    if _last_model:
-        _state["last_model"] = _last_model
-    if _last_context_window:
-        _state["last_context_window"] = _last_context_window
-    _save_state()
-
-    if resp.cost > 0:
-        log.info("Cost: $%.4f | Session: %s", resp.cost, resp.session_id[:8] if resp.session_id else "new")
+        log.error("enqueue failed: %s", e)
+        await msg.reply_text(f"Error: {e}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────
 
 async def _post_init(app: Application) -> None:
+    global _channel_worker
     await bridge.start()
     asyncio.create_task(_heartbeat_loop(app))
     # Default context so terminal CC (no TG message yet) can push to user's TG
     if ALLOWED_USER:
         bridge.set_context(app.bot, ALLOWED_USER, None)
-    # Graceful shutdown: 覆盖 PTB/asyncio 默认 signal handler, 等 in-flight
-    # CC 跑完再退 (cmd_restart / launchd SIGTERM / Ctrl+C 都走这条).
+    _channel_worker = ChannelWorker(cc, instance_label=_CURRENT_LABEL)
+    await _channel_worker.start()
+    # Graceful shutdown: 覆盖 PTB/asyncio 默认 signal handler, 等 live turn
+    # 跑完再退 (cmd_restart / launchd SIGTERM / Ctrl+C 都走这条).
     _install_signal_handlers(app)
     await app.bot.set_my_commands([
         ("new", "Start a fresh session"),
@@ -1234,6 +1806,7 @@ async def _post_init(app: Application) -> None:
         ("status", "Show model, session, verbose"),
         ("context", "Context usage breakdown"),
         ("verbose", "Tool display: 0=hidden 1=flash 2=keep"),
+        ("stop", "Interrupt current turn"),
         ("restart", "Restart this bot process"),
     ])
 
@@ -1265,6 +1838,7 @@ def main() -> None:
     app.add_handler(CommandHandler("context", cmd_context))
     app.add_handler(CommandHandler("verbose", cmd_verbose))
     app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler(["new", "reset"], on_text))
     app.add_handler(CallbackQueryHandler(on_verbose_click, pattern=r"^verbose:"))

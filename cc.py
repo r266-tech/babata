@@ -6,13 +6,15 @@ keeping session state and exposed tools isolated per channel.
 """
 
 import asyncio
+import copy
 import json
 import logging
 import os
 import subprocess
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Coroutine
+from typing import Any, AsyncIterator, Callable, Coroutine, Literal
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -318,6 +320,27 @@ class Response:
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+
+
+@dataclass
+class Event:
+    kind: Literal[
+        "tool_use",
+        "tool_result",
+        "text_delta",
+        "turn_end",
+        "session_changed",
+        "error",
+    ]
+    name: str | None = None
+    input_dict: dict[str, Any] | None = None
+    is_error: bool = False
+    text: str | None = None
+    chunk: str | None = None
+    response: Response | None = None
+    old_sid: str | None = None
+    new_sid: str | None = None
+    exception: Exception | None = None
 
 
 class CC:
@@ -692,6 +715,13 @@ class CC:
             system_prompt=self._source_prompt,
             setting_sources=["user"],  # 读 ~/.claude/{settings.json, CLAUDE.md, skills/} - 统一身份跨终端/TG/cron
             mcp_servers=self._mcp_servers,
+            # SDK 默认 max_buffer_size = 1MB; V 发 PDF/大图 或 resume 含 base64
+            # 附件的老 session 时, CLI stdout 单条 JSON message 就超了 → 报
+            # "JSON message exceeded maximum buffer size" → SDK 抛 Exception
+            # → cc.query 走 resume-fail 分支 → fire 🔴 + 🟢 让 V 以为在瞎切 session.
+            # 64MB 一次性 settle (单条 JSON message 理论上限 ~ context window
+            # 文本量级, 远不到 64MB). 2026-04-22 根因: babata-vvv.err 11:20 事件.
+            max_buffer_size=64 * 1024 * 1024,
         )
 
         if self._session_id:
@@ -851,6 +881,525 @@ class CC:
             session_id=sid or "",
             cost=cost,
             tools=tools_seen,
+            model=model,
+            context_window=context_window,
+            max_output_tokens=max_output_tokens,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            cache_read_tokens=cache_r,
+            cache_creation_tokens=cache_c,
+        )
+
+
+class LiveSession(CC):
+    """Long-lived Claude Code session with streaming user input injection.
+
+    Physical: one SDK client owns one CC CLI subprocess. ``submit()`` only
+    enqueues user messages; a background ``client.query(async_iter)`` task
+    serially writes them to CLI stdin, so mid-turn TG messages enter the same
+    conversation stream instead of spawning competing clients.
+    """
+
+    _STOP = object()
+
+    def __init__(
+        self,
+        *,
+        state_file: Path,
+        source_prompt: str,
+        mcp_servers: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            state_file=state_file,
+            source_prompt=source_prompt,
+            mcp_servers=mcp_servers,
+        )
+        self._client: ClaudeSDKClient | None = None
+        self._inbox: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+        self._input_task: asyncio.Task[None] | None = None
+        self._connect_lock = asyncio.Lock()
+        self._events_active = False
+        self._closed = True
+        self._pending_replay: list[dict[str, Any]] = []
+        self._resume_note_next: str | None = None
+        self._resume_recovered = False
+        self._started_with_resume = False
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    @property
+    def is_connected(self) -> bool:
+        return self._client is not None and not self._closed
+
+    def _make_options(
+        self,
+        *,
+        system_prompt: str | None = None,
+        resume: bool = True,
+    ) -> ClaudeAgentOptions:
+        opts = ClaudeAgentOptions(
+            max_turns=200,
+            permission_mode="bypassPermissions",
+            can_use_tool=_always_allow,
+            cwd=str(Path.home()),
+            cli_path=os.environ.get("CLAUDE_CLI_PATH"),
+            include_partial_messages=True,
+            system_prompt=system_prompt if system_prompt is not None else self._source_prompt,
+            setting_sources=["user"],
+            mcp_servers=self._mcp_servers,
+            # SDK 默认 1MB; PDF/大图 / base64 附件 resume 会爆 buffer (2026-04-22
+            # babata-vvv.err 事件). 64MB 一次性 settle. 跟 CC._make_options 同步.
+            max_buffer_size=64 * 1024 * 1024,
+        )
+        if resume and self._session_id:
+            opts.resume = self._session_id
+        return opts
+
+    async def connect(self) -> None:
+        """Connect once and start the open-ended SDK input writer."""
+        async with self._connect_lock:
+            if self.is_connected:
+                return
+            self._closed = False
+            try:
+                await self._start_client_locked(self._make_options())
+            except Exception as e:
+                if not self._session_id:
+                    self._closed = True
+                    raise
+                log.warning("LiveSession initial resume failed (%s), retrying fresh", e)
+                prompt = self._prepare_resume_recovery(e)
+                await self._start_client_locked(
+                    self._make_options(system_prompt=prompt, resume=False)
+                )
+
+    async def close(self) -> None:
+        """Close stdin iterator, disconnect the SDK client, and fire SessionEnd."""
+        async with self._connect_lock:
+            await self._stop_client_locked(fire_session_end=True)
+            self._closed = True
+
+    async def reset_live(self) -> Response:
+        """Async /new for the long-lived subprocess: reset state + reconnect."""
+        async with self._connect_lock:
+            super().reset()
+            self._pending_replay.clear()
+            self._resume_note_next = None
+            self._resume_recovered = False
+            await self._stop_client_locked(fire_session_end=False)
+            self._closed = False
+            await self._start_client_locked(self._make_options(resume=False))
+        return Response(content="会话已重置。", session_id="", cost=0.0)
+
+    async def resume_live(self, sid: str) -> bool:
+        """Async /resume: move state pointer, then reconnect CLI with --resume."""
+        if not (_CC_PROJECTS / f"{sid}.jsonl").is_file():
+            return False
+        async with self._connect_lock:
+            ok = super().resume(sid)
+            if not ok:
+                return False
+            self._pending_replay.clear()
+            self._resume_note_next = None
+            self._resume_recovered = False
+            await self._stop_client_locked(fire_session_end=False)
+            self._closed = False
+            await self._start_client_locked(self._make_options())
+        return True
+
+    def submit(self, prompt: str, images: list[dict[str, str]] | None = None) -> None:
+        """Enqueue one user message without blocking the PTB update handler."""
+        if self._closed or self._client is None:
+            raise RuntimeError("LiveSession is not connected")
+        self._inbox.put_nowait(self._user_message(prompt, images))
+
+    async def interrupt(self) -> None:
+        if not self._client:
+            raise RuntimeError("LiveSession is not connected")
+        await self._client.interrupt()
+
+    async def context_usage(self) -> dict[str, Any]:
+        if not self._client:
+            raise RuntimeError("LiveSession is not connected")
+        return await self._client.get_context_usage()
+
+    async def events(self) -> AsyncIterator[Event]:
+        """Yield parsed SDK events. Exactly one consumer may read this stream."""
+        if self._events_active:
+            raise RuntimeError("LiveSession.events() already has a consumer")
+        self._events_active = True
+        messages: list[Any] = []
+        tools_seen: list[str] = []
+        try:
+            while not self._closed:
+                client = self._client
+                if client is None:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                try:
+                    async for msg in self._receive_with_input_monitor(client):
+                        if client is not self._client:
+                            break
+                        messages.append(msg)
+
+                        if isinstance(msg, ResultMessage):
+                            response, changed = self._handle_result_message(
+                                messages, tools_seen
+                            )
+                            messages = []
+                            tools_seen = []
+                            self._pending_replay.clear()
+                            self._started_with_resume = False
+                            if changed:
+                                yield Event(
+                                    kind="session_changed",
+                                    old_sid=changed[0],
+                                    new_sid=changed[1],
+                                )
+                            yield Event(kind="turn_end", response=response)
+                            continue
+
+                        if isinstance(msg, AssistantMessage):
+                            for block in getattr(msg, "content", []) or []:
+                                if isinstance(block, ToolUseBlock):
+                                    name = getattr(block, "name", "")
+                                    inp = getattr(block, "input", {}) or {}
+                                    if name and name not in tools_seen:
+                                        tools_seen.append(name)
+                                    yield Event(
+                                        kind="tool_use",
+                                        name=name,
+                                        input_dict=inp,
+                                    )
+                        elif isinstance(msg, StreamEvent):
+                            ev = msg.event or {}
+                            if ev.get("type") == "content_block_delta":
+                                delta = ev.get("delta") or {}
+                                if delta.get("type") == "text_delta":
+                                    chunk = delta.get("text") or ""
+                                    if chunk:
+                                        yield Event(kind="text_delta", chunk=chunk)
+                        elif isinstance(msg, UserMessage):
+                            for block in getattr(msg, "content", []) or []:
+                                if isinstance(block, ToolResultBlock):
+                                    yield Event(
+                                        kind="tool_result",
+                                        is_error=bool(block.is_error),
+                                        text=_tool_result_text(block.content),
+                                    )
+                except Exception as e:
+                    if self._closed:
+                        break
+                    recovered = await self._recover_from_stream_error(e)
+                    if recovered:
+                        messages = []
+                        tools_seen = []
+                        continue
+                    log.warning("LiveSession event stream failed: %s", e)
+                    # P1.2: tear down dead client/queue so future submit() raises
+                    # RuntimeError instead of silently enqueueing into a dead inbox.
+                    # ChannelWorker._consume_events supervises and reconnects.
+                    await self._mark_dead_after_error()
+                    yield Event(kind="error", exception=e)
+                    break
+                else:
+                    if client is self._client:
+                        break
+        finally:
+            self._events_active = False
+
+    async def _start_client_locked(self, opts: ClaudeAgentOptions) -> None:
+        client = ClaudeSDKClient(opts)
+        await client.connect()
+        self._client = client
+        self._started_with_resume = bool(getattr(opts, "resume", None))
+        self._input_task = asyncio.create_task(
+            client.query(self._inbox_iter(self._inbox))
+        )
+
+    async def _stop_client_locked(self, *, fire_session_end: bool) -> None:
+        client = self._client
+        task = self._input_task
+        old_queue = self._inbox
+        self._client = None
+        self._input_task = None
+        self._started_with_resume = False
+
+        # P1.1: drop unsent user messages before sentinel — they belong to
+        # the OLD session. Without this drain, /new and /resume let pending
+        # input flush into the old subprocess before _STOP halts the writer.
+        while True:
+            try:
+                old_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        old_queue.put_nowait(self._STOP)
+        if task:
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(task, timeout=2)
+        if client:
+            with suppress(asyncio.CancelledError, Exception):
+                await client.disconnect()
+        self._inbox = asyncio.Queue()
+
+        if fire_session_end and self._session_id:
+            self._fire_hook(_HOOKS_DIR, "session-end.sh", self._session_id)
+
+    async def _inbox_iter(
+        self,
+        queue: asyncio.Queue[dict[str, Any] | object],
+    ) -> AsyncIterator[dict[str, Any]]:
+        while True:
+            msg = await queue.get()
+            if msg is self._STOP:
+                break
+            assert isinstance(msg, dict)
+            self._pending_replay.append(copy.deepcopy(msg))
+            yield msg
+
+    async def _receive_with_input_monitor(
+        self,
+        client: ClaudeSDKClient,
+    ) -> AsyncIterator[Any]:
+        receive_iter = client.receive_messages().__aiter__()
+        input_task = self._input_task
+        while True:
+            next_task = asyncio.create_task(receive_iter.__anext__())
+            wait_for: set[asyncio.Task[Any]] = {next_task}
+            if input_task is not None and not input_task.done():
+                wait_for.add(input_task)
+            done, _ = await asyncio.wait(wait_for, return_when=asyncio.FIRST_COMPLETED)
+
+            if input_task is not None and input_task in done:
+                try:
+                    exc = input_task.exception()
+                except asyncio.CancelledError:
+                    exc = None
+                input_task = None
+                if exc is not None:
+                    next_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await next_task
+                    raise exc
+
+            if next_task in done:
+                try:
+                    yield next_task.result()
+                except StopAsyncIteration:
+                    return
+            else:
+                next_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await next_task
+
+    async def _recover_from_stream_error(self, exc: Exception) -> bool:
+        if (
+            not self._started_with_resume
+            or self._resume_recovered
+            or not self._session_id
+        ):
+            return False
+
+        async with self._connect_lock:
+            if (
+                not self._started_with_resume
+                or self._resume_recovered
+                or not self._session_id
+            ):
+                return False
+
+            prompt = self._prepare_resume_recovery(exc)
+            old_queue = self._inbox
+            replay = [copy.deepcopy(m) for m in self._pending_replay]
+            pending = self._drain_queue(old_queue)
+            self._inbox = asyncio.Queue()
+            self._pending_replay = []
+            for msg in replay + pending:
+                self._inbox.put_nowait(msg)
+
+            await self._stop_old_client_for_reconnect(old_queue)
+            self._closed = False
+            await self._start_client_locked(
+                self._make_options(system_prompt=prompt, resume=False)
+            )
+            self._resume_recovered = True
+            return True
+
+    async def _mark_dead_after_error(self) -> None:
+        """Tear down a broken client + queue so submit() refuses input.
+
+        Called from events() when an un-recovered stream error breaks the
+        consumer. The next `connect()` (driven by ChannelWorker supervisor)
+        will start fresh.
+        """
+        async with self._connect_lock:
+            client = self._client
+            task = self._input_task
+            self._client = None
+            self._input_task = None
+            self._started_with_resume = False
+            self._closed = True
+            self._pending_replay.clear()
+            if task and not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
+            if client:
+                with suppress(asyncio.CancelledError, Exception):
+                    await client.disconnect()
+            self._inbox = asyncio.Queue()
+
+    async def _stop_old_client_for_reconnect(
+        self,
+        old_queue: asyncio.Queue[dict[str, Any] | object],
+    ) -> None:
+        client = self._client
+        task = self._input_task
+        self._client = None
+        self._input_task = None
+        self._started_with_resume = False
+        old_queue.put_nowait(self._STOP)
+        if task:
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(task, timeout=2)
+        if client:
+            with suppress(asyncio.CancelledError, Exception):
+                await client.disconnect()
+
+    @staticmethod
+    def _drain_queue(
+        queue: asyncio.Queue[dict[str, Any] | object],
+    ) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        while True:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return out
+            if item is LiveSession._STOP:
+                continue
+            if isinstance(item, dict):
+                out.append(item)
+
+    def _prepare_resume_recovery(self, exc: Exception) -> str:
+        old_sid = self._session_id
+        if old_sid:
+            self._fire_hook(_HOOKS_DIR, "session-end.sh", old_sid)
+        self._session_id = None
+        self._record_sid(None)
+        ctx = self._recent_turns_summary()
+        if ctx:
+            self._resume_note_next = (
+                f"⚠️ 会话重置 ({type(exc).__name__}), "
+                f"已从归档注入最近 {_RESUME_INJECT_PAIRS} 轮"
+            )
+            return f"{self._source_prompt}\n\n{ctx}"
+        self._resume_note_next = (
+            f"⚠️ 会话重置 ({type(exc).__name__}), 历史归档也没找到"
+        )
+        return self._source_prompt
+
+    @staticmethod
+    def _user_message(
+        prompt: str,
+        images: list[dict[str, str]] | None,
+    ) -> dict[str, Any]:
+        if images:
+            blocks: list[dict[str, Any]] = [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": img["media_type"],
+                        "data": img["data"],
+                    },
+                }
+                for img in images
+            ]
+            if prompt:
+                blocks.append({"type": "text", "text": prompt})
+            content: str | list[dict[str, Any]] = blocks
+        else:
+            content = prompt
+        return {
+            "type": "user",
+            "message": {"role": "user", "content": content},
+            "parent_tool_use_id": None,
+        }
+
+    def _handle_result_message(
+        self,
+        messages: list[Any],
+        tools_seen: list[str],
+    ) -> tuple[Response, tuple[str | None, str] | None]:
+        response = self._response_from_messages(messages, tools_seen)
+        if self._resume_note_next:
+            response.resume_note = self._resume_note_next
+            self._resume_note_next = None
+
+        sid = response.session_id or None
+        changed: tuple[str | None, str] | None = None
+        if sid:
+            old_sid = self._session_id
+            if sid != old_sid:
+                self._fire_hook(_HOOKS_DIR, "session-start.sh", sid)
+                changed = (old_sid, sid)
+            self._session_id = sid
+            self._record_sid(sid)
+        return response, changed
+
+    @staticmethod
+    def _response_from_messages(
+        messages: list[Any],
+        tools_seen: list[str],
+    ) -> Response:
+        content = ""
+        cost = 0.0
+        sid = ""
+        model: str | None = None
+        context_window: int | None = None
+        max_output_tokens: int | None = None
+        in_tok = out_tok = cache_r = cache_c = 0
+
+        for msg in messages:
+            if isinstance(msg, ResultMessage):
+                cost = getattr(msg, "total_cost_usd", 0.0) or 0.0
+                sid = getattr(msg, "session_id", None) or ""
+                result = getattr(msg, "result", None)
+                if result:
+                    content = str(result).strip()
+                mu = getattr(msg, "model_usage", None) or {}
+                if mu:
+                    model = next(iter(mu.keys()))
+                    stats = mu[model] or {}
+                    context_window = stats.get("contextWindow")
+                    max_output_tokens = stats.get("maxOutputTokens")
+                    in_tok = int(stats.get("inputTokens") or 0)
+                    out_tok = int(stats.get("outputTokens") or 0)
+                    cache_r = int(stats.get("cacheReadInputTokens") or 0)
+                    cache_c = int(stats.get("cacheCreationInputTokens") or 0)
+                break
+
+        if not content:
+            parts = []
+            for msg in messages:
+                if isinstance(msg, AssistantMessage):
+                    for block in getattr(msg, "content", []) or []:
+                        if isinstance(block, TextBlock):
+                            parts.append(block.text)
+            content = "\n".join(parts).strip()
+
+        if not content and tools_seen:
+            content = "(done)"
+
+        return Response(
+            content=content,
+            session_id=sid,
+            cost=cost,
+            tools=list(tools_seen),
             model=model,
             context_window=context_window,
             max_output_tokens=max_output_tokens,
