@@ -78,9 +78,20 @@ class FakeUpdate:
         self.effective_user = None
 
 
+class FakeBot:
+    """PTB Bot stub. Records set_message_reaction calls so tests can assert
+    👀 fired at turn-begin and 👌 at turn-end."""
+
+    def __init__(self):
+        self.reactions: list[tuple[int, int, str]] = []
+
+    async def set_message_reaction(self, *, chat_id, message_id, reaction):
+        self.reactions.append((chat_id, message_id, reaction))
+
+
 class FakeCtx:
     def __init__(self):
-        self.bot = object()
+        self.bot = FakeBot()
         self.application = object()
 
 
@@ -181,8 +192,12 @@ def test_channel_worker_single_turn_clean_reset(monkeypatch, tmp_path):
 
 
 def test_channel_worker_back_to_back_submits_promote_next_anchor(monkeypatch, tmp_path):
-    """P1.4: when V sends two messages back-to-back, the second becomes the
-    anchor for the next SDK turn instead of being silently dropped."""
+    """P1.4 + per-message reply anchor:
+    - SDK turn anchor (P1.4): turn_end 后 promote latest_payload 给下个 SDK turn.
+    - V-visible reply anchor: 每条 V 消息进来立刻把流式输出切到自己的 reply.
+      所以 first_msg 的 SDK turn 期间, 如果第二条 V msg 已经 submit, 后续的
+      text_delta 会 reply 到 second_msg (V 视角"活跃消息"), 不是 first_msg.
+    """
     async def run():
         reset_bot_globals(monkeypatch, tmp_path)
         session = FakeSession()
@@ -203,20 +218,22 @@ def test_channel_worker_back_to_back_submits_promote_next_anchor(monkeypatch, tm
 
         assert session.submitted == [("hello", None), ("more", None)]
         assert bot._in_flight == 1
+        # SDK turn anchor 仍是 msg1 (P1.4: 等 turn_end 才 promote)
         assert worker._turn_anchor == 1
         assert bot.bridge.contexts[-1][2] == 2
 
+        # text_delta — per-message reply: 切到 second_msg (最近 submit 的 V 消息)
         session.queue.put_nowait(Event(kind="text_delta", chunk="Hi"))
-        await wait_for(lambda: len(first_msg.replies) == 1)
-        live_text = first_msg.replies[0]
+        await wait_for(lambda: len(second_msg.replies) == 1)
+        live_text = second_msg.replies[0]
         assert live_text.text == "Hi"
-        assert len(second_msg.replies) == 0
+        assert len(first_msg.replies) == 0  # first_msg 没收到 reply
 
         session.queue.put_nowait(
             Event(kind="tool_use", name="Read", input_dict={"file_path": "a.py"})
         )
-        await wait_for(lambda: len(first_msg.replies) == 2)
-        tool_status = first_msg.replies[1]
+        await wait_for(lambda: len(second_msg.replies) == 2)
+        tool_status = second_msg.replies[1]
         assert "Read" in tool_status.text
 
         session.queue.put_nowait(
@@ -234,20 +251,19 @@ def test_channel_worker_back_to_back_submits_promote_next_anchor(monkeypatch, tm
                 ),
             )
         )
-        # P1.4 invariant: turn_end finalizes msg1's turn, then the second
-        # submit's payload becomes the anchor for the next SDK turn so its
-        # text deltas have somewhere to render.
+        # P1.4: turn_end 后 promote, _turn_anchor 切到 msg2
         await wait_for(lambda: worker._turn_anchor == 2)
         assert bot._in_flight == 1  # next turn pre-armed
+        # final response 编辑当前 _text_message (= second_msg.replies[0])
         assert live_text.edits[-1][0] == "<b>done</b>"
         assert tool_status.deleted is True
         assert bot._session_turns == 1
         assert bot._last_used_tokens == 8
 
-        # Second SDK turn: text delta should hit second_msg's reply, not first
+        # 第二个 SDK turn: _begin_turn 重置 _text_message=None, 又新开 reply 到 msg2
         session.queue.put_nowait(Event(kind="text_delta", chunk="ok"))
-        await wait_for(lambda: len(second_msg.replies) == 1)
-        assert second_msg.replies[0].text == "ok"
+        await wait_for(lambda: len(second_msg.replies) == 3)
+        assert second_msg.replies[2].text == "ok"
 
         # Finalize the second turn cleanly
         session.queue.put_nowait(
@@ -261,6 +277,236 @@ def test_channel_worker_back_to_back_submits_promote_next_anchor(monkeypatch, tm
 
         await worker.stop()
         assert session.closed
+
+    asyncio.run(run())
+
+
+def test_channel_worker_reaction_eye_then_ok_single_turn(monkeypatch, tmp_path):
+    """单条消息: submit → 👀 立即 fire (因为 _begin_turn inline); turn_end → 👌."""
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        await worker.start()
+
+        chat = FakeChat(chat_id=42)
+        msg = FakeMessage(1, "hello")
+        ctx = FakeCtx()
+        await worker.submit(
+            bot.Payload(update=FakeUpdate(msg, chat), ctx=ctx, text="hello")
+        )
+        await wait_for(lambda: (42, 1, "👀") in ctx.bot.reactions)
+        # turn_end 之前不该出现 👌
+        assert (42, 1, "👌") not in ctx.bot.reactions
+
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="hi", session_id="sid-1", cost=0.01),
+            )
+        )
+        await wait_for(lambda: (42, 1, "👌") in ctx.bot.reactions)
+        assert ctx.bot.reactions == [(42, 1, "👀"), (42, 1, "👌")]
+
+        await worker.stop()
+
+    asyncio.run(run())
+
+
+def test_channel_worker_reaction_back_to_back_messages(monkeypatch, tmp_path):
+    """V 连发两条: 第一条 👀 立即, 第二条等. turn_end 后第一条 👌 + 第二条 👀
+    自动接管 (P1.4 promote 路径). 下个 turn_end → 第二条 👌."""
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        await worker.start()
+
+        chat = FakeChat(chat_id=42)
+        m1 = FakeMessage(1, "first")
+        m2 = FakeMessage(2, "second")
+        ctx = FakeCtx()  # 共享同一个 bot 让 reactions 集中收集
+
+        await worker.submit(
+            bot.Payload(update=FakeUpdate(m1, chat), ctx=ctx, text="first")
+        )
+        await wait_for(lambda: (42, 1, "👀") in ctx.bot.reactions)
+
+        await worker.submit(
+            bot.Payload(update=FakeUpdate(m2, chat), ctx=ctx, text="second")
+        )
+        # 第二条还没被 picked_up — 当前 turn 还在跑第一条
+        await asyncio.sleep(0.05)
+        assert (42, 2, "👀") not in ctx.bot.reactions
+        assert (42, 2, "👌") not in ctx.bot.reactions
+
+        # turn 1 结束 → 第一条 👌, P1.4 promote 第二条 → 👀
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="ok1", session_id="sid-1", cost=0.01),
+            )
+        )
+        await wait_for(lambda: (42, 1, "👌") in ctx.bot.reactions)
+        await wait_for(lambda: (42, 2, "👀") in ctx.bot.reactions)
+        assert (42, 2, "👌") not in ctx.bot.reactions
+
+        # turn 2 结束 → 第二条 👌
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="ok2", session_id="sid-2", cost=0.01),
+            )
+        )
+        await wait_for(lambda: (42, 2, "👌") in ctx.bot.reactions)
+
+        # 顺序: 1👀 → 2 等待 → 1👌 → 2👀 → 2👌
+        # (👀 调度 vs 👌 调度顺序在 turn_end finally 里是先 👌 后 _begin_turn 触发 👀)
+        assert ctx.bot.reactions[0] == (42, 1, "👀")
+        assert ctx.bot.reactions[-1] == (42, 2, "👌")
+        assert (42, 1, "👌") in ctx.bot.reactions
+        assert (42, 2, "👀") in ctx.bot.reactions
+
+        await worker.stop()
+
+    asyncio.run(run())
+
+
+def test_channel_worker_new_message_reply_does_not_merge(monkeypatch, tmp_path):
+    """V 发 msg1 流式中, 又发 msg2 — msg2 进来后流式输出应该 reply 到 msg2,
+    不接着编辑 msg1 的旧 reply (per-message reply anchor)."""
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        await worker.start()
+
+        chat = FakeChat(chat_id=42)
+        m1 = FakeMessage(1, "first")
+        m2 = FakeMessage(2, "second")
+        ctx = FakeCtx()
+
+        await worker.submit(
+            bot.Payload(update=FakeUpdate(m1, chat), ctx=ctx, text="first")
+        )
+        # 第一条流式输出: 应 reply 到 m1
+        session.queue.put_nowait(Event(kind="text_delta", chunk="answer-1-part-A"))
+        await wait_for(lambda: len(m1.replies) == 1)
+        first_reply = m1.replies[0]
+        assert "answer-1-part-A" in first_reply.text
+
+        # V 中途发 msg2 (turn 1 还没 turn_end)
+        await worker.submit(
+            bot.Payload(update=FakeUpdate(m2, chat), ctx=ctx, text="second")
+        )
+
+        # 后续 text_delta: 应该 reply 到 m2 (开新消息), 不再编辑 m1.replies[0]
+        session.queue.put_nowait(Event(kind="text_delta", chunk="answer-2"))
+        await wait_for(lambda: len(m2.replies) == 1)
+        assert m2.replies[0].text == "answer-2"
+        # m1 的旧 reply 停在最后流式状态, 没被 "answer-2" 污染
+        assert "answer-2" not in first_reply.text
+        # m1 的旧 reply 也没多新消息进来 (只在它 reply 链有第一条)
+        assert len(m1.replies) == 1
+
+        # 关掉 worker (turn_end 不发, 让 stop 自己 drain)
+        await worker.stop()
+
+    asyncio.run(run())
+
+
+def test_channel_worker_final_response_lands_on_active_reply_anchor(monkeypatch, tmp_path):
+    """P1-C/D: V 发 msg1 流式中 → 发 msg2 → SDK turn_end 来时, final response
+    应该落到 msg2 reply (V 视角 active anchor), 不是 msg1.
+    long-response overflow parts 也必须同 anchor, 不跨 msg1/msg2 分裂."""
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        await worker.start()
+
+        chat = FakeChat(chat_id=42)
+        m1 = FakeMessage(1, "first")
+        m2 = FakeMessage(2, "second")
+        ctx = FakeCtx()
+
+        await worker.submit(
+            bot.Payload(update=FakeUpdate(m1, chat), ctx=ctx, text="first")
+        )
+        # 第一条流式输出: reply 到 m1
+        session.queue.put_nowait(Event(kind="text_delta", chunk="streaming-msg1"))
+        await wait_for(lambda: len(m1.replies) == 1)
+
+        # V 中途发 msg2 — submit 切 active_reply_payload + 清 _text_message
+        await worker.submit(
+            bot.Payload(update=FakeUpdate(m2, chat), ctx=ctx, text="second")
+        )
+
+        # SDK turn_end 来 — final response 应落 msg2 (active anchor), 不落 m1
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(
+                    content="final answer", session_id="sid-1", cost=0.05,
+                ),
+            )
+        )
+        # 等 m2 收到 final response (开新 reply, 因为 _text_message 被 submit 清了)
+        await wait_for(lambda: len(m2.replies) >= 1)
+        # m2 的 reply 包含 final content
+        assert any("final answer" in r.text for r in m2.replies)
+        # m1 的旧 reply 没被 final response 污染 — 停在最后流式状态
+        assert "final answer" not in m1.replies[0].text
+        assert "streaming-msg1" in m1.replies[0].text
+
+        await worker.stop()
+
+    asyncio.run(run())
+
+
+def test_channel_worker_reset_drops_pending_marks(monkeypatch, tmp_path):
+    """P2-D: V 发 m1 → submit (pending=[m1]) → /new → reset_turn_state 应清
+    pending_marks. 接着 V 发 m2 → 只有 m2 进 pending, 不会带着 m1 一起 fire 👀."""
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        await worker.start()
+
+        chat = FakeChat(chat_id=42)
+        ctx = FakeCtx()
+
+        m1 = FakeMessage(1, "first")
+        await worker.submit(
+            bot.Payload(update=FakeUpdate(m1, chat), ctx=ctx, text="first")
+        )
+        await wait_for(lambda: (42, 1, "👀") in ctx.bot.reactions)
+
+        # V /new — 走 _handle_reset 路径
+        new_msg = FakeMessage(99, "/new")
+        await worker.submit(
+            bot.Payload(update=FakeUpdate(new_msg, chat), ctx=ctx, text="/new")
+        )
+        # /new 后 _pending_marks 应被清空 (drop_pending=True 路径)
+        assert worker._pending_marks == []
+        assert worker._active_marks == []
+
+        # V 接着发 m2 — 只有 m2 进 pending → 👀 给 m2
+        m2 = FakeMessage(2, "after-reset")
+        await worker.submit(
+            bot.Payload(update=FakeUpdate(m2, chat), ctx=ctx, text="after-reset")
+        )
+        await wait_for(lambda: (42, 2, "👀") in ctx.bot.reactions)
+
+        # 关键断言: m1 的 (chat=42, msg=1) 不应该再次 fire 👀 (它在 reset 里被丢了)
+        # 第一次 m1 submit 时已 fire 过一次 👀, 但 /new 之后不应再有第二次
+        eye_for_m1 = [r for r in ctx.bot.reactions if r == (42, 1, "👀")]
+        assert len(eye_for_m1) == 1, (
+            f"m1 should have fired 👀 exactly once, got {eye_for_m1}, "
+            f"all reactions: {ctx.bot.reactions}"
+        )
+
+        await worker.stop()
 
     asyncio.run(run())
 

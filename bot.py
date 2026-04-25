@@ -424,6 +424,28 @@ class ChannelWorker:
         self._text_buffer = ""
         self._text_last_edit = 0.0
         self._stopping = False  # set on graceful shutdown to break supervisor loop
+        # 消息状态 reaction: 👀 = SDK 开始处理这条 / 👌 = 这条触发的 turn 已结束.
+        # _pending_marks: submit 后等下个 _begin_turn 接管 (push 到 active_marks 并打 👀)
+        # _active_marks: 当前 turn 已 picked_up; turn_end 时打 👌 并清空
+        # 每条 mark = (bot, chat_id, message_id). bot 用 Any 因为 PTB Bot 实例 (含 ctx.bot)
+        self._pending_marks: list[tuple[Any, int, int]] = []
+        self._active_marks: list[tuple[Any, int, int]] = []
+        self._reaction_tasks: set[asyncio.Task[None]] = set()
+        # P2-A: 串行所有 reaction API 调用, 保证 schedule 顺序 = 执行顺序
+        # (turn_end finally 先 schedule 👌 再触发 _begin_turn → 👀, lock FIFO
+        # 保证 V 看到的最终 reaction 是 👌 不是 👀).
+        self._reaction_lock = asyncio.Lock()
+        # P1-A/B: anchor generation token. submit / _begin_turn 切 anchor 时 +1;
+        # _handle_text_delta / _handle_tool_event 在 await 边界检查, 变了就 abort
+        # 防 stale write 覆盖新 anchor 状态.
+        self._anchor_generation: int = 0
+        # 流式输出 reply 的 anchor — 跟 _turn_payload 解耦.
+        # _turn_payload 是 SDK turn 边界 anchor (P1.4 promote 用); 一个 turn 可能
+        # 跨多条 V 消息. _active_reply_payload 是 V 视角的 "当前活跃消息" — 每条
+        # V message 进来都切到自己, 让流式输出和 tool 状态走新 reply, 不混到上
+        # 一条的 reply 上 (即使 SDK 把多条 batch 成一个 turn 也能保持 per-message
+        # reply 体验).
+        self._active_reply_payload: Payload | None = None
 
     async def start(self) -> None:
         await self.session.connect()
@@ -441,6 +463,16 @@ class ChannelWorker:
                     await self._consume_task
                 except asyncio.CancelledError:
                     pass
+        # 等 in-flight reaction tasks 跑完 (避免 asyncio Task was destroyed warning).
+        # 短超时: reaction 是 fire-and-forget, 卡了直接放弃.
+        if self._reaction_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._reaction_tasks, return_exceptions=True),
+                    timeout=2,
+                )
+            except (asyncio.TimeoutError, Exception):
+                pass
 
     async def submit(self, payload: Payload) -> None:
         chat = payload.update.effective_chat
@@ -461,6 +493,21 @@ class ChannelWorker:
             # next SDK turn if the race between submit and turn_end leaves
             # _turn_payload unset.
             self._latest_payload = payload
+            # 消息状态: 入 _pending_marks 队列, 等 _begin_turn 接管时一起 fire 👀
+            self._pending_marks.append((payload.ctx.bot, chat.id, msg.message_id))
+            # 切流式输出 anchor 到新消息: 后续 text_delta / tool_event 会 reply
+            # 到这条 V 消息, 不接前一条 reply. 上一条 reply 停在最后流式状态
+            # (V 看到的是 msg1 reply 中途断, msg2 reply 续上后续内容).
+            # P1-A/B: anchor_generation += 1 让 in-flight text_delta/tool_event
+            # await 醒来后检测到 stale → abort, 不污染新 anchor 状态.
+            self._anchor_generation += 1
+            self._text_message = None
+            self._text_buffer = ""
+            self._text_last_edit = 0.0
+            self._tool_status = None
+            self._tool_entries = []
+            self._tool_last_edit = 0.0
+            self._active_reply_payload = payload
             if not self._turn_active:
                 self._begin_turn(payload)
 
@@ -478,13 +525,17 @@ class ChannelWorker:
         async with self._state_lock:
             if self._turn_active:
                 await self._surface_error(RuntimeError("会话已切换。"))
-                self._reset_turn_state(exit_inflight=True)
+            # P2-D: drop_pending — resume 后 inbox drain (LiveSession.resume_live
+            # 内部 _stop_client_locked 会 drain), pending V messages 永远不会被
+            # 处理, 不能让它们的 mark 被下次 _begin_turn promote.
+            self._reset_turn_state(exit_inflight=True, drop_pending=True)
             return await self.session.resume_live(sid)
 
     async def _handle_reset(self, payload: Payload) -> None:
         if self._turn_active:
             await self._surface_error(RuntimeError("会话已重置。"))
-            self._reset_turn_state(exit_inflight=True)
+        # P2-D: 同 resume — /new drain 后 pending marks 失效.
+        self._reset_turn_state(exit_inflight=True, drop_pending=True)
         resp = await self.session.reset_live()
         await self._deliver_response(payload, resp)
         self._apply_accounting(resp)
@@ -494,6 +545,9 @@ class ChannelWorker:
         self._turn_active = True
         self._turn_payload = payload
         self._latest_payload = payload  # keep latest in sync
+        # P1-A/B: 切 anchor 时 +1 generation. P1.4 promote 路径走这里, 也要 bump.
+        self._anchor_generation += 1
+        self._active_reply_payload = payload  # 同步切 reply anchor
         self._turn_anchor = msg.message_id if msg else None
         self._tool_status = None
         self._tool_entries = []
@@ -501,6 +555,13 @@ class ChannelWorker:
         self._text_message = None
         self._text_buffer = ""
         self._text_last_edit = 0.0
+        # 消息状态: pending → active, 给本 turn 覆盖的所有 V message 打 👀
+        # (单 turn 可能聚合多条 message: 第一条立即 _begin_turn 时 pending=[m1];
+        # 其后 turn 结束 P1.4 promote 路径再 _begin_turn 时 pending 可能 [m2, m3, ...])
+        if self._pending_marks:
+            self._active_marks = self._pending_marks
+            self._pending_marks = []
+            self._schedule_marks(self._active_marks, "👀")
         _inflight_enter()
 
     async def _consume_events(self) -> None:
@@ -537,7 +598,10 @@ class ChannelWorker:
                 async with self._state_lock:
                     if self._turn_active:
                         await self._surface_error(e)
-                        self._reset_turn_state(exit_inflight=True)
+                        # P2-D: consume crash → reconnect, pending V msgs 失效
+                        self._reset_turn_state(
+                            exit_inflight=True, drop_pending=True
+                        )
 
             if self._stopping:
                 return
@@ -554,9 +618,17 @@ class ChannelWorker:
     async def _handle_text_delta(self, chunk: str) -> None:
         if not chunk:
             return
-        # P1.4: tolerate brief windows where _turn_payload was reset but
-        # _latest_payload still has the most-recent user message anchor.
-        payload = self._turn_payload or self._latest_payload
+        # 优先用 _active_reply_payload (V 视角"当前活跃消息" — 每条 V msg 都切到
+        # 自己, 即使 SDK 还没 turn_end 也能让新消息有独立 reply).
+        # P1.4 fallback: turn_payload / latest_payload 兜底 (race 窗口).
+        # P1-A: snapshot generation 入口, 每次 await 边界检查; 变了就 abort
+        # 避免 stale write 覆盖新 anchor 状态.
+        gen = self._anchor_generation
+        payload = (
+            self._active_reply_payload
+            or self._turn_payload
+            or self._latest_payload
+        )
         if payload is None:
             return
         chat = payload.update.effective_chat
@@ -573,17 +645,27 @@ class ChannelWorker:
 
         if self._text_message is None:
             try:
-                self._text_message = await msg.reply_text(display or "…")
-                self._text_last_edit = now
+                new_reply = await msg.reply_text(display or "…")
             except Exception:
-                pass
+                return
+            # P1-A: gen 没变才装回 _text_message. 变了说明 submit 已经切到新
+            # anchor, 这条 reply 是孤儿 (V 看到一条 "…" 或 first chunk 的孤立
+            # reply), 不能装回去覆盖新 anchor 的 _text_message=None 状态.
+            if gen == self._anchor_generation:
+                self._text_message = new_reply
+                self._text_last_edit = now
             return
 
         if now - self._text_last_edit < 2.0:
             return
+        # P1-A: 在 edit await 前再查一次 gen — 变了就 abort, 不把新 chunk
+        # 写到旧 reply (chunk 在 V 视角属于新 anchor).
+        if gen != self._anchor_generation:
+            return
         self._text_last_edit = now
+        target = self._text_message
         try:
-            await self._text_message.edit_text(display)
+            await target.edit_text(display)
         except Exception:
             pass
         try:
@@ -594,9 +676,15 @@ class ChannelWorker:
     async def _handle_tool_event(self, ev: Event) -> None:
         if _verbose == 0:
             return
-        # P1.4: same fallback as _handle_text_delta — keep tool status visible
-        # even when the payload anchor briefly slipped between turns.
-        payload = self._turn_payload or self._latest_payload
+        # 同 _handle_text_delta: per-message reply anchor 优先, 让 tool 状态也
+        # 跟着新 V 消息走 (不混到上一条 reply 链).
+        # P1-B: gen check 同 _handle_text_delta.
+        gen = self._anchor_generation
+        payload = (
+            self._active_reply_payload
+            or self._turn_payload
+            or self._latest_payload
+        )
         if payload is None:
             return
         chat = payload.update.effective_chat
@@ -617,18 +705,23 @@ class ChannelWorker:
         body = "\n".join(self._tool_entries[-30:])[:_MAX_TG]
         if self._tool_status is None:
             try:
-                self._tool_status = await msg.reply_text(body)
+                new_status = await msg.reply_text(body)
             except Exception:
                 return
-            self._tool_last_edit = time.monotonic()
+            if gen == self._anchor_generation:
+                self._tool_status = new_status
+                self._tool_last_edit = time.monotonic()
             return
 
         now = time.monotonic()
         if now - self._tool_last_edit < 2.0:
             return
+        if gen != self._anchor_generation:
+            return
         self._tool_last_edit = now
+        target = self._tool_status
         try:
-            await self._tool_status.edit_text(body)
+            await target.edit_text(body)
         except Exception:
             pass
         try:
@@ -642,7 +735,14 @@ class ChannelWorker:
             # ResultMessage and consume_events reaching here, _turn_payload may
             # already point at a newer Payload. Either way, fall back to
             # _latest_payload so V never sees a silent drop.
-            payload = self._turn_payload or self._latest_payload
+            # P1-C/D: 优先用 _active_reply_payload (V 视角"当前活跃") — final
+            # response 落到 V 最新 message 的 reply, 跟流式期间的 _text_message
+            # 同 anchor; 否则 long-response overflow parts 会跨两个 anchor 分裂.
+            payload = (
+                self._active_reply_payload
+                or self._turn_payload
+                or self._latest_payload
+            )
             anchor_at_start = self._turn_payload
             # P1.3: try/finally guarantees turn state resets even if TG edits
             # raise — otherwise _in_flight stays >0 and graceful shutdown hangs.
@@ -665,6 +765,12 @@ class ChannelWorker:
                         resp.session_id[:8] if resp.session_id else "new",
                     )
             finally:
+                # 消息状态: 先 fire 👌 给本 turn 的 active_marks, 再 reset
+                # (reset 会清空 active_marks; 必须在 reset 前抢先 fire).
+                if self._active_marks:
+                    done_marks = self._active_marks
+                    self._active_marks = []
+                    self._schedule_marks(done_marks, "👌")
                 self._reset_turn_state(exit_inflight=True)
                 # P1.4: if a submit landed during this turn (latest_payload diverged
                 # from the turn's original anchor), another SDK turn is on the way —
@@ -680,7 +786,10 @@ class ChannelWorker:
         log.error("CC stream failed: %s", exc)
         async with self._state_lock:
             await self._surface_error(exc)
-            self._reset_turn_state(exit_inflight=True)
+            # P2-D: stream error → LiveSession 已 _mark_dead_after_error 清 inbox,
+            # pending marks 永远不会被处理. ChannelWorker supervisor reconnect
+            # 后 _begin_turn 不能 promote 这些已废弃 mark.
+            self._reset_turn_state(exit_inflight=True, drop_pending=True)
 
     async def _surface_error(self, exc: Exception) -> None:
         text = f"Error: {exc}"
@@ -696,7 +805,13 @@ class ChannelWorker:
                 continue
         if surfaced:
             return
-        payload = self._turn_payload
+        # P2-C: 用 _active_reply_payload 优先 (errors 应落 V 最新 message reply,
+        # 不是旧 turn anchor).
+        payload = (
+            self._active_reply_payload
+            or self._turn_payload
+            or self._latest_payload
+        )
         if payload and payload.update.effective_message:
             try:
                 await payload.update.effective_message.reply_text(text)
@@ -791,7 +906,12 @@ class ChannelWorker:
             _state["last_context_window"] = _last_context_window
         _save_state()
 
-    def _reset_turn_state(self, *, exit_inflight: bool) -> None:
+    def _reset_turn_state(
+        self,
+        *,
+        exit_inflight: bool,
+        drop_pending: bool = False,
+    ) -> None:
         was_active = self._turn_active
         self._turn_active = False
         self._turn_payload = None
@@ -802,8 +922,53 @@ class ChannelWorker:
         self._text_message = None
         self._text_buffer = ""
         self._text_last_edit = 0.0
+        # error / reset 路径: turn_end 没 fire 过 👌, active_marks 直接丢
+        # (V 看到的是 reset 消息 / Error 消息, 不需要再补 emoji).
+        # turn_end 路径: 已在 finally 抢先 fire 并清空, 这里是无操作 safety net.
+        self._active_marks = []
+        self._active_reply_payload = None
+        # P1-A/B: bump generation 让 in-flight handler 看到 stale.
+        self._anchor_generation += 1
+        # P2-D: reset/error/resume 路径要清 _pending_marks (这些 mark 的 V 消息
+        # 永远不会被处理了 — /new 后 inbox 已 drain). turn_end 路径不清, 留给
+        # P1.4 promote 给下个 SDK turn 用.
+        if drop_pending:
+            self._pending_marks = []
         if exit_inflight and was_active:
             _inflight_exit()
+
+    def _schedule_marks(self, marks: list[tuple[Any, int, int]], emoji: str) -> None:
+        """Fire-and-forget: 给一组 (bot, chat_id, msg_id) 打 reaction emoji."""
+        if not marks:
+            return
+        task = asyncio.create_task(self._fire_marks(list(marks), emoji))
+        self._reaction_tasks.add(task)
+        task.add_done_callback(self._reaction_tasks.discard)
+
+    async def _fire_marks(
+        self,
+        marks: list[tuple[Any, int, int]],
+        emoji: str,
+    ) -> None:
+        # P2-A: 全局串行所有 reaction API 调用. asyncio.Lock FIFO 保证 schedule
+        # 顺序 = 执行顺序 — turn_end finally 先 schedule 👌(active) 再触发
+        # _begin_turn → 👀(next), V 看到的最终 reaction 一定是后者覆盖前者.
+        # 没这个 lock, 两个 create_task 并发可能让快的 👀 覆盖慢的 👌, 那条
+        # 消息卡在 👀 永远不变 👌 (TG setMessageReaction 是 last-write-wins).
+        async with self._reaction_lock:
+            for bot_obj, chat_id, msg_id in marks:
+                try:
+                    await bot_obj.set_message_reaction(
+                        chat_id=chat_id,
+                        message_id=msg_id,
+                        reaction=emoji,
+                    )
+                except Exception as e:
+                    # TG API throttling / message too old / bot 无权限 — 不影响主流程
+                    log.debug(
+                        "set_message_reaction(%s) %s/%s failed: %s",
+                        emoji, chat_id, msg_id, e,
+                    )
 
 
 def _worker() -> ChannelWorker:
