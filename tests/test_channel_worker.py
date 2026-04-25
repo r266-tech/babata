@@ -461,6 +461,8 @@ def test_channel_worker_reset_drops_pending_marks(monkeypatch, tmp_path):
         # /new 后 _pending_marks 应被清空 (drop_pending=True 路径)
         assert worker._pending_marks == []
         assert worker._active_marks == []
+        # m1 在 /new 时被 fire 💔 (区分 turn_end 的 👌, V 一眼看到未完成).
+        await wait_for(lambda: (42, 1, "💔") in ctx.bot.reactions)
 
         # V 接着发 m2 — 只有 m2 进 pending → 👀 给 m2
         m2 = FakeMessage(2, "after-reset")

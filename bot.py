@@ -515,8 +515,21 @@ class ChannelWorker:
                 self.session.submit(payload.text, payload.images)
             except RuntimeError:
                 log.warning("LiveSession was disconnected; reconnecting before submit")
-                await self.session.connect()
-                self.session.submit(payload.text, payload.images)
+                try:
+                    await self.session.connect()
+                    self.session.submit(payload.text, payload.images)
+                except Exception as e:
+                    # MINOR-1 fix: 二次失败 silent loss + in_flight 卡死 →
+                    # 回滚 (fire 💔 给已 push 的 mark + reset turn state),
+                    # V 通过 reaction 看到这条 V msg 没成功.
+                    log.error(
+                        "Second submit failed: %s — dropping V message", e
+                    )
+                    self._reset_turn_state(
+                        exit_inflight=True,
+                        drop_pending=True,
+                        fail_emoji="💔",
+                    )
 
     async def interrupt(self) -> None:
         await self.session.interrupt()
@@ -528,14 +541,20 @@ class ChannelWorker:
             # P2-D: drop_pending — resume 后 inbox drain (LiveSession.resume_live
             # 内部 _stop_client_locked 会 drain), pending V messages 永远不会被
             # 处理, 不能让它们的 mark 被下次 _begin_turn promote.
-            self._reset_turn_state(exit_inflight=True, drop_pending=True)
+            # 💔: 让 V 看到这些 V msg 被中止, reaction 状态不卡 👀.
+            self._reset_turn_state(
+                exit_inflight=True, drop_pending=True, fail_emoji="💔"
+            )
             return await self.session.resume_live(sid)
 
     async def _handle_reset(self, payload: Payload) -> None:
         if self._turn_active:
             await self._surface_error(RuntimeError("会话已重置。"))
         # P2-D: 同 resume — /new drain 后 pending marks 失效.
-        self._reset_turn_state(exit_inflight=True, drop_pending=True)
+        # 💔: 标记这些 V msg 为"未完成" (区别于 turn_end 的 👌).
+        self._reset_turn_state(
+            exit_inflight=True, drop_pending=True, fail_emoji="💔"
+        )
         resp = await self.session.reset_live()
         await self._deliver_response(payload, resp)
         self._apply_accounting(resp)
@@ -599,8 +618,11 @@ class ChannelWorker:
                     if self._turn_active:
                         await self._surface_error(e)
                         # P2-D: consume crash → reconnect, pending V msgs 失效
+                        # 💔 让 V 一眼看到这些没完成.
                         self._reset_turn_state(
-                            exit_inflight=True, drop_pending=True
+                            exit_inflight=True,
+                            drop_pending=True,
+                            fail_emoji="💔",
                         )
 
             if self._stopping:
@@ -743,7 +765,6 @@ class ChannelWorker:
                 or self._turn_payload
                 or self._latest_payload
             )
-            anchor_at_start = self._turn_payload
             # P1.3: try/finally guarantees turn state resets even if TG edits
             # raise — otherwise _in_flight stays >0 and graceful shutdown hangs.
             try:
@@ -786,7 +807,11 @@ class ChannelWorker:
             # P2-D: stream error → LiveSession 已 _mark_dead_after_error 清 inbox,
             # pending marks 永远不会被处理. ChannelWorker supervisor reconnect
             # 后 _begin_turn 不能 promote 这些已废弃 mark.
-            self._reset_turn_state(exit_inflight=True, drop_pending=True)
+            # 💔 让 V 看到这些 V msg 因 error 中止 (跟 _surface_error 的 "Error:"
+            # message 互补 — message 给具体原因, reaction 给状态).
+            self._reset_turn_state(
+                exit_inflight=True, drop_pending=True, fail_emoji="💔"
+            )
 
     async def _surface_error(self, exc: Exception) -> None:
         text = f"Error: {exc}"
@@ -908,6 +933,7 @@ class ChannelWorker:
         *,
         exit_inflight: bool,
         drop_pending: bool = False,
+        fail_emoji: str | None = None,
     ) -> None:
         was_active = self._turn_active
         self._turn_active = False
@@ -919,9 +945,15 @@ class ChannelWorker:
         self._text_message = None
         self._text_buffer = ""
         self._text_last_edit = 0.0
-        # error / reset 路径: turn_end 没 fire 过 👌, active_marks 直接丢
-        # (V 看到的是 reset 消息 / Error 消息, 不需要再补 emoji).
-        # turn_end 路径: 已在 finally 抢先 fire 并清空, 这里是无操作 safety net.
+        # 失败路径 (error / reset / resume / submit retry fail): fire 💔 给
+        # active + (drop 模式下) pending 让 V 一眼看到这些 V message 没正常完成.
+        # turn_end 路径不传 fail_emoji — finally 段已经手动 fire 过 👌.
+        if fail_emoji:
+            failed = list(self._active_marks)
+            if drop_pending:
+                failed.extend(self._pending_marks)
+            if failed:
+                self._schedule_marks(failed, fail_emoji)
         self._active_marks = []
         self._active_reply_payload = None
         # P1-A/B: bump generation 让 in-flight handler 看到 stale.
