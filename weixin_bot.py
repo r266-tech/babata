@@ -102,7 +102,11 @@ cc = CC(
 # ── markdown → plain text (WeChat renders literal) ───────────────────
 
 _MD_STRIPS = [
-    (re.compile(r"```.*?```", re.DOTALL), ""),
+    # Strip ``` fences but KEEP the inner code (WeChat renders plaintext —
+    # without the body the user just sees code disappear). The info string
+    # tolerates anything except newline / backtick (covers `c#`, `.env`,
+    # `shell script`, etc.); trailing newline after opener is consumed too.
+    (re.compile(r"```[^\r\n`]*\r?\n?(.*?)```", re.DOTALL), r"\1"),
     (re.compile(r"`([^`]+)`"), r"\1"),
     (re.compile(r"\*\*(.+?)\*\*"), r"\1"),
     (re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)"), r"\1"),
@@ -146,6 +150,117 @@ def chunk_text(text: str, limit: int = _MAX_WX) -> list[str]:
     if text:
         out.append(text)
     return out
+
+
+# ── stream split safety ───────────────────────────────────────────────
+# WeChat protocol has no edit-message; the stream coalescer must send
+# multiple messages. Without boundary protection that splits between words /
+# inside ``...`` / inside **...**, leaving readers with cut-off sentences and
+# leftover markdown chars (because strip_markdown's pair-matching regexes
+# fail when only half the pair lives in the prefix). These helpers find a
+# split point that's both at a natural boundary AND keeps the prefix
+# markdown-balanced; tail is returned to the buffer to merge with the next
+# arriving chunk.
+
+_BACKTICK_RE = re.compile(r"(?<!\\)`")           # unescaped backtick
+_BOLD_RE = re.compile(r"(?<!\*)\*\*(?!\*)")      # ** delimiter (not *** etc.)
+# Link / image opener that was not yet closed by `](url)`. If the prefix ends
+# inside a link's text or url half, strip_markdown's [X](Y) regex won't match
+# and the raw `[` / `(` / `]` chars leak to WeChat. We consume every complete
+# link first, then check for any leftover `[`. The URL slot allows one level
+# of nested parens to cover Wikipedia-style URLs like `Foo_(bar)`.
+_LINK_OPENER_RE = re.compile(
+    r"!?\[(?:[^\[\]]*)\]\((?:[^()]|\([^()]*\))*\)"
+)
+
+
+def _md_balanced(text: str) -> bool:
+    """True if backtick / ** / link delimiters are all paired in `text`.
+
+    Checks the markers strip_markdown uses character-pair regexes for:
+    `code`, **bold**, [link](url), ![alt](url). Headings / lists are
+    line-anchored and don't care about cross-flush splits.
+    """
+    if len(_BACKTICK_RE.findall(text)) % 2:
+        return False
+    if len(_BOLD_RE.findall(text)) % 2:
+        return False
+    # Link/image: any `[` (or `![`) that lacks a closed `](url)` after it
+    # would leak as raw markdown when split there. Scan and remove every
+    # complete `[X](Y)` / `![X](Y)`; if any unmatched `[` remains, unbalanced.
+    stripped = _LINK_OPENER_RE.sub("", text)
+    if "[" in stripped:
+        return False
+    return True
+
+
+# Natural-boundary candidates ordered by preference (best → worst).
+# Split point is AFTER the boundary so it stays attached to the prefix.
+_SAFE_BOUNDARIES = (
+    "\n\n",
+    "\n",
+    "。", "！", "？", "；",        # Chinese sentence terminators
+    ". ", "! ", "? ", "; ",         # English sentence terminators
+    "，", "、",                      # Chinese clause separators
+    ", ",                            # English clause separator
+    " ",                             # whitespace last resort
+)
+
+
+def _find_safe_split(text: str, hi: int | None = None) -> int:
+    """Largest split point ≤ hi at a natural boundary that keeps text[:split]
+    markdown-balanced. Returns 0 if nothing safe was found."""
+    n = len(text)
+    if hi is None or hi > n:
+        hi = n
+    if hi <= 0:
+        return 0
+    for boundary in _SAFE_BOUNDARIES:
+        pos = text.rfind(boundary, 0, hi)
+        if pos < 0:
+            continue
+        candidate = pos + len(boundary)
+        if candidate <= 0 or candidate > hi:
+            continue
+        if _md_balanced(text[:candidate]):
+            return candidate
+    return 0
+
+
+def _sanitize_unbalanced_markers(text: str) -> str:
+    """Last-resort scrubber: remove individual unpaired markers from `text`
+    so strip_markdown produces clean output even when we had to force-cut
+    in the middle of a markdown span. Used only on the force-emit escape
+    paths (cut=0 and end-of-stream drain) where holding back is worse than
+    accepting char loss."""
+    # Drop a trailing `**` if odd count (the unpaired one is whichever the
+    # cut left orphaned; rfind is the safe choice).
+    if len(_BOLD_RE.findall(text)) % 2:
+        idx = text.rfind("**")
+        if idx >= 0:
+            text = text[:idx] + text[idx + 2:]
+    # Drop a trailing unescaped backtick if odd count.
+    if len(_BACKTICK_RE.findall(text)) % 2:
+        matches = list(_BACKTICK_RE.finditer(text))
+        if matches:
+            last = matches[-1]
+            text = text[:last.start()] + text[last.end():]
+    # Drop trailing unmatched `[` (the link opener that never closed).
+    # Iterate because Wikipedia-style URLs may need multiple passes.
+    for _ in range(8):  # bounded — typical text has <2 unmatched brackets
+        if _md_balanced(text):
+            break
+        idx = text.rfind("[")
+        if idx < 0:
+            break
+        text = text[:idx] + text[idx + 1:]
+    return text
+
+
+# Stream coalescer thresholds (mirror semantics, not values, of plugin defaults).
+_STREAM_FLUSH_CHARS = 1200   # try to flush once buf reaches this size
+_STREAM_FLUSH_IDLE_S = 6.0   # try to flush after this much idle time
+_STREAM_HARD_MAX = 3500      # force a hard cut when buf reaches this size
 
 
 # ── inbound media decode ─────────────────────────────────────────────
@@ -426,24 +541,70 @@ async def _process_combined_msgs(
         except Exception as e:
             log.debug("typing on failed: %s", e)
 
-    # Stream coalescer — mirrors plugin's blockStreamingCoalesceDefaults:
-    #   flush when accumulated text >= 200 chars OR 3s idle since last flush.
-    # Each flush sends one FINISH sendmessage. Long replies naturally produce
-    # multiple FINISH sends (same as the plugin does for its own agent output).
+    # Stream coalescer — wx protocol has no edit-message, so each flush sends
+    # a new FINISH sendmessage. We split only at natural sentence/paragraph
+    # boundaries that keep markdown pairs (`...`, **...**, [..](..)) balanced;
+    # otherwise we wait. _STREAM_HARD_MAX is the upper bound past which we
+    # force a cut (last whitespace within bound, retracted to nearest balanced
+    # position; if even that fails, sanitize markers and emit) to avoid
+    # unbounded buffering when the stream produces no boundaries.
     buf: list[str] = []
     last_flush = time.monotonic()
     flush_lock = asyncio.Lock()
     sent_any = False
 
-    async def _flush() -> None:
+    async def _flush(force: bool = False) -> None:
+        """Send accumulated buf. force=True drains everything (use after stream
+        ends). force=False finds a safe split, sends prefix, returns tail to
+        buf. May return without sending when no safe split is reachable yet."""
         nonlocal last_flush, sent_any
         async with flush_lock:
             if not buf:
                 return
             raw = "".join(buf)
+            sanitize_needed = False
+            if force:
+                # End-of-stream drain: prefix may end mid-marker if the model
+                # output was itself malformed. Run sanitize unconditionally
+                # so strip_markdown sees a balanced prefix.
+                prefix, tail = raw, ""
+                sanitize_needed = not _md_balanced(prefix)
+            else:
+                split = _find_safe_split(raw)
+                if split <= 0:
+                    if len(raw) < _STREAM_HARD_MAX:
+                        return  # wait for more chunks to give us a boundary
+                    # Hard-cut fallback: last whitespace within the hard max,
+                    # then retract to the nearest md-balanced position so we
+                    # never leak an unpaired ` / ** / [ marker.
+                    cut = raw.rfind(" ", 0, _STREAM_HARD_MAX)
+                    if cut < _STREAM_HARD_MAX // 2:
+                        cut = _STREAM_HARD_MAX
+                    while cut > 0 and not _md_balanced(raw[:cut]):
+                        cut -= 1
+                    # cut == 0: the whole prefix has an unclosable marker
+                    # (e.g. buf opens with a never-closed `). Rather than
+                    # spin retrying forever (each new chunk re-enters here),
+                    # force-emit at _STREAM_HARD_MAX // 2 with sanitize so
+                    # the leaked marker is scrubbed before send. Frozen
+                    # output is worse than dropping a char.
+                    if cut <= 0:
+                        cut = _STREAM_HARD_MAX // 2
+                        sanitize_needed = True
+                        log.warning(
+                            "wx flush: no md-balanced prefix in %d-char buf; "
+                            "force-emitting at pos %d (sanitizing markers)",
+                            len(raw), cut,
+                        )
+                    split = cut
+                prefix, tail = raw[:split], raw[split:]
             buf.clear()
+            if tail:
+                buf.append(tail)
             last_flush = time.monotonic()
-            text = strip_markdown(raw)
+            if sanitize_needed:
+                prefix = _sanitize_unbalanced_markers(prefix)
+            text = strip_markdown(prefix)
             if not text:
                 return
             for chunk in chunk_text(text):
@@ -459,7 +620,10 @@ async def _process_combined_msgs(
         if not text_chunk:
             return
         buf.append(text_chunk)
-        if len("".join(buf)) >= 200 or (time.monotonic() - last_flush) >= 3.0:
+        cur = sum(len(b) for b in buf)
+        if cur >= _STREAM_FLUSH_CHARS or (
+            cur > 0 and (time.monotonic() - last_flush) >= _STREAM_FLUSH_IDLE_S
+        ):
             await _flush()
 
     try:
@@ -476,8 +640,9 @@ async def _process_combined_msgs(
             pass
         return
 
-    # Drain any residue after CC finished
-    await _flush()
+    # Drain any residue after CC finished — force=True bypasses safe-split
+    # gating since there's no more incoming stream to wait for.
+    await _flush(force=True)
 
     # If stream produced nothing (CC output came only via resp.content, not
     # partial chunks), send the final content as one reply.
