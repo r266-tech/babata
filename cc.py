@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import subprocess
+import time
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -246,6 +247,24 @@ async def _always_allow(
 _MAX_RECENT_SIDS = 200          # ring buffer of past session_ids (~1y at 5/day, ~15KB state file)
 _RESUME_INJECT_PAIRS = 3        # last N user+assistant pairs to inject on resume failure
 _RESUME_INJECT_CHARS = 300      # per-turn char cap (3 pairs × 300 × 2 ≈ 1.8KB, fits any system_prompt)
+_IDLE_RESET_MINUTES_DEFAULT = 1440  # 24h, parity with hermes session_reset.idle_minutes (gateway/config.py:114)
+
+
+def _idle_reset_seconds() -> int:
+    """Idle threshold in seconds. 0 = disabled. Override via BABATA_IDLE_RESET_MINUTES."""
+    raw = os.environ.get("BABATA_IDLE_RESET_MINUTES")
+    if raw is None:
+        m = _IDLE_RESET_MINUTES_DEFAULT
+    else:
+        try:
+            m = int(raw)
+        except ValueError:
+            log.warning(
+                "Bad BABATA_IDLE_RESET_MINUTES=%r, using default %d",
+                raw, _IDLE_RESET_MINUTES_DEFAULT,
+            )
+            m = _IDLE_RESET_MINUTES_DEFAULT
+    return max(0, m) * 60
 
 
 # CC CLI writes synthetic `type:"user"` entries for its own housekeeping:
@@ -380,11 +399,56 @@ class CC:
     def _record_sid(self, sid: str | None) -> None:
         state = self._load_state()
         state["session_id"] = sid
+        # Touch activity timestamp on every sid write — _run() calls this after
+        # each successful turn, so it doubles as the idle-reset clock.
+        state["last_activity_at"] = time.time()
         if sid:
             hist = [s for s in state.get("recent_sids", []) if s != sid]
             hist.insert(0, sid)
             state["recent_sids"] = hist[:_MAX_RECENT_SIDS]
         self._save_state(state)
+
+    def _check_idle_reset(self) -> bool:
+        """Silently reset session if idle exceeds threshold. Returns True if reset.
+
+        Idle reset ≠ /new: fires only the babata-local session-end hook for the
+        old sid. Skips skill-evolve session-start (V didn't actively reset) and
+        skips the "会话已重置" reply. Next turn starts fresh and picks up the
+        standard SessionStart memory inject.
+
+        Default 24h, parity with hermes idle_minutes. Migration: state files
+        without last_activity_at fall back to file mtime so an already-stale
+        sid doesn't get one free turn before reset kicks in.
+        """
+        threshold = _idle_reset_seconds()
+        if threshold <= 0 or not self._session_id:
+            return False
+        last = self._load_state().get("last_activity_at")
+        if not isinstance(last, (int, float)):
+            try:
+                last = self._state_file.stat().st_mtime
+            except OSError:
+                return False
+        elapsed = time.time() - last
+        if elapsed < 0:
+            # Future timestamp (clock rollback / NTP / corruption). Don't
+            # reset — _record_sid overwrites with current time on next turn.
+            log.warning(
+                "idle check: future timestamp on sid=%s (last=%s now=%s); skipping",
+                self._session_id[:8], last, time.time(),
+            )
+            return False
+        if elapsed <= threshold:
+            return False
+        log.info(
+            "idle reset: sid=%s elapsed=%.0fs threshold=%ds",
+            self._session_id[:8], elapsed, threshold,
+        )
+        old_sid = self._session_id
+        self._fire_hook(_HOOKS_DIR, "session-end.sh", old_sid)
+        self._session_id = None
+        self._record_sid(None)
+        return True
 
     def _recent_turns_summary(self) -> str:
         """Take the most recent session (tracked in state.recent_sids) and
@@ -705,6 +769,11 @@ class CC:
             self.reset()
             return Response(content="会话已重置。", session_id="", cost=0.0)
 
+        # Silent idle reset (default 24h, hermes parity). V didn't ask for it,
+        # don't reply "会话已重置" — fresh session + memory inject takes over.
+        # Override via BABATA_IDLE_RESET_MINUTES env (0 disables).
+        self._check_idle_reset()
+
         opts = ClaudeAgentOptions(
             max_turns=200,
             permission_mode="bypassPermissions",
@@ -963,6 +1032,11 @@ class LiveSession(CC):
             if self.is_connected:
                 return
             self._closed = False
+            # Idle reset on connect: process restart (e.g. daily 4am launchd
+            # restart, see com.babata*.plist) clears stale sid before resume.
+            # Bot doesn't reset mid-flight — that complexity belongs to process
+            # lifecycle, not LiveSession's hot path.
+            self._check_idle_reset()
             try:
                 await self._start_client_locked(self._make_options())
             except Exception as e:
