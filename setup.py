@@ -224,6 +224,48 @@ def probe_third_party(base_url: str, token: str) -> tuple[bool, list[str], str]:
     return False, [], msg
 
 
+def _probe_messages(base_url: str, token: str, model: str) -> tuple[bool, str]:
+    """POST 一个最小 /v1/messages 真正验证 token + model. 消耗 1 个请求 quota.
+
+    跟 probe_third_party 一样 serial fallback: x-api-key 先, 401/403 再 Bearer.
+    /v1/models 探不到时, 这是唯一办法在装的时候发现 token / model 错.
+    """
+    base = base_url.rstrip("/")
+    url = f"{base}/v1/messages"
+    body = {
+        "model": model,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    common = {"anthropic-version": "2023-06-01", "Content-Type": "application/json"}
+
+    def _try(headers: dict[str, str]) -> tuple[int, str]:
+        try:
+            with httpx.Client(timeout=30) as client:
+                r = client.post(url, headers=headers, json=body)
+            return r.status_code, r.text[:300]
+        except httpx.HTTPError as e:
+            return -1, f"网络错误: {e}"
+
+    code, body_txt = _try({"x-api-key": token, **common})
+    if code in (401, 403):
+        code2, body_txt2 = _try({"Authorization": f"Bearer {token}", **common})
+        if code2 not in (401, 403):
+            code, body_txt = code2, body_txt2
+
+    if code == 200:
+        return True, "token + model 都有效"
+    if code == -1:
+        return False, body_txt
+    if code in (401, 403):
+        return False, f"token 鉴权失败 HTTP {code}: {body_txt}"
+    if code == 400:
+        return False, f"请求被拒 HTTP 400 (model 名错或格式不兼容): {body_txt}"
+    if code == 404:
+        return False, f"endpoint 不接 /v1/messages 或 model 不存在 HTTP 404: {body_txt}"
+    return False, f"HTTP {code}: {body_txt}"
+
+
 # ── step 1: model auth ─────────────────────────────────────────────────
 
 # 完整 key 列表 — 选了某档就把其他档的字段清空, 防止上一次的残留串模式
@@ -341,6 +383,18 @@ def _step_third_party() -> dict[str, str]:
             print("空值, 重输")
 
     print(f"✓ model = {model}")
+
+    # 真验 token + model — POST 一次最小 /v1/messages. 消耗 1 个请求 quota,
+    # 但是装的时候就发现错比 babata 启动 fail 友好.
+    print("验证 token + model (发一次最小请求)...")
+    chat_ok, chat_msg = _probe_messages(base_url, token, model)
+    if chat_ok:
+        print(f"✓ {chat_msg}")
+    else:
+        print(f"✗ {chat_msg}")
+        if not confirm("仍然保存 (后续启动可能失败)?", default=False):
+            sys.exit(1)
+
     out = _empty_auth()
     out["ANTHROPIC_BASE_URL"] = base_url
     out["ANTHROPIC_AUTH_TOKEN"] = token
