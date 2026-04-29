@@ -657,7 +657,14 @@ def main() -> int:
     print(f"✓ .env 已写入 Claude auth")
 
     # 2. CLAUDE_CLI_PATH (落盘一次)
+    # PATH 里没找到时显式探常见安装目录 — 用户单独跑 setup.py 没经过 install.sh
+    # 的 export PATH, ~/.local/bin 不在当前 shell 但 claude 是装在那的.
     claude_bin = shutil.which("claude")
+    if not claude_bin:
+        for cand in [Path.home() / ".local/bin/claude", Path("/usr/local/bin/claude")]:
+            if cand.is_file() and os.access(cand, os.X_OK):
+                claude_bin = str(cand)
+                break
     if claude_bin:
         write_env({"CLAUDE_CLI_PATH": claude_bin})
         print(f"✓ CLAUDE_CLI_PATH = {claude_bin}")
