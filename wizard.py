@@ -1,6 +1,6 @@
 """babata 引导程序 — 全自动配置, 不让用户碰 .env.
 
-跑这个: install.sh 装完 deps 后自动调; 也可以独立 `.venv/bin/python setup.py` 重跑.
+跑这个: install.sh 装完 deps 后自动调; 也可以独立 `.venv/bin/python wizard.py` 重跑.
 
 三档 Claude 接入:
   [1] Anthropic 官方 API key — 验证后写 ANTHROPIC_API_KEY
@@ -119,7 +119,7 @@ def write_env(updates: dict[str, str]) -> None:
     if appends:
         if new_lines and new_lines[-1].strip():
             new_lines.append("")
-        new_lines.append("# ── added by setup.py ──")
+        new_lines.append("# ── added by wizard.py ──")
         for k in appends:
             new_lines.append(f"{k}={updates[k]}")
 
@@ -607,7 +607,7 @@ def step_wx() -> bool:
         return False
 
     # WX 依赖 (pilk + qrcode) 默认不装 — TG-only 用户不该被 C 扩展拖累.
-    # 选 WX 才现装. 独立跑 setup.py 时 PATH 可能没 ~/.local/bin, 显式探.
+    # 选 WX 才现装. 独立跑 wizard.py 时 PATH 可能没 ~/.local/bin, 显式探.
     uv_bin = shutil.which("uv")
     if not uv_bin:
         for cand in [Path.home() / ".local/bin/uv", Path("/usr/local/bin/uv")]:
@@ -667,7 +667,7 @@ def main() -> int:
     print(f"✓ .env 已写入 Claude auth")
 
     # 2. CLAUDE_CLI_PATH (落盘一次)
-    # PATH 里没找到时显式探常见安装目录 — 用户单独跑 setup.py 没经过 install.sh
+    # PATH 里没找到时显式探常见安装目录 — 用户单独跑 wizard.py 没经过 install.sh
     # 的 export PATH, ~/.local/bin 不在当前 shell 但 claude 是装在那的.
     claude_bin = shutil.which("claude")
     if not claude_bin:
@@ -705,9 +705,9 @@ def main() -> int:
         print("   纯微信启动需要单独跑: .venv/bin/python weixin_bot.py")
     else:
         print("⚠️  TG 和微信都没装, babata 现在跑不起来. 重跑 setup:")
-        print("   .venv/bin/python setup.py")
+        print("   .venv/bin/python wizard.py")
     print()
-    print("重跑 setup:  .venv/bin/python setup.py")
+    print("重跑 setup:  .venv/bin/python wizard.py")
     print()
     # 退出码: 至少一个 channel 装了 → 0; 都没装 → 1 (install.sh 据此判断)
     return 0 if (tg_configured or wx_configured) else 1

@@ -82,12 +82,12 @@ echo "Installing Python deps..."
 uv sync --quiet
 echo "✓ venv ready at .venv/"
 
-# 6) .env scaffold (setup.py 会自动填; 这里只确保文件存在)
+# 6) .env scaffold (wizard.py 会自动填; 这里只确保文件存在)
 if [[ ! -f .env ]]; then
     cp .env.example .env
     echo "✓ .env created from template"
 else
-    echo "✓ .env exists (setup.py 会按需更新)"
+    echo "✓ .env exists (wizard.py 会按需更新)"
 fi
 
 # 7) Expose `babata` as a global command (mirrors hermes / openclaw)
@@ -125,17 +125,17 @@ case ":$PATH:" in
        ;;
 esac
 
-# 8) Hand off to setup.py — interactive guided config (auth + TG + WX)
+# 8) Hand off to wizard.py — interactive guided config (auth + TG + WX)
 echo
-echo "── 进入引导程序 setup.py (可 Ctrl+C 跳过, 之后再跑 .venv/bin/python setup.py) ──"
+echo "── 进入引导程序 wizard.py (可 Ctrl+C 跳过, 之后再跑 .venv/bin/python wizard.py) ──"
 echo
 
 SETUP_EXIT=0
 if [[ -t 0 ]] && [[ -t 1 ]]; then
-    # 不能 set -e 时直接跑 setup.py — 失败会让整个 install.sh exit. 显式捕获退出码.
-    "$REPO_DIR/.venv/bin/python" "$REPO_DIR/setup.py" || SETUP_EXIT=$?
+    # 不能 set -e 时直接跑 wizard.py — 失败会让整个 install.sh exit. 显式捕获退出码.
+    "$REPO_DIR/.venv/bin/python" "$REPO_DIR/wizard.py" || SETUP_EXIT=$?
 else
-    echo "(非交互终端, 跳过引导. 手动跑: .venv/bin/python setup.py)"
+    echo "(非交互终端, 跳过引导. 手动跑: .venv/bin/python wizard.py)"
     SETUP_EXIT=99  # 显式标记: 没跑过, 待用户手动跑
 fi
 
@@ -144,21 +144,21 @@ if [[ $SETUP_EXIT -eq 0 ]]; then
     cat <<EOF
 ── Install done. Next: ─────────────────────────
   - 启动 bot:         babata           (foreground, Ctrl+C to stop)
-  - 重跑引导配置:     .venv/bin/python setup.py
+  - 重跑引导配置:     .venv/bin/python wizard.py
   - 后台常驻 (macOS): docs/persist-macos.md
 
 EOF
 elif [[ $SETUP_EXIT -eq 99 ]]; then
     cat <<EOF
 ── Install 完成, 配置待手动 ──────────────────
-  - 跑引导配置:       .venv/bin/python setup.py
+  - 跑引导配置:       .venv/bin/python wizard.py
   - 后台常驻 (macOS): docs/persist-macos.md
 
 EOF
 else
     cat <<EOF
-── Install 完成, 但配置未完成 (setup.py exit=$SETUP_EXIT) ──
-  - 重跑引导:         .venv/bin/python setup.py
+── Install 完成, 但配置未完成 (wizard.py exit=$SETUP_EXIT) ──
+  - 重跑引导:         .venv/bin/python wizard.py
   - 没装任何 channel babata 跑不起来.
 
 EOF

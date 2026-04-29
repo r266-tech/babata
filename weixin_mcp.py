@@ -85,6 +85,17 @@ async def list_tools() -> list[Tool]:
                 "required": ["path"],
             },
         ),
+        # wx_send_voice 永久下线 (2026-04-26 round 2 verdict, Java SDK live test 坐实):
+        # ilink 协议 server 在 bot→user 方向 silent filter voice item.
+        # 穷举证据:
+        #   - 13 字段变体 (A-M) + silk +0x02 prefix + 3 个 encode_type 值 (4/6/7)
+        #     + 5 个 channel_version (1.0.0/2.1.8/2.1.9/2.1.10/2.2.0/3.0.0)
+        #     + echo V 自己录的 silk 字节 verbatim
+        #   - 全部 server 200 OK 但 client 永不渲染气泡
+        #   - lith0924 Java SDK (CSDN 文章 reference, GitHub wechat-ilink-sdk-java) live test:
+        #     mvn install + WeixinVoiceSend.java + 拦截 wire dump → server 同样 200 OK,
+        #     V 同样收不到. Java SDK 是 vaporware.
+        # ClawBot 截图里的 voice 气泡是 V 发给 bot 的输入 (左对齐), 不是 bot 发的.
         Tool(
             name="wx_send_typing",
             description=(
