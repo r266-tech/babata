@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.babata</string>
+
+    <!-- Edit __REPO_DIR__ to your actual clone path, e.g. /Users/yourname/code/babata -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO_DIR__/.venv/bin/python</string>
+        <string>__REPO_DIR__/bot.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_DIR__</string>
+
+    <!-- Auto-restart on crash, throttled so a tight crash loop doesn't burn CPU -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Graceful shutdown: 600s for in-flight CC queries to finish before SIGKILL.
+         bot.py's _graceful_shutdown handles SIGTERM and waits for tasks. -->
+    <key>ExitTimeOut</key>
+    <integer>600</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/babata.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/babata.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- launchd's default PATH is minimal; brew/homebrew binaries live here -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+
+        <!-- Edit __HOME__ to your home dir, e.g. /Users/yourname -->
+        <key>HOME</key>
+        <string>__HOME__</string>
+
+        <!-- Path to claude binary (output of `which claude`) -->
+        <key>CLAUDE_CLI_PATH</key>
+        <string>__HOME__/.local/bin/claude</string>
+    </dict>
+</dict>
+</plist>

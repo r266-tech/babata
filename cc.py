@@ -56,7 +56,19 @@ from constants import (
 
 VENV_PYTHON = str(Path(__file__).parent / ".venv" / "bin" / "python")
 
-_CC_PROJECTS = Path.home() / ".claude/projects/-Users-admin"
+_CC_PROJECTS = Path.home() / ".claude" / "projects" / str(Path.home()).replace("/", "-")
+
+# 默认隔离 — 不读用户 ~/.claude/{settings.json, CLAUDE.md, skills/}, 不动 OAuth keychain.
+# 用户日常 CC 完全无感. 开源用户走这条 (.env 必须有 ANTHROPIC_API_KEY).
+# V 私人 .env 设 BABATA_SHARED_CC=1 → 共享用户 CC 全套 (skill / settings / OAuth), 跟之前体验一致.
+_SETTING_SOURCES: list[str] = ["user"] if os.environ.get("BABATA_SHARED_CC") == "1" else []
+
+# 默认信任边界 — babata 容器化 default: cwd 限定 repo 自身 (不让 babata access 用户整个家),
+# permission_mode 走 "default" (重要 tool call 提示授权, 不静默 bypass).
+# V 私人 .env 设 BABATA_FULL_TRUST=1 → cwd=~/ + bypassPermissions, 跟之前 V 体验一致.
+_FULL_TRUST = os.environ.get("BABATA_FULL_TRUST") == "1"
+_DEFAULT_CWD = str(Path.home()) if _FULL_TRUST else str(Path(__file__).parent)
+_PERMISSION_MODE = "bypassPermissions" if _FULL_TRUST else "default"
 
 # _STATE_DIR: all channel state files land here. Cross-channel session picker
 # scans this dir, so it's a soft coupling — cc.py isn't fully channel-agnostic
@@ -392,7 +404,9 @@ class CC:
     def _save_state(self, state: dict) -> None:
         try:
             self._state_file.parent.mkdir(parents=True, exist_ok=True)
-            self._state_file.write_text(json.dumps(state))
+            tmp = self._state_file.with_suffix(self._state_file.suffix + ".tmp")
+            tmp.write_text(json.dumps(state))
+            tmp.replace(self._state_file)
         except Exception as e:
             log.warning("Failed to persist session state: %s", e)
 
@@ -764,8 +778,8 @@ class CC:
     ) -> Response:
         # Channel-agnostic reset command. Any channel (TG/WX/future) whose
         # transport layer doesn't have its own command dispatch still gets
-        # /new + /reset for free — and reset() fires the skill-evolve hooks.
-        if prompt.strip() in ("/new", "/reset") and not images:
+        # /new for free — and reset() fires the skill-evolve hooks.
+        if prompt.strip() == "/new" and not images:
             self.reset()
             return Response(content="会话已重置。", session_id="", cost=0.0)
 
@@ -776,13 +790,13 @@ class CC:
 
         opts = ClaudeAgentOptions(
             max_turns=200,
-            permission_mode="bypassPermissions",
+            permission_mode=_PERMISSION_MODE,
             can_use_tool=_always_allow,  # auto-approve protected-path prompts that bypassPermissions still forwards
-            cwd=str(Path.home()),
+            cwd=_DEFAULT_CWD,
             cli_path=os.environ.get("CLAUDE_CLI_PATH"),
             include_partial_messages=on_stream is not None,
             system_prompt=self._source_prompt,
-            setting_sources=["user"],  # 读 ~/.claude/{settings.json, CLAUDE.md, skills/} - 统一身份跨终端/TG/cron
+            setting_sources=_SETTING_SOURCES,  # 默认 [] 隔离; BABATA_SHARED_CC=1 → ["user"] 共享
             mcp_servers=self._mcp_servers,
             # SDK 默认 max_buffer_size = 1MB; V 发 PDF/大图 或 resume 含 base64
             # 附件的老 session 时, CLI stdout 单条 JSON message 就超了 → 报
@@ -1010,13 +1024,13 @@ class LiveSession(CC):
     ) -> ClaudeAgentOptions:
         opts = ClaudeAgentOptions(
             max_turns=200,
-            permission_mode="bypassPermissions",
+            permission_mode=_PERMISSION_MODE,
             can_use_tool=_always_allow,
-            cwd=str(Path.home()),
+            cwd=_DEFAULT_CWD,
             cli_path=os.environ.get("CLAUDE_CLI_PATH"),
             include_partial_messages=True,
             system_prompt=system_prompt if system_prompt is not None else self._source_prompt,
-            setting_sources=["user"],
+            setting_sources=_SETTING_SOURCES,
             mcp_servers=self._mcp_servers,
             # SDK 默认 1MB; PDF/大图 / base64 附件 resume 会爆 buffer (2026-04-22
             # babata-vvv.err 事件). 64MB 一次性 settle. 跟 CC._make_options 同步.

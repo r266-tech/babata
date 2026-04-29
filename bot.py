@@ -13,6 +13,7 @@ import re
 import shutil
 import signal
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -33,7 +34,7 @@ load_dotenv(override=False)
 # Namespace / paths derive from PROJECT_NAMESPACE + BABATA_INSTANCE env.
 # See constants.py for the full derivation. Propagate BRIDGE_SOCKET to
 # bridge.py (imported next) and to tg_mcp subprocess below.
-from constants import BRIDGE_SOCKET, INSTANCE, INSTANCE_LABELS, PROJECT, SESSION_FILE, STATE_FILE
+from constants import BRIDGE_SOCKET, INSTANCE, INSTANCE_LABELS, PROJECT, SESSION_FILE, STATE_DIR, STATE_FILE
 os.environ["BABATA_BRIDGE_SOCKET"] = BRIDGE_SOCKET
 
 from telegram import Update
@@ -161,15 +162,14 @@ def _install_signal_handlers(app: "Application") -> None:
 # 自己每 30s touch; 主 TG bot (INSTANCE="") 监控微信心跳, stale > 3 min 告警
 # 一次 (对方 fresh 后允许再告). vvv/vvvv 只写不监控 — 避免重复告警.
 
-_HEARTBEAT_DIR = Path.home() / "cc-workspace" / "state"
-_HEARTBEAT_ME = _HEARTBEAT_DIR / f"babata-tg{'-' + INSTANCE if INSTANCE else ''}-heartbeat"
-_HEARTBEAT_PEER = _HEARTBEAT_DIR / "babata-weixin-heartbeat"
+_HEARTBEAT_ME = STATE_DIR / f"{PROJECT}-tg{'-' + INSTANCE if INSTANCE else ''}-heartbeat"
+_HEARTBEAT_PEER = STATE_DIR / f"{PROJECT}-weixin-heartbeat"
 _HEARTBEAT_STALE_S = 180
 _HEARTBEAT_INTERVAL_S = 30
 
 
 async def _heartbeat_loop(app: "Application") -> None:
-    _HEARTBEAT_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     alerted = False
     is_primary = not INSTANCE
     while True:
@@ -224,10 +224,6 @@ _last_model: str | None = _state.get("last_model")
 _last_context_window: int | None = _state.get("last_context_window")
 _last_used_tokens: int = int(_state.get("last_used_tokens", 0))
 _last_cost: float = float(_state.get("last_cost", 0.0))
-# Today's cost — this bot instance only. Date-stamped so it self-resets across
-# day rollover (instead of silently accumulating into yesterday's bucket).
-_today_cost: float = float(_state.get("today_cost", 0.0))
-_today_cost_date: str = _state.get("today_cost_date", "")
 
 # ── Formatting (physical: TG requires HTML, max 4096 chars) ──────────
 
@@ -388,8 +384,9 @@ def _split(text: str) -> list[str]:
 # ── Auth (physical: access control) ──────────────────────────────────
 
 def _allowed(update: Update) -> bool:
+    # ALLOWED_USER 必须显式设置 — 默认 deny 防止开源用户首次跑没配置就开放给陌生人.
     if not ALLOWED_USER:
-        return True
+        return False
     return bool(update.effective_user and update.effective_user.id == ALLOWED_USER)
 
 
@@ -484,7 +481,7 @@ class ChannelWorker:
         self._last_user_msg_id = msg.message_id
 
         async with self._state_lock:
-            if payload.text.strip() in ("/new", "/reset") and not payload.images:
+            if payload.text.strip() == "/new" and not payload.images:
                 await self._handle_reset(payload)
                 return
 
@@ -891,11 +888,8 @@ class ChannelWorker:
 
     def _apply_accounting(self, resp: Response) -> None:
         global _session_cost, _session_turns, _last_model, _last_context_window
-        global _last_used_tokens, _last_cost, _today_cost
+        global _last_used_tokens, _last_cost
         if not resp.session_id and resp.cost == 0.0 and not resp.tools:
-            # /new shortcut — wipe per-session accumulators. _today_cost
-            # intentionally NOT reset: /new is a session boundary but today's
-            # spending is per-calendar-day.
             _session_cost = 0.0
             _session_turns = 0
             _last_used_tokens = 0
@@ -904,8 +898,6 @@ class ChannelWorker:
             _session_cost += resp.cost
             _session_turns += 1
             _last_cost = resp.cost
-            _roll_today_cost(datetime.now().strftime("%Y-%m-%d"))
-            _today_cost += resp.cost
             if resp.model:
                 _last_model = resp.model
             if resp.context_window:
@@ -920,8 +912,6 @@ class ChannelWorker:
         _state["session_turns"] = _session_turns
         _state["last_cost"] = _last_cost
         _state["last_used_tokens"] = _last_used_tokens
-        _state["today_cost"] = _today_cost
-        _state["today_cost_date"] = _today_cost_date
         if _last_model:
             _state["last_model"] = _last_model
         if _last_context_window:
@@ -1008,12 +998,6 @@ def _worker() -> ChannelWorker:
 
 # ── Handlers ──────────────────────────────────────────────────────────
 
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _allowed(update):
-        return
-    await update.message.reply_text("Ready.")
-
-
 async def cmd_verbose(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
         return
@@ -1052,7 +1036,7 @@ def _scan_recent_session_model() -> str | None:
         recent = cc._load_state().get("recent_sids") or []
     except Exception:
         recent = []
-    proj_dir = Path.home() / ".claude/projects/-Users-admin"
+    proj_dir = Path.home() / ".claude" / "projects" / str(Path.home()).replace("/", "-")
     for sid in recent[:5]:
         fp = proj_dir / f"{sid}.jsonl"
         if not fp.is_file():
@@ -1104,63 +1088,168 @@ def _sdk_version() -> str:
 #   [bar] N% · <model> (<window> context)
 #   session N% · resets Npm  |  week N% · resets Mon DD  |  $X today
 #
-# Mirror it on the bot. Quota comes from api.anthropic.com/api/oauth/usage
-# (OAuth-scoped endpoint CC itself uses), which needs the account's OAuth
-# access token (lives in macOS keychain, auto-refreshed by /login).
-_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+# Quota source: send a 1-token POST to /v1/messages and read the
+# `anthropic-ratelimit-unified-{5h,7d}-utilization` response headers — same
+# numbers the official CLI's TUI surfaces (claude_agent_sdk's RateLimitEvent
+# strips utilization in print/SDK mode, and /api/oauth/usage is rate-limited
+# upstream, so neither works as a fallback). Costs ~9 input + 1 output token
+# of the cheapest model per /status invocation; not cached because V wants
+# real-time numbers.
 
 
-def _claude_oauth_token() -> str | None:
-    """Pull the OAuth access token from keychain (same slot /login writes).
-    Single source; don't mirror it to .env (see memory reference on token
-    single-source). Returns None if keychain lookup fails."""
+def _fetch_anthropic_quota_sync(token: str) -> dict | None:
+    """POST a minimal Claude API request and parse rate-limit headers.
+    Returns {"five_hour": {utilization, resets_at}, "seven_day": {...}} or
+    None on net/auth failure."""
+    if not token:
+        return None
+    body = json.dumps({
+        "model": "claude-haiku-4-5",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "."}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "oauth-2025-04-20",
+            "Content-Type": "application/json",
+        },
+    )
     try:
-        p = subprocess.run(
-            ["security", "find-generic-password",
-             "-a", os.environ.get("USER", "admin"),
-             "-s", "Claude Code-credentials", "-w"],
-            capture_output=True, text=True, timeout=2,
-        )
-        if p.returncode != 0 or not p.stdout.strip():
+        with urllib.request.urlopen(req, timeout=8) as r:
+            r.read()
+            h = r.headers
+    except (urllib.error.URLError, TimeoutError, Exception):
+        return None
+
+    def _pct(name: str) -> float | None:
+        v = h.get(name)
+        try:
+            return float(v) if v is not None else None
+        except ValueError:
             return None
-        return json.loads(p.stdout).get("claudeAiOauth", {}).get("accessToken")
+
+    def _ts(name: str) -> int | None:
+        v = h.get(name)
+        try:
+            return int(v) if v is not None else None
+        except ValueError:
+            return None
+
+    return {
+        "five_hour": {
+            "utilization": _pct("anthropic-ratelimit-unified-5h-utilization"),
+            "resets_at": _ts("anthropic-ratelimit-unified-5h-reset"),
+        },
+        "seven_day": {
+            "utilization": _pct("anthropic-ratelimit-unified-7d-utilization"),
+            "resets_at": _ts("anthropic-ratelimit-unified-7d-reset"),
+        },
+    }
+
+
+async def _fetch_anthropic_quota(token: str) -> dict | None:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _fetch_anthropic_quota_sync, token)
+
+# OpenRouter 渠道下 /status 用: 读 /v1/key 拿 usage / limit / daily.
+# 5 分钟 cache 跟 statusline.sh 共享同一文件 (/tmp/cc-or-usage-{uid}.json),
+# 两边都不 blocking — 谁先过 5min 就异步刷新, 另一方读缓存.
+_OR_USAGE_CACHE = Path(f"/tmp/cc-or-usage-{os.getuid()}.json")
+_OR_USAGE_STAMP = Path(f"/tmp/cc-or-usage-{os.getuid()}.stamp")
+_OR_USAGE_MAX_AGE = 300
+
+
+def _openrouter_key_from_providers(snapshot: dict | None = None) -> str | None:
+    """Find any OpenRouter API key configured in providers.json. Optional
+    snapshot lets callers pass a pre-loaded providers dict so a /provider
+    switch mid-render can't sneak in a different key (race-safe single-read
+    contract for cmd_status)."""
+    data = snapshot if snapshot is not None else _load_providers()
+    for cfg in data.get("providers", {}).values():
+        env = cfg.get("env") or {}
+        if "openrouter" in (env.get("ANTHROPIC_BASE_URL", "") or "").lower():
+            tok = env.get("ANTHROPIC_AUTH_TOKEN")
+            if tok:
+                return tok
+    return None
+
+
+# Daemon-thread refresh keeps /status fast (returns stale cache immediately)
+# while next call sees fresh data. Lock serializes refreshes so concurrent
+# /status calls don't fan out to N parallel HTTP requests.
+_OR_REFRESH_LOCK = threading.Lock()
+
+
+def _refresh_or_cache(key: str) -> None:
+    """Background refresher invoked from a daemon thread. Writes the stamp
+    ONLY on success — failed refresh stays "stale" so the next /status retries
+    instead of suppressing for the full _OR_USAGE_MAX_AGE window."""
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/key",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            body = r.read()
+        tmp = _OR_USAGE_CACHE.with_suffix(_OR_USAGE_CACHE.suffix + ".tmp")
+        tmp.write_bytes(body)
+        tmp.replace(_OR_USAGE_CACHE)
+        _OR_USAGE_STAMP.write_text(str(int(time.time())))
+    except Exception:
+        pass
+
+
+def _fetch_or_usage_sync(key: str | None) -> dict | None:
+    """Return cached OpenRouter /v1/key response. If cache is stale, fire a
+    daemon-thread refresh (don't block /status) and return whatever's on disk.
+    Token stays in-process (Authorization header on Request) — never enters
+    argv, so `ps aux` is clean."""
+    if not key:
+        return None
+    now = int(time.time())
+    try:
+        last = int(_OR_USAGE_STAMP.read_text().strip() or "0")
+    except Exception:
+        last = 0
+    if now - last >= _OR_USAGE_MAX_AGE and _OR_REFRESH_LOCK.acquire(blocking=False):
+        def _runner():
+            try:
+                _refresh_or_cache(key)
+            finally:
+                _OR_REFRESH_LOCK.release()
+        try:
+            threading.Thread(target=_runner, daemon=True).start()
+        except Exception:
+            _OR_REFRESH_LOCK.release()
+
+    if not _OR_USAGE_CACHE.exists():
+        return None
+    try:
+        return json.loads(_OR_USAGE_CACHE.read_text())
     except Exception:
         return None
 
 
-def _fetch_usage_sync() -> dict | None:
-    """GET /api/oauth/usage. Blocking; call via run_in_executor from async.
-    Returns parsed JSON or None on any failure (wrong token / no net / 4xx)."""
-    token = _claude_oauth_token()
-    if not token:
-        return None
-    req = urllib.request.Request(
-        _USAGE_URL,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "anthropic-beta": "oauth-2025-04-20",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=3) as r:
-            return json.loads(r.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception):
-        return None
-
-
-async def _fetch_usage() -> dict | None:
+async def _fetch_or_usage(key: str | None) -> dict | None:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _fetch_usage_sync)
+    return await loop.run_in_executor(None, _fetch_or_usage_sync, key)
 
 
-def _fmt_reset(iso_str: str | None) -> str:
-    """ISO8601 UTC → local-time display.
-    Same local calendar date → '9pm' (hour, 12h lowercase).
-    Different date → 'Apr 24' (month + day)."""
-    if not iso_str:
+def _fmt_reset(value: Any) -> str:
+    """Reset-timestamp display. Accepts either ISO8601 UTC string (legacy
+    /api/oauth/usage shape) or Unix int (SDK RateLimitInfo.resets_at).
+    Same local date → '9pm' (12h lowercase). Different date → 'Apr 24'."""
+    if value is None or value == "":
         return "—"
     try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00")).astimezone()
+        if isinstance(value, (int, float)):
+            dt = datetime.fromtimestamp(float(value)).astimezone()
+        else:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone()
     except Exception:
         return "—"
     now = datetime.now().astimezone()
@@ -1210,13 +1299,77 @@ def _short_window(tokens: int | None) -> str:
     return str(tokens)
 
 
-def _roll_today_cost(now_date: str) -> None:
-    """Zero the daily accumulator if we crossed midnight since last turn.
-    Called from both turn accumulation and /status display paths."""
-    global _today_cost, _today_cost_date
-    if _today_cost_date != now_date:
-        _today_cost = 0.0
-        _today_cost_date = now_date
+_CCUSAGE_BIN = Path.home() / ".bun" / "bin" / "ccusage"
+# Share cache with statusline.sh — when V has a terminal CC open, its
+# statusline keeps this cache fresh, and /status hits it for free. When
+# nothing is keeping it warm, our own daemon thread refreshes it.
+_CCUSAGE_CACHE = Path(f"/tmp/cc-ccusage-{os.getuid()}.txt")
+_CCUSAGE_STAMP = Path(f"/tmp/cc-ccusage-{os.getuid()}.stamp")
+_CCUSAGE_MAX_AGE = 60  # match statusline.sh
+_CCUSAGE_REFRESH_LOCK = threading.Lock()
+_CCUSAGE_FAKE_INPUT = json.dumps({
+    "hook_event_name": "Status",
+    "session_id": "00000000-0000-0000-0000-000000000000",
+    "transcript_path": "/tmp/none.jsonl",
+    "cwd": "/tmp",
+    "model": {"display_name": "Opus", "id": "claude-opus-4-7"},
+    "workspace": {"current_dir": "/tmp", "project_dir": "/tmp"},
+})
+_CCUSAGE_TODAY_RE = re.compile(r"\$(\d+(?:\.\d+)?) today")
+
+
+def _refresh_ccusage_cache() -> None:
+    """Run `ccusage statusline` (~10s cold) and write its emoji-text output
+    to the cache file. Stamp written only on success."""
+    try:
+        proc = subprocess.run(
+            [str(_CCUSAGE_BIN), "statusline", "-B", "emoji-text"],
+            input=_CCUSAGE_FAKE_INPUT,
+            capture_output=True, text=True, timeout=20,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return
+        tmp = _CCUSAGE_CACHE.with_suffix(_CCUSAGE_CACHE.suffix + ".tmp")
+        tmp.write_text(proc.stdout)
+        tmp.replace(_CCUSAGE_CACHE)
+        _CCUSAGE_STAMP.write_text(str(int(time.time())))
+    except Exception:
+        pass
+
+
+def _fetch_ccusage_today_sync() -> float | None:
+    """Return today's total spend by reading the shared statusline cache.
+    Fires a daemon-thread refresh when stale; returns whatever's on disk
+    immediately. None when ccusage isn't installed or cache parse fails."""
+    if not _CCUSAGE_BIN.exists():
+        return None
+    now = int(time.time())
+    try:
+        last = int(_CCUSAGE_STAMP.read_text().strip() or "0")
+    except Exception:
+        last = 0
+    if now - last >= _CCUSAGE_MAX_AGE and _CCUSAGE_REFRESH_LOCK.acquire(blocking=False):
+        def _runner():
+            try:
+                _refresh_ccusage_cache()
+            finally:
+                _CCUSAGE_REFRESH_LOCK.release()
+        try:
+            threading.Thread(target=_runner, daemon=True).start()
+        except Exception:
+            _CCUSAGE_REFRESH_LOCK.release()
+    if not _CCUSAGE_CACHE.exists():
+        return None
+    try:
+        m = _CCUSAGE_TODAY_RE.search(_CCUSAGE_CACHE.read_text())
+        return float(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+async def _fetch_ccusage_today() -> float | None:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _fetch_ccusage_today_sync)
 
 
 def _last_prompt_tokens(sid: str | None) -> int:
@@ -1291,23 +1444,86 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     model_short = _short_model(actual)
     window_short = _short_window(win)
 
-    # Quota: five_hour + seven_day utilization + $today from api/oauth/usage.
-    # Graceful fallback to "—" if OAuth/network fails.
-    usage = await _fetch_usage()
-    if usage:
-        fh = usage.get("five_hour") or {}
-        wk = usage.get("seven_day") or {}
-        s_pct = fh.get("utilization")
-        s_reset = _fmt_reset(fh.get("resets_at"))
-        w_pct = wk.get("utilization")
-        w_reset = _fmt_reset(wk.get("resets_at"))
-        session_line = f"session {s_pct:.0f}% · resets {s_reset}" if s_pct is not None else "session —"
-        week_line = f"week {w_pct:.0f}% · resets {w_reset}" if w_pct is not None else "week —"
-    else:
-        session_line, week_line = "session —", "week —"
+    # Quota policy: show whatever the current /provider points at, plus a
+    # secondary OpenRouter line if current isn't already OR. Tokens for other
+    # OAuth accounts in providers.json may lack `user:profile` scope (403), so
+    # we don't try to render them — only the active account is meaningful.
 
-    _roll_today_cost(datetime.now().strftime("%Y-%m-%d"))
-    today_line = f"${_today_cost:.2f} today"
+    # Single snapshot of providers.json — guard against /provider switch racing
+    # mid-render and giving us provider A's token but provider B's label.
+    snapshot = _load_providers()
+    provider_key = snapshot.get("current", "?")
+    providers = snapshot.get("providers", {})
+    current_cfg = providers.get(provider_key) or {}
+    provider_label = current_cfg.get("display_name", provider_key)
+    current_env = current_cfg.get("env") or {}
+    current_oauth_token = current_env.get("CLAUDE_CODE_OAUTH_TOKEN")
+    is_or_current = "openrouter" in (current_env.get("ANTHROPIC_BASE_URL", "") or "").lower()
+
+    # Active provider's primary quota — POST a 1-token Claude request live and
+    # read the rate-limit response headers. Real-time, no cache, ~10 tokens
+    # of the cheapest model per /status. The request uses the *current*
+    # provider token, so quota always matches the active provider.
+    session_line = week_line = None
+    if current_oauth_token and not is_or_current:
+        quota = await _fetch_anthropic_quota(current_oauth_token)
+        rl = quota or {}
+
+        def _format(window_key: str, label: str) -> str:
+            entry = rl.get(window_key) or {}
+            util = entry.get("utilization")
+            if util is None:
+                return f"{label} —"
+            return f"{label} {util * 100:.0f}% · resets {_fmt_reset(entry.get('resets_at'))}"
+
+        session_line = _format("five_hour", "session")
+        week_line = _format("seven_day", "week")
+
+    # OpenRouter — full 2-line layout when OR is current, compact 1-line
+    # secondary otherwise. OR data is always fetched (cached, non-blocking).
+    # Pass key from the same snapshot that drove provider_key/label so a
+    # /provider switch mid-render can't desync them.
+    or_key = _openrouter_key_from_providers(snapshot)
+    or_today_line = or_balance_line = or_compact_line = None
+    or_data = await _fetch_or_usage(or_key)
+    if is_or_current:
+        if or_data:
+            d = or_data.get("data") or {}
+            or_used = d.get("usage")
+            or_today = d.get("usage_daily")
+            or_rem = d.get("limit_remaining")
+            or_limit = d.get("limit")
+            or_today_line = f"${or_today:.2f} today" if or_today is not None else "today —"
+            if or_used is not None and or_rem is not None:
+                or_balance_line = f"${or_used:.2f} used · ${or_rem:.2f} left USD"
+            elif or_used is not None and or_limit is not None:
+                or_balance_line = f"${or_used:.2f} used · ${(or_limit - or_used):.2f} left USD"
+            elif or_used is not None:
+                or_balance_line = f"${or_used:.2f} used · no limit USD"
+            else:
+                or_balance_line = "usage —"
+        else:
+            or_today_line, or_balance_line = "today —", "usage —"
+    elif or_data:
+        d = or_data.get("data") or {}
+        or_used = d.get("usage")
+        or_today = d.get("usage_daily")
+        or_rem = d.get("limit_remaining")
+        or_limit = d.get("limit")
+        parts = ["openrouter"]
+        if or_today is not None:
+            parts.append(f"${or_today:.2f} today")
+        if or_rem is not None:
+            parts.append(f"${or_rem:.2f} left")
+        elif or_used is not None and or_limit is not None:
+            parts.append(f"${(or_limit - or_used):.2f} left")
+        elif or_used is not None:
+            parts.append(f"${or_used:.2f} used")
+        or_compact_line = " · ".join(parts) if len(parts) > 1 else None
+
+    today_cost = await _fetch_ccusage_today()
+    today_str = f"${today_cost:.2f}" if today_cost is not None else "—"
+    today_line = f"{today_str} today (ccusage) · {provider_label}"
 
     sids = cc._load_state().get("recent_sids") or []
     sid_now = cc._session_id if cc._session_id else "(new)"
@@ -1315,15 +1531,24 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     labels = {0: "hidden", 1: "flash", 2: "keep"}
 
     # Layout: header two lines in default font (no <code> — TG renders ▓/░ as
-    # noisy stipple inside code blocks). Quota broken into 3 separate lines so
+    # noisy stipple inside code blocks). Quota broken into separate lines so
     # mobile doesn't wrap awkwardly. Session UUID on its own line, same reason.
     lines = [
         "<b>📊 Status</b>",
         "",
         f"{bar} {pct_ctx:.0f}% · {html.escape(model_short)} ({window_short})",
         "",
-        html.escape(session_line),
-        html.escape(week_line),
+    ]
+    if session_line:
+        lines.append(html.escape(session_line))
+    if week_line:
+        lines.append(html.escape(week_line))
+    if or_today_line:
+        lines.append(html.escape(or_today_line))
+        lines.append(html.escape(or_balance_line))
+    if or_compact_line:
+        lines.append(html.escape(or_compact_line))
+    lines += [
         today_line,
         "",
         f"CC v{_cc_version()} · SDK v{_sdk_version()} · {labels.get(_verbose, _verbose)}",
@@ -1387,7 +1612,8 @@ async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ThrottleInterval=10s + ExitTimeOut=600s 在 plist 里设置, 最多等 10 分钟
     让任务结束, 超时才 SIGKILL. os._exit(0) 在 _graceful_shutdown 末尾触发.
     """
-    if not _allowed(update):
+    # Infrastructure-touching command: fail-closed even if ALLOWED_USER==0 (开发态后门).
+    if not ALLOWED_USER or not (update.effective_user and update.effective_user.id == ALLOWED_USER):
         return
     if _in_flight > 0:
         await update.message.reply_text(
@@ -1403,13 +1629,126 @@ async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _allowed(update):
+    # Infrastructure-touching command: fail-closed even if ALLOWED_USER==0 (开发态后门).
+    if not ALLOWED_USER or not (update.effective_user and update.effective_user.id == ALLOWED_USER):
         return
     try:
         await _worker().interrupt()
         await update.message.reply_text("⏸  当前 turn 已请求中断")
     except Exception as e:
         await update.message.reply_text(f"/stop 失败: {type(e).__name__}: {e}")
+
+
+# cc-router 是可选外部服务 (V 私人多 Anthropic 账号切换). 没设 BABATA_CC_ROUTER_DIR
+# = OSS 用户没这服务, /provider 命令降级 "未配置". V .env 设路径走原行为.
+_CC_ROUTER_DIR = os.environ.get("BABATA_CC_ROUTER_DIR", "")
+_CC_ROUTER_CLI = str(Path(_CC_ROUTER_DIR) / "cli.py") if _CC_ROUTER_DIR else ""
+_PROVIDERS_JSON = Path(_CC_ROUTER_DIR) / "providers.json" if _CC_ROUTER_DIR else None
+
+
+def _load_providers() -> dict:
+    if not _PROVIDERS_JSON:
+        return {}
+    try:
+        return json.loads(_PROVIDERS_JSON.read_text())
+    except Exception:
+        return {}
+
+
+def _provider_choices() -> list[tuple[str, str]]:
+    """[(display_name, key), ...] dynamic from providers.json — adding an account
+    there auto-surfaces here without touching bot.py."""
+    data = _load_providers()
+    return [(cfg.get("display_name", key), key) for key, cfg in data.get("providers", {}).items()]
+
+
+def _current_provider_key() -> str:
+    return _load_providers().get("current", "?")
+
+
+def _current_provider_label() -> str:
+    """Display name of current provider. Used by /status + /provider UI."""
+    data = _load_providers()
+    key = data.get("current")
+    if not key:
+        return "?"
+    return data.get("providers", {}).get(key, {}).get("display_name", key)
+
+
+async def _run_cc_router_switch(key: str) -> tuple[int, str]:
+    if not _CC_ROUTER_CLI:
+        return 2, "/provider 未配置 (需要 BABATA_CC_ROUTER_DIR env)"
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [_CC_ROUTER_CLI, "switch", key],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        body = (result.stdout + result.stderr).strip() or "(no output)"
+        return result.returncode, body
+    except subprocess.TimeoutExpired:
+        return 124, "/provider 超时 (15s)"
+    except Exception as e:
+        return 2, f"/provider 失败: {type(e).__name__}: {e}"
+
+
+async def cmd_provider(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """切换 Anthropic 渠道.
+
+    - 无参 → inline keyboard (类似 /verbose), 点按钮触发 switch
+    - 带参 `/provider openrouter` → 直接 switch (供 scripting / 快捷路径)
+
+    cc-router cli 改完 ~/.claude/settings.json env 会同步清 4 个 channel 的
+    session_id (避免跨 provider 续 redacted_thinking 爆), 然后 self-ops.sh
+    detached restart 4 个 launchd 实例. V 在 TG 体感 ~10s 断线再上线, 下条消息
+    走新 provider, 新 session 无上下文 (跟手动 /new 一样).
+    """
+    # Infrastructure-changing command: fail-closed even if ALLOWED_USER==0 (开发态后门).
+    if not ALLOWED_USER or not (update.effective_user and update.effective_user.id == ALLOWED_USER):
+        return
+
+    args = (update.message.text or "").split(maxsplit=1)
+    if len(args) > 1 and args[1].strip():
+        rc, body = await _run_cc_router_switch(args[1].strip())
+        prefix = "🔄 切换中" if rc == 0 and "switched to" in body else f"⚠️ exit={rc}"
+        await update.message.reply_text(f"{prefix}\n```\n{body}\n```", parse_mode="Markdown")
+        return
+
+    # No arg → inline button UI.
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    current_key = _current_provider_key()
+    current_label = _current_provider_label()
+    choices = _provider_choices()
+    if not choices:
+        await update.message.reply_text("⚠️ providers.json 读取失败, 无可选渠道")
+        return
+    buttons = [
+        [InlineKeyboardButton(
+            f"{'● ' if key == current_key else '○ '}{name}",
+            callback_data=f"provider:{key}",
+        )]
+        for name, key in choices
+    ]
+    await update.message.reply_text(
+        f"Anthropic 渠道 (当前: {current_label}):",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def on_provider_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not ALLOWED_USER or not (q.from_user and q.from_user.id == ALLOWED_USER):
+        await q.answer("auth denied")
+        return
+    await q.answer()
+    _, key = q.data.split(":", 1)
+    target_name = dict((k, n) for n, k in _provider_choices()).get(key, key)
+    await q.edit_message_text(f"🔄 切换到 {target_name}…")
+    rc, body = await _run_cc_router_switch(key)
+    prefix = "🔄 切换中" if rc == 0 and "switched to" in body else f"⚠️ exit={rc}"
+    await q.edit_message_text(f"{prefix}\n```\n{body}\n```", parse_mode="Markdown")
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1846,6 +2185,7 @@ async def _post_init(app: Application) -> None:
         ("verbose", "Tool display: 0=hidden 1=flash 2=keep"),
         ("stop", "Interrupt current turn"),
         ("restart", "Restart this bot process"),
+        ("provider", "切换 Anthropic 渠道"),
     ])
 
     # 意外重启 / launchd kickstart / 任务中 /restart → bot 重连后主动告知 V 当
@@ -1871,15 +2211,16 @@ async def _post_init(app: Application) -> None:
 def main() -> None:
     app = Application.builder().token(TOKEN).concurrent_updates(True).post_init(_post_init).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("context", cmd_context))
     app.add_handler(CommandHandler("verbose", cmd_verbose))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("restart", cmd_restart))
-    app.add_handler(CommandHandler(["new", "reset"], on_text))
+    app.add_handler(CommandHandler("provider", cmd_provider))
+    app.add_handler(CommandHandler("new", on_text))
     app.add_handler(CallbackQueryHandler(on_verbose_click, pattern=r"^verbose:"))
+    app.add_handler(CallbackQueryHandler(on_provider_click, pattern=r"^provider:"))
     # resume-ch: 必须注册在 resume: 之前匹配更精确, 但 ^resume: 不会吞 ^resume-ch:
     # (第 7 个字符 '-' vs ':'), 两者 pattern 互斥, 顺序无关紧要.
     app.add_handler(CallbackQueryHandler(on_resume_channel_pick, pattern=r"^resume-ch:"))

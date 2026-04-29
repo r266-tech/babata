@@ -47,15 +47,14 @@ log = logging.getLogger(f"{PROJECT}.weixin")
 
 # ── Heartbeat (双 bot 互监控, 零 LLM 成本, 镜像 bot.py 同段) ──────────
 # 自己每 30s touch; 看主 TG bot 心跳, stale > 3 min 通过微信推 V (allowFrom[0]).
-_HEARTBEAT_DIR = Path.home() / "cc-workspace" / "state"
-_HEARTBEAT_ME = _HEARTBEAT_DIR / "babata-weixin-heartbeat"
-_HEARTBEAT_PEER = _HEARTBEAT_DIR / "babata-tg-heartbeat"
+_HEARTBEAT_ME = STATE_DIR / f"{PROJECT}-weixin-heartbeat"
+_HEARTBEAT_PEER = STATE_DIR / f"{PROJECT}-tg-heartbeat"
 _HEARTBEAT_STALE_S = 180
 _HEARTBEAT_INTERVAL_S = 30
 
 
 async def _heartbeat_loop(client: "WeixinClient", account_id: str) -> None:
-    _HEARTBEAT_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     alerted = False
     while True:
         try:
@@ -88,9 +87,11 @@ async def _heartbeat_loop(client: "WeixinClient", account_id: str) -> None:
 
 _WEIXIN_MCP_SCRIPT = str(Path(__file__).parent / "weixin_mcp.py")
 
+_WX_SOURCE_PROMPT = "Source: WeChat. The user is on WeChat right now; this conversation lives there."
+
 cc = CC(
     state_file=STATE_DIR / f"{PROJECT}-weixin-session.json",
-    source_prompt="Source: WeChat.",
+    source_prompt=_WX_SOURCE_PROMPT,
     mcp_servers={
         "weixin": {
             "command": VENV_PYTHON,
@@ -323,9 +324,29 @@ async def _decode_item(
 
     if itype == ITEM_VOICE:
         voice = item.get("voice_item") or {}
+        # DIAGNOSTIC: dump full inbound voice_item to compare vs our outbound fields
+        try:
+            import json as _json
+            log.warning("INBOUND voice_item raw: %s", _json.dumps(voice, ensure_ascii=False, default=str)[:1500])
+        except Exception:
+            pass
+        # DIAGNOSTIC: server-side STT fast path skips download — force silk
+        # download + copy BEFORE the fast-path so we always have a sample to
+        # diff against our outbound silk magic bytes / structure.
+        media = voice.get("media") or {}
+        if media:
+            try:
+                _raw = await client.download_media(media)
+                _keep = Path("/tmp/inbound-voice-sample.silk")
+                _keep.write_bytes(_raw)
+                log.warning(
+                    "INBOUND silk saved to %s (%d bytes), magic=%r",
+                    _keep, _keep.stat().st_size, _raw[:16],
+                )
+            except Exception as e:
+                log.warning("silk diag pre-fetch failed: %s", e)
         if voice.get("text"):  # server-provided transcription
             return (f"[语音] {voice['text']}", [])
-        media = voice.get("media") or {}
         silk_path: Path | None = None
         try:
             raw = await client.download_media(media)
@@ -543,11 +564,10 @@ async def _process_combined_msgs(
 
     # Stream coalescer — wx protocol has no edit-message, so each flush sends
     # a new FINISH sendmessage. We split only at natural sentence/paragraph
-    # boundaries that keep markdown pairs (`...`, **...**, [..](..)) balanced;
-    # otherwise we wait. _STREAM_HARD_MAX is the upper bound past which we
-    # force a cut (last whitespace within bound, retracted to nearest balanced
-    # position; if even that fails, sanitize markers and emit) to avoid
-    # unbounded buffering when the stream produces no boundaries.
+    # boundaries that keep markdown pairs (`...`, **...**) balanced; otherwise
+    # we wait. _STREAM_HARD_MAX is the upper bound past which we force a cut
+    # (last whitespace within bound, retracted to nearest balanced position)
+    # to avoid unbounded buffering when the stream produces no boundaries.
     buf: list[str] = []
     last_flush = time.monotonic()
     flush_lock = asyncio.Lock()

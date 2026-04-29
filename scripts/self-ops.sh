@@ -7,9 +7,11 @@ set -euo pipefail
 
 DELAY="${DELAY:-5}"
 UID_N=$(id -u)
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LABEL_PREFIX="com.${PROJECT_NAMESPACE:-babata}"
 
 restart() {
-    local label="${1:-com.babata}"
+    local label="${1:-$LABEL_PREFIX}"
     nohup bash -c "sleep $DELAY && launchctl kickstart -k gui/$UID_N/$label" >/dev/null 2>&1 &
     disown
     echo "已排队: ${DELAY}s 后 kickstart -k $label"
@@ -24,7 +26,7 @@ bootstrap_plist() {
 
 update_claude() {
     # 走 auto-update.sh 而非 `claude update` — 前者含 npm 防护 / symlink 自愈 / 变更时 kickstart.
-    nohup /Users/admin/code/babata/auto-update.sh >/dev/null 2>&1 &
+    nohup "$REPO_DIR/auto-update.sh" >/dev/null 2>&1 &
     disown
     echo "已排队: auto-update.sh"
 }

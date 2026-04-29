@@ -23,7 +23,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-export PATH="/opt/homebrew/bin:/Users/admin/.npm-global/bin:/Users/admin/.local/bin:/usr/local/bin:/usr/bin:/bin"
+export PATH="/opt/homebrew/bin:$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
 # memory: reference_cc_shell_uv_index_pollution.md — company pypi env 401s public packages
 unset UV_INDEX_URL PIP_INDEX_URL UV_EXTRA_INDEX_URL PIP_EXTRA_INDEX_URL 2>/dev/null || true
@@ -38,7 +38,7 @@ LOG="$SCRIPT_DIR/logs/auto-update.log"
 VENV_PY="$SCRIPT_DIR/.venv/bin/python"
 NPM="/opt/homebrew/bin/npm"
 UV="/opt/homebrew/bin/uv"
-CLAUDE_BIN="/Users/admin/.local/bin/claude"
+CLAUDE_BIN="${CLAUDE_CLI_PATH:-$HOME/.local/bin/claude}"
 
 mkdir -p "$(dirname "$LOG")"
 exec >> "$LOG" 2>&1
@@ -53,9 +53,9 @@ echo "=== $(date -Iseconds) ==="
 # 自愈: ~/.local/bin/claude symlink 在 2026-04-20 无故消失过一次, versions/ 还在.
 # 丢了就从 versions/ 最新版重建, 避免 bot 下次启动 CLINotFoundError.
 if [ ! -e "$CLAUDE_BIN" ]; then
-    LATEST_VER=$(ls /Users/admin/.local/share/claude/versions/ 2>/dev/null | sort -V | tail -1)
+    LATEST_VER=$(ls $HOME/.local/share/claude/versions/ 2>/dev/null | sort -V | tail -1)
     if [ -n "$LATEST_VER" ]; then
-        ln -sf "/Users/admin/.local/share/claude/versions/$LATEST_VER" "$CLAUDE_BIN"
+        ln -sf "$HOME/.local/share/claude/versions/$LATEST_VER" "$CLAUDE_BIN"
         echo "Restored $CLAUDE_BIN -> $LATEST_VER"
     fi
 fi
@@ -68,7 +68,7 @@ if [ -e "$HOME/.npm-global/bin/claude" ] || [ -d "$HOME/.npm-global/lib/node_mod
 fi
 
 # 清半成品 version (install 中断留的 0 字节文件)
-find /Users/admin/.local/share/claude/versions -maxdepth 1 -type f -size 0 -delete 2>/dev/null || true
+find $HOME/.local/share/claude/versions -maxdepth 1 -type f -size 0 -delete 2>/dev/null || true
 
 OLD_CLI=$("$CLAUDE_BIN" --version 2>/dev/null | awk '{print $1}')
 "$CLAUDE_BIN" update 2>&1 | tail -5
@@ -104,17 +104,20 @@ if [ "$OLD_CLI" != "$NEW_CLI" ] || [ "$OLD_SDK" != "$NEW_SDK" ]; then
         done
     fi
 
-    # 4) Optional post-update hook: fire-and-forget analysis agent that reads
-    # release notes + diffs usage to decide whether to push an alert.
+    # 4) Optional post-update hook: analysis agent that reads release notes
+    # and decides whether to push an alert. Synchronous (not nohup-detached)
+    # so the hook inherits auto-update.sh's launchd session — needed for the
+    # child `claude -p` to reach the macOS keychain. Hook is bounded by its
+    # own internal timeout; worst case adds ~10 min to auto-update runtime.
     # OSS users: set POST_UPDATE_HOOK to your own script (same argv shape) or
     # leave it pointing nowhere — missing file = silent skip.
     POST_UPDATE_HOOK="${POST_UPDATE_HOOK:-$HOME/cc-workspace/cron-skills/version-watch/run.sh}"
     if [ -x "$POST_UPDATE_HOOK" ]; then
-        nohup "$POST_UPDATE_HOOK" \
+        echo "post-update hook running..."
+        "$POST_UPDATE_HOOK" \
             --cc-old "$OLD_CLI" --cc-new "$NEW_CLI" \
             --sdk-old "$OLD_SDK" --sdk-new "$NEW_SDK" \
-            >/dev/null 2>&1 &
-        echo "post-update hook launched (PID $!)"
+            || echo "post-update hook exited $?"
     fi
 else
     echo "No changes, bots untouched."

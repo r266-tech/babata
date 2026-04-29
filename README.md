@@ -1,32 +1,79 @@
 # babata
 
-CC 个人助手 — 通讯层 (TG + 微信). Claude Code 是内核, babata 是围绕它构建的记忆/skill/通讯壳. 当前 repo 是通讯层 (TG 优先, 微信 WIP).
+Your Claude Code, on Telegram.
+
+babata is a thin transport layer that lets you talk to Claude Code from any phone, any client. Same CC binary, same skills, same memory — just a different wire.
+
+```
+                             ┌─────────────┐
+   📱 Telegram / WeChat ────▶│   babata    │────▶  claude  ─── Anthropic
+                             │  (transport) │
+                             └─────────────┘
+```
+
+The bot only does what CC physically cannot: TG HTML / 4096-char chunking / OGG voice transcription / image base64. It gives CC capabilities (MCP tools to push back to TG), never tells CC how to use them.
 
 ## Quick Start
 
-Give this repo to your Claude Code:
-
+```bash
+git clone https://github.com/r266-tech/babata.git
+cd babata
+bash install.sh
 ```
-clone https://github.com/r266-tech/babata and set it up for me
+
+Detects what's missing (Python / uv / ffmpeg / Claude Code), installs deps, scaffolds `.env`. Then edit `.env` and run.
+
+## You'll need
+
+- **macOS or Linux** with Python 3.11+
+- **A Telegram bot** — message [@BotFather](https://t.me/BotFather), `/newbot`, save the token
+- **Your TG user ID** — message [@userinfobot](https://t.me/userinfobot)
+- **An Anthropic API key** — https://console.anthropic.com → Settings → API keys
+  - *Or skip the key + set `BABATA_SHARED_CC=1` to share with your existing logged-in `claude`*
+
+## Run
+
+```bash
+$EDITOR .env                    # fill TELEGRAM_BOT_TOKEN, ALLOWED_USER_ID, ANTHROPIC_API_KEY
+.venv/bin/python bot.py         # bot starts, message it on TG
 ```
 
-CC will read `CLAUDE.md` and walk you through everything.
+## Modes
 
-## What This Is
+**Default — isolated (recommended for OSS users)**:
+babata doesn't touch your `~/.claude/` settings, doesn't read your OAuth keychain, doesn't pollute your existing CC sessions. It runs as its own contained Claude instance, authed via `ANTHROPIC_API_KEY`.
 
-Your terminal Claude Code, accessible from Telegram. Not a wrapper, not a reimplementation — just a transport layer.
+**Shared mode** (`.env`: `BABATA_SHARED_CC=1`):
+babata shares your existing logged-in CC — same skills, same settings, same OAuth. No `ANTHROPIC_API_KEY` needed. Quota / settings changes affect both.
 
-- **Same CC binary** — same version, same memory, same hooks, same skills
-- **Same everything** — the only difference is the wire
-- **817 lines** — because a transport layer shouldn't be 21,000 lines
+**Full trust** (`.env`: `BABATA_FULL_TRUST=1`):
+babata's CC subprocess runs with `cwd=$HOME` and `permission_mode=bypassPermissions` — can read your home, run any command without prompts. ⚠️ Only when `ALLOWED_USER_ID` is strictly correct, since anyone who can DM the bot effectively gets shell access.
 
-## Philosophy
+## Multi-instance
 
-The bot only does what CC physically cannot: convert TG media formats, render HTML, enforce TG's 4096-char limit, provide TG-native UI feedback.
+Run multiple babatas on one machine — different TG bots, different chats, shared code, independent state. Second instance:
 
-It gives CC capabilities (MCP tools for TG buttons), but never tells CC how or when to use them.
+```bash
+BABATA_INSTANCE=alice TELEGRAM_BOT_TOKEN=... ALLOWED_USER_ID=... .venv/bin/python bot.py
+```
 
-Test for every line of code: *if AI were 100x smarter, would this still need to exist?*
+State files / sockets / launchd labels all derive from `PROJECT_NAMESPACE` + `BABATA_INSTANCE` so nothing collides.
+
+## Persist (macOS launchd)
+
+See [`docs/persist-macos.md`](docs/persist-macos.md) — copy a plist template, edit paths, `launchctl bootstrap`.
+
+## Architecture
+
+| File | Role |
+|---|---|
+| `bot.py` | TG transport (HTML, 4096 chunks, reactions, auth) |
+| `weixin_bot.py` | WeChat transport (iLink protocol, optional) |
+| `cc.py` | Claude Code SDK wrapper, channel-agnostic |
+| `bridge.py` | Unix socket so MCP tools can push to TG |
+| `tg_mcp.py` | MCP tools `tg_send_*` exposed to CC |
+| `media.py` | OGG → WAV, image base64, video understanding |
+| `constants.py` | Single source of truth for paths / labels |
 
 ## License
 
