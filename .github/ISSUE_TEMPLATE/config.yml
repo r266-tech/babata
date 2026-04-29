@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Discussion / Question
+    url: https://github.com/r266-tech/babata/discussions
+    about: Architectural questions, design discussions, or general help — use Discussions, not Issues.
+  - name: 🔒 Security Vulnerability
+    url: https://github.com/r266-tech/babata/security/advisories/new
+    about: Don't open a public issue. Use GitHub Security Advisories (private).

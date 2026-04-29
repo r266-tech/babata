@@ -35,8 +35,11 @@ Detects what's missing (Python / uv / ffmpeg / Claude Code), installs deps, scaf
 
 ```bash
 $EDITOR .env                    # fill TELEGRAM_BOT_TOKEN, ALLOWED_USER_ID, ANTHROPIC_API_KEY
-.venv/bin/python bot.py         # bot starts, message it on TG
+babata                          # bot starts (foreground, Ctrl+C to stop)
+                                # → message it on Telegram
 ```
+
+`install.sh` symlinks `babata` into `~/.local/bin/`, so it's globally available — same shape as `hermes` / `openclaw`. (If the command isn't found, add `~/.local/bin` to your PATH.)
 
 ## Modes
 

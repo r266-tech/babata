@@ -1,0 +1,30 @@
+name: ✨ Feature Request
+description: Propose a new capability or improvement.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        babata aims to be a thin transport layer. Features that can be done as a Claude Code skill/tool instead of bot code are usually preferred. Test for any new bot Python: *if AI were 100x smarter, would this still need to exist?*
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Concrete user pain. Avoid solution-shaped framing here.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How would this work? What's the API/UX?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Why not just a CC skill? Why not user-side config?

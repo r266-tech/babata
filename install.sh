@@ -94,12 +94,26 @@ else
     echo "✓ .env exists (skipped)"
 fi
 
+# 7) Expose `babata` as a global command (mirrors hermes / openclaw)
+mkdir -p "$HOME/.local/bin"
+ln -sf "$REPO_DIR/.venv/bin/babata" "$HOME/.local/bin/babata"
+echo "✓ symlinked $HOME/.local/bin/babata → $REPO_DIR/.venv/bin/babata"
+
+# Hint user if ~/.local/bin not on PATH
+case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) echo
+       echo "  ⚠️  $HOME/.local/bin is not on your PATH. Add to your shell rc:"
+       echo "       export PATH=\"\$HOME/.local/bin:\$PATH\""
+       ;;
+esac
+
 cat <<EOF
 
 ── Install done. Next: ─────────────────────────
   1. Edit .env (see above)
-  2. Test run:    .venv/bin/python bot.py
-                  → message your bot in Telegram
-  3. Persist:     docs/persist-macos.md  (launchd, optional)
+  2. Run the bot:   babata             (foreground, Ctrl+C to stop)
+                    → message your bot in Telegram
+  3. Persist:       docs/persist-macos.md  (launchd, optional)
 
 EOF

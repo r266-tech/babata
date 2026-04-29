@@ -1,0 +1,60 @@
+name: 🐛 Bug Report
+description: Something behaves wrong.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, check existing issues. For security vulnerabilities, use [Security Advisories](https://github.com/r266-tech/babata/security/advisories/new) instead.
+
+  - type: input
+    id: version
+    attributes:
+      label: babata version / commit SHA
+      placeholder: "e.g. 47ec1c0 or v0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - macOS
+        - Linux
+        - Other (specify in description)
+    validations:
+      required: true
+
+  - type: textarea
+    id: smoke
+    attributes:
+      label: Smoke test output
+      description: Paste the output of `bash tests/smoke.sh`. If it fails, that's almost certainly relevant.
+      render: shell
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you expected vs what actually happened.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs (optional)
+      description: Trim to relevant sections. Strip any tokens / chat IDs.
+      render: shell
