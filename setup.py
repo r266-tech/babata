@@ -250,10 +250,12 @@ def step_model_auth() -> dict[str, str]:
     print()
 
     while True:
-        choice = ask("选 [1/2/3]", "1")
+        # 不给 default — 这是明确选项不是 yes/no, 默认 [1] 会让按 enter
+        # 的用户被静默接走到官方 API key 路径.
+        choice = ask("选 [1/2/3]")
         if choice in ("1", "2", "3"):
             break
-        print("无效选项")
+        print("请输入 1, 2, 或 3")
 
     if choice == "1":
         return _step_official()
