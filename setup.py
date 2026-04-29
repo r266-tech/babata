@@ -550,6 +550,20 @@ def step_wx() -> bool:
         print(f"✗ 找不到 {VENV_PY}, 先跑 install.sh")
         return False
 
+    # WX 依赖 (pilk + qrcode) 默认不装 — TG-only 用户不该被 C 扩展拖累.
+    # 选 WX 才现装. uv 应在 PATH (install.sh 装的; 独立跑时用户自己 source 过).
+    print("装 WX 依赖 (pilk + qrcode)...")
+    sync = subprocess.run(
+        ["uv", "sync", "--quiet", "--extra", "wx"],
+        cwd=str(REPO),
+    )
+    if sync.returncode != 0:
+        print("✗ WX 依赖装失败.")
+        print("  pilk 是 C 扩展, 需要 gcc + Python headers. 装好 build 工具再重跑:")
+        print("    Linux:  sudo apt install build-essential python3-dev")
+        print("    macOS:  xcode-select --install")
+        return False
+
     code = (
         "import asyncio, sys\n"
         f"sys.path.insert(0, {str(REPO)!r})\n"

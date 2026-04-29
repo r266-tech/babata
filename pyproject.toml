@@ -9,6 +9,13 @@ dependencies = [
     "python-dotenv>=1.0",
     "httpx>=0.27",
     "cryptography>=42.0",
+]
+
+[project.optional-dependencies]
+# WX channel: pilk = SILK voice decode (C ext, build 需要 gcc); qrcode = 终端 ASCII QR.
+# TG-only 用户不装这俩, 避免 ARM/无 prebuilt wheel 场景 (e.g. Linux + Python 3.13) 卡 build.
+# setup.py step_wx 选 yes 时才 `uv sync --extra wx` 现装.
+wx = [
     "pilk>=0.2.4",
     "qrcode>=7.4",
 ]
