@@ -54,16 +54,21 @@ fi
 if ! need claude; then
     echo
     echo "Claude Code CLI not found. babata uses it as the engine."
-    read -r -p "Install now? [Y/n] " ans
-    if [[ ! "$ans" =~ ^[Nn] ]]; then
-        curl -fsSL https://claude.ai/install.sh | bash
-        export PATH="$HOME/.local/bin:$PATH"
-        if ! need claude; then
-            echo "❌ Claude Code install failed. Manual: https://claude.ai/download"
+    # 非交互 (CI / `bash install.sh < /dev/null`) 时, read 会立刻拿到 EOF + set -e
+    # 让脚本提前退出, 不到下面的引导. 显式 TTY guard 给非交互 case 明确指引.
+    if [[ -t 0 ]] && [[ -t 1 ]]; then
+        read -r -p "Install now? [Y/n] " ans
+        if [[ "$ans" =~ ^[Nn] ]]; then
+            echo "❌ babata 需要 Claude Code. 装好后再跑此脚本."
             exit 1
         fi
     else
-        echo "❌ babata 需要 Claude Code. 装好后再跑此脚本."
+        echo "(非交互终端, 自动装 Claude Code)"
+    fi
+    curl -fsSL https://claude.ai/install.sh | bash
+    export PATH="$HOME/.local/bin:$PATH"
+    if ! need claude; then
+        echo "❌ Claude Code install failed. Manual: https://claude.ai/download"
         exit 1
     fi
 fi
@@ -77,21 +82,12 @@ echo "Installing Python deps..."
 uv sync --quiet
 echo "✓ venv ready at .venv/"
 
-# 6) .env scaffold
+# 6) .env scaffold (setup.py 会自动填; 这里只确保文件存在)
 if [[ ! -f .env ]]; then
     cp .env.example .env
-    # Pre-fill detected paths
-    sed -i.bak "s|^CLAUDE_CLI_PATH=.*|CLAUDE_CLI_PATH=$CLAUDE_BIN|" .env
-    rm -f .env.bak
-    echo "✓ .env created (with CLAUDE_CLI_PATH pre-filled)"
-    echo
-    echo "  ── Required: edit .env to fill ──"
-    echo "    TELEGRAM_BOT_TOKEN  ← get from @BotFather in Telegram"
-    echo "    ALLOWED_USER_ID     ← get from @userinfobot in Telegram"
-    echo "    ANTHROPIC_API_KEY   ← from https://console.anthropic.com"
-    echo "                          (or skip + set BABATA_SHARED_CC=1 to share with logged-in CC)"
+    echo "✓ .env created from template"
 else
-    echo "✓ .env exists (skipped)"
+    echo "✓ .env exists (setup.py 会按需更新)"
 fi
 
 # 7) Expose `babata` as a global command (mirrors hermes / openclaw)
@@ -108,12 +104,42 @@ case ":$PATH:" in
        ;;
 esac
 
-cat <<EOF
+# 8) Hand off to setup.py — interactive guided config (auth + TG + WX)
+echo
+echo "── 进入引导程序 setup.py (可 Ctrl+C 跳过, 之后再跑 .venv/bin/python setup.py) ──"
+echo
 
+SETUP_EXIT=0
+if [[ -t 0 ]] && [[ -t 1 ]]; then
+    # 不能 set -e 时直接跑 setup.py — 失败会让整个 install.sh exit. 显式捕获退出码.
+    "$REPO_DIR/.venv/bin/python" "$REPO_DIR/setup.py" || SETUP_EXIT=$?
+else
+    echo "(非交互终端, 跳过引导. 手动跑: .venv/bin/python setup.py)"
+    SETUP_EXIT=99  # 显式标记: 没跑过, 待用户手动跑
+fi
+
+echo
+if [[ $SETUP_EXIT -eq 0 ]]; then
+    cat <<EOF
 ── Install done. Next: ─────────────────────────
-  1. Edit .env (see above)
-  2. Run the bot:   babata             (foreground, Ctrl+C to stop)
-                    → message your bot in Telegram
-  3. Persist:       docs/persist-macos.md  (launchd, optional)
+  - 启动 bot:         babata           (foreground, Ctrl+C to stop)
+  - 重跑引导配置:     .venv/bin/python setup.py
+  - 后台常驻 (macOS): docs/persist-macos.md
 
 EOF
+elif [[ $SETUP_EXIT -eq 99 ]]; then
+    cat <<EOF
+── Install 完成, 配置待手动 ──────────────────
+  - 跑引导配置:       .venv/bin/python setup.py
+  - 后台常驻 (macOS): docs/persist-macos.md
+
+EOF
+else
+    cat <<EOF
+── Install 完成, 但配置未完成 (setup.py exit=$SETUP_EXIT) ──
+  - 重跑引导:         .venv/bin/python setup.py
+  - 没装任何 channel babata 跑不起来.
+
+EOF
+    exit $SETUP_EXIT
+fi
