@@ -95,12 +95,33 @@ mkdir -p "$HOME/.local/bin"
 ln -sf "$REPO_DIR/.venv/bin/babata" "$HOME/.local/bin/babata"
 echo "✓ symlinked $HOME/.local/bin/babata → $REPO_DIR/.venv/bin/babata"
 
-# Hint user if ~/.local/bin not on PATH
+# PATH 没 ~/.local/bin 就自动 append 到 shell rc — 不让用户手改文件 (iron rule).
+# 幂等: grep 检查已存在不重复 append.
 case ":$PATH:" in
     *":$HOME/.local/bin:"*) ;;
-    *) echo
-       echo "  ⚠️  $HOME/.local/bin is not on your PATH. Add to your shell rc:"
-       echo "       export PATH=\"\$HOME/.local/bin:\$PATH\""
+    *)
+       SHELL_NAME="$(basename "${SHELL:-/bin/bash}")"
+       case "$SHELL_NAME" in
+           zsh)  RC="$HOME/.zshrc" ;;
+           bash) RC="$HOME/.bashrc" ;;
+           fish) RC="$HOME/.config/fish/config.fish" ;;
+           *)    RC="$HOME/.profile" ;;
+       esac
+       EXPORT_LINE='export PATH="$HOME/.local/bin:$PATH"'
+       [[ "$SHELL_NAME" == "fish" ]] && EXPORT_LINE='set -gx PATH $HOME/.local/bin $PATH'
+       mkdir -p "$(dirname "$RC")"
+       touch "$RC"
+       if grep -qF -- "$EXPORT_LINE" "$RC" 2>/dev/null; then
+           echo "✓ \$HOME/.local/bin 已在 $RC"
+       else
+           {
+               echo ""
+               echo "# babata install.sh — 自动加 ~/.local/bin (含 babata + claude + uv)"
+               echo "$EXPORT_LINE"
+           } >> "$RC"
+           echo "✓ 已加 \$HOME/.local/bin 到 $RC"
+       fi
+       echo "  开新终端 or 跑: source $RC"
        ;;
 esac
 
