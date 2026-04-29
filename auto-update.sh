@@ -78,6 +78,10 @@ echo "CLI: $OLD_CLI -> $NEW_CLI"
 # 2) claude-agent-sdk in babata venv (uv-managed, no pip)
 OLD_SDK=$("$VENV_PY" -c "import claude_agent_sdk; print(claude_agent_sdk.__version__)" 2>/dev/null)
 "$UV" pip install --python "$VENV_PY" --upgrade claude-agent-sdk 2>&1 | tail -5
+# Sync uv.lock to match the upgrade. `pip install --upgrade` ignores the lock,
+# so without this any dev `uv sync` would downgrade venv to lock's pinned (older)
+# version → next auto-update upgrades again → phantom kickstart of all bots.
+"$UV" --directory "$SCRIPT_DIR" lock --upgrade-package claude-agent-sdk 2>&1 | tail -3
 NEW_SDK=$("$VENV_PY" -c "import claude_agent_sdk; print(claude_agent_sdk.__version__)" 2>/dev/null)
 echo "SDK: $OLD_SDK -> $NEW_SDK"
 
