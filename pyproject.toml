@@ -9,6 +9,9 @@ dependencies = [
     "python-dotenv>=1.0",
     "httpx>=0.27",
     "cryptography>=42.0",
+    # 开箱即用 voice — 默认本地, 用户填 MIMO env 升级到 MiMo Omni.
+    "edge-tts>=6.1",        # MS Edge 免费 TTS, 中文 zh-CN-XiaoxiaoNeural 默认; ~150KB
+    "faster-whisper>=1.0",  # 本地 STT, base 模型 ~150MB 首跑下载缓存到 ~/.cache/
 ]
 
 [project.optional-dependencies]
