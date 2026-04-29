@@ -607,10 +607,20 @@ def step_wx() -> bool:
         return False
 
     # WX 依赖 (pilk + qrcode) 默认不装 — TG-only 用户不该被 C 扩展拖累.
-    # 选 WX 才现装. uv 应在 PATH (install.sh 装的; 独立跑时用户自己 source 过).
+    # 选 WX 才现装. 独立跑 setup.py 时 PATH 可能没 ~/.local/bin, 显式探.
+    uv_bin = shutil.which("uv")
+    if not uv_bin:
+        for cand in [Path.home() / ".local/bin/uv", Path("/usr/local/bin/uv")]:
+            if cand.is_file() and os.access(cand, os.X_OK):
+                uv_bin = str(cand)
+                break
+    if not uv_bin:
+        print("✗ 找不到 uv 命令. 先跑 install.sh 装 uv, 或手动: pip install uv")
+        return False
+
     print("装 WX 依赖 (pilk + qrcode)...")
     sync = subprocess.run(
-        ["uv", "sync", "--quiet", "--extra", "wx"],
+        [uv_bin, "sync", "--quiet", "--extra", "wx"],
         cwd=str(REPO),
     )
     if sync.returncode != 0:
