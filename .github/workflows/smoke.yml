@@ -3,6 +3,7 @@ name: smoke
 on:
   push:
     branches: [main]
+    tags: ['*']
   pull_request:
 
 jobs:
@@ -15,6 +16,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Leak guard
+        run: bash tests/leak_guard.sh
 
       - uses: actions/setup-python@v5
         with:

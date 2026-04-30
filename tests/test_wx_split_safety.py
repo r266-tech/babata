@@ -10,10 +10,11 @@ import os
 import sys
 from pathlib import Path
 
-SDK_SITE = Path("/Users/admin/code/babata/.venv/lib/python3.13/site-packages")
-if SDK_SITE.exists():
-    sys.path.insert(0, str(SDK_SITE))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_REPO = Path(__file__).resolve().parents[1]
+_SDK_SITE = next(iter((_REPO / ".venv/lib").glob("python*/site-packages")), None)
+if _SDK_SITE:
+    sys.path.insert(0, str(_SDK_SITE))
+sys.path.insert(0, str(_REPO))
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:test")
 os.environ.setdefault("ALLOWED_USER_ID", "0")

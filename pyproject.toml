@@ -9,9 +9,33 @@ dependencies = [
     "python-dotenv>=1.0",
     "httpx>=0.27",
     "cryptography>=42.0",
+    # 开箱即用 voice — 默认本地, 用户填 MIMO env 升级到 MiMo Omni.
+    "edge-tts>=6.1",        # MS Edge 免费 TTS, 中文 zh-CN-XiaoxiaoNeural 默认; ~150KB
+    "faster-whisper>=1.0",  # 本地 STT, base 模型 ~150MB 首跑下载缓存到 ~/.cache/
+]
+
+[project.optional-dependencies]
+# WX channel: pilk = SILK voice decode (C ext, build 需要 gcc); qrcode = 终端 ASCII QR.
+# TG-only 用户不装这俩, 避免 ARM/无 prebuilt wheel 场景 (e.g. Linux + Python 3.13) 卡 build.
+# wizard.py step_wx 选 yes 时才 `uv sync --extra wx` 现装.
+wx = [
     "pilk>=0.2.4",
     "qrcode>=7.4",
 ]
 
 [project.scripts]
 babata = "bot:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# 单文件 module 项目 (没用 packages 目录), 显式列出每个 .py 让 setuptools
+# 知道安装哪些. 没这段 uv sync 不会真 install 项目, [project.scripts] 不生成
+# entry script, .venv/bin/babata 不存在, install.sh 的 symlink 变 dangling.
+[tool.setuptools]
+py-modules = [
+    "bot", "bridge", "cc", "constants", "media",
+    "tg_mcp", "weixin_account", "weixin_bot",
+    "weixin_bridge", "weixin_ilink", "weixin_mcp",
+]
