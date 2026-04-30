@@ -43,11 +43,20 @@ if ! need uv; then
 fi
 echo "✓ uv $(uv --version 2>&1 | awk '{print $2}')"
 
-# 3) ffmpeg (optional, for voice transcription)
+# 3) ffmpeg — 语音 STT/TTS pipeline 必需 (OGG → WAV / TTS mp3 → SILK).
+# 默认装, 不让用户手敲. 100MB 但开箱即用. 自己有就 skip.
 if ! need ffmpeg; then
-    echo "⚠️  ffmpeg not found (语音消息转录需要; 文字/图片/视频不受影响)"
-    [[ $PLATFORM == mac ]]   && echo "   Install: brew install ffmpeg"
-    [[ $PLATFORM == linux ]] && echo "   Install: sudo apt install ffmpeg"
+    if [[ $PLATFORM == linux ]] && need apt-get; then
+        echo "Installing ffmpeg (语音消息转录需要)..."
+        sudo apt-get install -y ffmpeg
+    elif [[ $PLATFORM == mac ]] && need brew; then
+        echo "Installing ffmpeg (语音消息转录需要)..."
+        brew install ffmpeg
+    else
+        echo "⚠️  ffmpeg not found, 自动装失败 (没 apt-get / brew). 手动装一下:"
+        [[ $PLATFORM == mac ]]   && echo "   brew install ffmpeg"
+        [[ $PLATFORM == linux ]] && echo "   你的发行版包管理器装 ffmpeg"
+    fi
 fi
 
 # 4) Claude Code CLI — babata 强依赖, 没装就直接装, 不 ask (跟 uv 一样)
