@@ -88,28 +88,33 @@ echo "✓ symlinked $HOME/.local/bin/babata → $REPO_DIR/.venv/bin/babata"
 case ":$PATH:" in
     *":$HOME/.local/bin:"*) ;;
     *)
+       # 同时 append 到多处: interactive non-login (.bashrc/.zshrc) + login shell
+       # (.profile/.zprofile). OrbStack ssh / docker exec 进 sandbox 是 login shell,
+       # 只读 .profile 不读 .bashrc — 单写 .bashrc 用户开新 shell 还是没 PATH.
        SHELL_NAME="$(basename "${SHELL:-/bin/bash}")"
-       case "$SHELL_NAME" in
-           zsh)  RC="$HOME/.zshrc" ;;
-           bash) RC="$HOME/.bashrc" ;;
-           fish) RC="$HOME/.config/fish/config.fish" ;;
-           *)    RC="$HOME/.profile" ;;
-       esac
        EXPORT_LINE='export PATH="$HOME/.local/bin:$PATH"'
-       [[ "$SHELL_NAME" == "fish" ]] && EXPORT_LINE='set -gx PATH $HOME/.local/bin $PATH'
-       mkdir -p "$(dirname "$RC")"
-       touch "$RC"
-       if grep -qF -- "$EXPORT_LINE" "$RC" 2>/dev/null; then
-           echo "✓ \$HOME/.local/bin 已在 $RC"
-       else
-           {
-               echo ""
-               echo "# babata install.sh — 自动加 ~/.local/bin (含 babata + claude + uv)"
-               echo "$EXPORT_LINE"
-           } >> "$RC"
-           echo "✓ 已加 \$HOME/.local/bin 到 $RC"
-       fi
-       echo "  开新终端 or 跑: source $RC"
+       case "$SHELL_NAME" in
+           zsh)  RCS=("$HOME/.zshrc" "$HOME/.zprofile") ;;
+           bash) RCS=("$HOME/.bashrc" "$HOME/.profile") ;;
+           fish) RCS=("$HOME/.config/fish/config.fish")
+                 EXPORT_LINE='set -gx PATH $HOME/.local/bin $PATH' ;;
+           *)    RCS=("$HOME/.profile") ;;
+       esac
+       for RC in "${RCS[@]}"; do
+           mkdir -p "$(dirname "$RC")"
+           touch "$RC"
+           if grep -qF -- "$EXPORT_LINE" "$RC" 2>/dev/null; then
+               echo "✓ \$HOME/.local/bin 已在 $RC"
+           else
+               {
+                   echo ""
+                   echo "# babata install.sh — 自动加 ~/.local/bin"
+                   echo "$EXPORT_LINE"
+               } >> "$RC"
+               echo "✓ 已加 \$HOME/.local/bin 到 $RC"
+           fi
+       done
+       echo "  开新终端 or 跑: source ${RCS[0]}"
        ;;
 esac
 
