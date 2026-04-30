@@ -140,25 +140,29 @@ else
 fi
 
 echo
+# 启动命令用绝对路径 — 当前 shell 还没 source rc, \`babata\` / \`claude\` 这些全局
+# 命令要开新终端才生效. 不靠 PATH 就不会卡用户.
 if [[ $SETUP_EXIT -eq 0 ]]; then
     cat <<EOF
 ── Install done. Next: ─────────────────────────
-  - 启动 bot:         babata           (foreground, Ctrl+C to stop)
-  - 重跑引导配置:     .venv/bin/python wizard.py
+  - 启动 bot:         $REPO_DIR/.venv/bin/babata    (foreground, Ctrl+C to stop)
+  - 重跑引导配置:     $REPO_DIR/.venv/bin/python $REPO_DIR/wizard.py
   - 后台常驻 (macOS): docs/persist-macos.md
+
+  (开新终端后, 直接 \`babata\` / \`claude\` 也能用 — PATH 已加到 shell rc)
 
 EOF
 elif [[ $SETUP_EXIT -eq 99 ]]; then
     cat <<EOF
 ── Install 完成, 配置待手动 ──────────────────
-  - 跑引导配置:       .venv/bin/python wizard.py
+  - 跑引导配置:       $REPO_DIR/.venv/bin/python $REPO_DIR/wizard.py
   - 后台常驻 (macOS): docs/persist-macos.md
 
 EOF
 else
     cat <<EOF
 ── Install 完成, 但配置未完成 (wizard.py exit=$SETUP_EXIT) ──
-  - 重跑引导:         .venv/bin/python wizard.py
+  - 重跑引导:         $REPO_DIR/.venv/bin/python $REPO_DIR/wizard.py
   - 没装任何 channel babata 跑不起来.
 
 EOF
