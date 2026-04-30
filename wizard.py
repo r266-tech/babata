@@ -594,6 +594,47 @@ def _capture_tg_user_id(token: str, nonce: str) -> tuple[int, dict] | None:
 # ── step 3: WX channel ────────────────────────────────────────────────
 
 
+def _ensure_pilk_build_tools() -> bool:
+    """pilk 没 prebuilt wheel (ARM Linux Py3.13 等), 必须本地编译.
+    没 gcc 就主动 sudo apt 装 build-essential + python3-dev. 不让用户手敲命令.
+    """
+    if shutil.which("gcc") or shutil.which("cc") or shutil.which("clang"):
+        return True
+
+    if sys.platform.startswith("linux"):
+        if not shutil.which("apt-get"):
+            print("✗ 没找到 gcc 也没找到 apt-get — 不知怎么装. 自己装个 C 编译器后重跑.")
+            return False
+        print("装微信需要 C 编译器 (pilk 是 C 扩展). 现在装 build-essential + python3-dev...")
+        print("(会要 sudo 密码)")
+        proc = subprocess.run(
+            ["sudo", "apt-get", "install", "-y", "build-essential", "python3-dev"],
+        )
+        if proc.returncode == 0 and shutil.which("gcc"):
+            print("✓ build tools 装好")
+            return True
+        # apt-get install -y 失败可能是 apt 索引过期, 自动 update 再试
+        print("第一次失败, 尝试 apt-get update 再装...")
+        subprocess.run(["sudo", "apt-get", "update"])
+        proc = subprocess.run(
+            ["sudo", "apt-get", "install", "-y", "build-essential", "python3-dev"],
+        )
+        if proc.returncode == 0 and shutil.which("gcc"):
+            print("✓ build tools 装好")
+            return True
+        print("✗ build-essential 装失败. 自己装上后重跑 wizard.py.")
+        return False
+
+    if sys.platform == "darwin":
+        # macOS xcode CLT 必须 GUI 装, 没法 automate. 提示用户跑.
+        print("✗ 没找到 C 编译器. 跑这个 (会弹 GUI 确认): xcode-select --install")
+        print("  装完重跑 wizard.py")
+        return False
+
+    print(f"✗ 没找到 C 编译器, 平台 {sys.platform} 不知怎么自动装. 自己装个 gcc 重跑.")
+    return False
+
+
 def step_wx() -> bool:
     banner("WeChat channel (可选)")
     print("用腾讯 iLink bot 协议. 终端打 ASCII QR, 微信扫码即可.")
@@ -604,6 +645,11 @@ def step_wx() -> bool:
 
     if not VENV_PY.exists():
         print(f"✗ 找不到 {VENV_PY}, 先跑 install.sh")
+        return False
+
+    # pilk 是 C 扩展, 必须有 gcc + Python headers. 没装就主动 sudo apt 装,
+    # 不让用户手动跑 (iron rule). macOS 通常 xcode CLT 自带, 缺了得 GUI 装.
+    if not _ensure_pilk_build_tools():
         return False
 
     # WX 依赖 (pilk + qrcode) 默认不装 — TG-only 用户不该被 C 扩展拖累.
@@ -624,10 +670,8 @@ def step_wx() -> bool:
         cwd=str(REPO),
     )
     if sync.returncode != 0:
-        print("✗ WX 依赖装失败.")
-        print("  pilk 是 C 扩展, 需要 gcc + Python headers. 装好 build 工具再重跑:")
-        print("    Linux:  sudo apt install build-essential python3-dev")
-        print("    macOS:  xcode-select --install")
+        print("✗ WX 依赖装失败 (build tools 已装但 pilk 还是没编出来).")
+        print("  完整 build 输出在上面, 复制给开发者看.")
         return False
 
     code = (
