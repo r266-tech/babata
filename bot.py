@@ -17,6 +17,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -224,6 +225,12 @@ _last_model: str | None = _state.get("last_model")
 _last_context_window: int | None = _state.get("last_context_window")
 _last_used_tokens: int = int(_state.get("last_used_tokens", 0))
 _last_cost: float = float(_state.get("last_cost", 0.0))
+# Session id that produced the values above. /status uses _last_used_tokens
+# only as a fallback when JSONL hasn't flushed yet; cross-session leak (idle
+# reset spawns a new sid while state still carries the previous session's
+# inflated model_usage aggregate) was the source of "317% of 1M" right after
+# bot restart.
+_last_session_id: str | None = _state.get("last_session_id")
 
 # ── Formatting (physical: TG requires HTML, max 4096 chars) ──────────
 
@@ -793,6 +800,13 @@ class ChannelWorker:
                 if all_done:
                     self._schedule_marks(all_done, "👌")
                 self._reset_turn_state(exit_inflight=True)
+                # Turn 结束 → 清 bridge.reply_to. 不清的话, V turn 之后 cron
+                # 走 mcp__tg__tg_send_* 发的消息 (gmail PR-merged 通报 / weekly
+                # report / X 日报...) 都会带上 V 上一条 message_id 当 reply_to,
+                # TG 渲染成"引用 V 上一条". chat_id 保留 — cron 还得知道发哪
+                # 个 chat. 只清 reply_to.
+                with suppress(Exception):
+                    bridge.reply_to = None
                 # 不再 P1.4 promote — batch 模式 SDK 不会发第二个 turn_end,
                 # promote 会让 in_flight 永久卡死. per-msg 模式后续 SDK ev
                 # 通过 _handle_text_delta 的 _latest_payload fallback 渲染.
@@ -888,7 +902,7 @@ class ChannelWorker:
 
     def _apply_accounting(self, resp: Response) -> None:
         global _session_cost, _session_turns, _last_model, _last_context_window
-        global _last_used_tokens, _last_cost
+        global _last_used_tokens, _last_cost, _last_session_id
         if not resp.session_id and resp.cost == 0.0 and not resp.tools:
             _session_cost = 0.0
             _session_turns = 0
@@ -907,6 +921,8 @@ class ChannelWorker:
                 + resp.cache_creation_tokens
                 + resp.cache_read_tokens
             )
+            if resp.session_id:
+                _last_session_id = resp.session_id
 
         _state["session_cost"] = _session_cost
         _state["session_turns"] = _session_turns
@@ -916,6 +932,8 @@ class ChannelWorker:
             _state["last_model"] = _last_model
         if _last_context_window:
             _state["last_context_window"] = _last_context_window
+        if _last_session_id:
+            _state["last_session_id"] = _last_session_id
         _save_state()
 
     def _reset_turn_state(
@@ -1438,7 +1456,12 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         actual = cfg_model
 
     win = _last_context_window or _infer_window_from_alias(cfg_model)
-    used = _last_prompt_tokens(cc._session_id) or _last_used_tokens
+    # Fallback to _last_used_tokens only when it belongs to the current session.
+    # Otherwise idle-reset (4am daily restart spawns a fresh sid) leaks the
+    # previous session's inflated model_usage aggregate into the new session's
+    # bar — observed as "317% of 1M" before JSONL flushed the first turn.
+    fallback_used = _last_used_tokens if _last_session_id == cc._session_id else 0
+    used = _last_prompt_tokens(cc._session_id) or fallback_used
     pct_ctx = (used / win * 100) if (win and used > 0) else 0.0
     bar = _progress_bar(pct_ctx)
     model_short = _short_model(actual)
@@ -1940,20 +1963,41 @@ def _fmt_ago(ts: float) -> str:
 # 的一次性 session 把 bb 交互列表塞满. 判定在 cc.list_recent_sessions 按 JSONL
 # entrypoint 字段打 label.
 _CURRENT_LABEL = INSTANCE_LABELS.get(INSTANCE, INSTANCE or PROJECT)
-_RESUME_CATEGORIES: list[tuple[str, str, list[str]]] = [
-    # (category_id, 中文显示名, channel labels in cc.py)
-    ("tg",      "当前",   [_CURRENT_LABEL]),
-    ("wx",      "微信",   [INSTANCE_LABELS["weixin"]]),
-    ("term",    "终端",   ["term"]),
-    ("oneshot", "一次性", ["oneshot"]),
+# (category_id, 中文显示名, channel labels in cc.py, scan_all_buckets)
+# scan_all_buckets=True: 跨 ~/.claude/projects/<cwd-hash>/ 全部 bucket 扫.
+# tg/wx 是 babata 自己拥有的 channel, sids 在 babata 自己 cwd 对应的单 bucket
+# 里, 不用全扫. term/oneshot 是 V 在终端 (任意 cwd) 开的原生 CC, sessions
+# 散落在不同 bucket, 必须全扫才能跟终端 /resume 对齐.
+_RESUME_CATEGORIES: list[tuple[str, str, list[str], bool]] = [
+    ("tg",      "当前",   [_CURRENT_LABEL],            False),
+    ("wx",      "微信",   [INSTANCE_LABELS["weixin"]], False),
+    ("term",    "终端",   ["term"],                    True),
+    ("oneshot", "一次性", ["oneshot"],                 True),
 ]
+
+
+def _render_resume_channel_picker() -> tuple[str, "InlineKeyboardMarkup"]:
+    """Build the Level-1 渠道 picker (header text + keyboard).
+
+    Shared between /resume command (initial display) and resume-back callback
+    (从 Level 2 session 列表返回).
+    """
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    buttons = [
+        [InlineKeyboardButton(name, callback_data=f"resume-ch:{cat}")]
+        for cat, name, _, _ in _RESUME_CATEGORIES
+    ]
+    cur = cc._session_id
+    header = f"当前: {cur[:8]}\n选一个渠道:" if cur else "当前: (无)\n选一个渠道:"
+    return header, InlineKeyboardMarkup(buttons)
 
 
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Two-level session picker.
 
     Level 1: 选渠道 (TG / 微信 / 终端 / 一次性). /resume 直接给的这层.
-    Level 2: 选具体 session. 对应渠道内最近 5 条.
+    Level 2: 选具体 session. 对应渠道内最近 5 条, 底部带"← 返回"回到 Level 1.
 
     两级设计避免跨渠道 session 混在一个 list 里噪音大, V 明确指定"在哪个渠道
     的历史里挑"让 picker 更聚焦. 仍然跨渠道可见 — 在 TG 里也能看到终端 /微信开的
@@ -1961,17 +2005,20 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     if not _allowed(update):
         return
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-    buttons = [
-        [InlineKeyboardButton(name, callback_data=f"resume-ch:{cat}")]
-        for cat, name, _ in _RESUME_CATEGORIES
-    ]
-    cur = cc._session_id
-    header = f"当前: {cur[:8]}\n选一个渠道:" if cur else "当前: (无)\n选一个渠道:"
-    await update.message.reply_text(
-        header, reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    header, markup = _render_resume_channel_picker()
+    await update.message.reply_text(header, reply_markup=markup)
+
+
+async def on_resume_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Back-button callback: 从 Level 2 session 列表回到 Level 1 渠道 picker."""
+    query = update.callback_query
+    await query.answer()
+    header, markup = _render_resume_channel_picker()
+    try:
+        await query.edit_message_text(header, reply_markup=markup)
+    except Exception:
+        pass
 
 
 async def on_resume_channel_pick(
@@ -1992,10 +2039,14 @@ async def on_resume_channel_pick(
         except Exception:
             pass
         return
-    _, cat_name, channel_labels = cat
+    _, cat_name, channel_labels, scan_all_buckets = cat
 
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    sessions = cc.list_recent_sessions(limit=5, channel_filter=channel_labels)
+    sessions = cc.list_recent_sessions(
+        limit=5,
+        channel_filter=channel_labels,
+        scan_all_buckets=scan_all_buckets,
+    )
     if not sessions:
         try:
             await query.edit_message_text(f"{cat_name}: 暂无历史 session")
@@ -2018,6 +2069,10 @@ async def on_resume_channel_pick(
         buttons.append([
             InlineKeyboardButton(label, callback_data=f"resume:{s['sid']}"),
         ])
+    # 底部"← 返回"回到 Level 1 渠道 picker — V 选错渠道时不用重发 /resume.
+    buttons.append([
+        InlineKeyboardButton("← 返回", callback_data="resume-back"),
+    ])
     try:
         await query.edit_message_text(
             f"{cat_name} 渠道最近 session, 选一个恢复:",
@@ -2068,11 +2123,21 @@ async def on_resume_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     _state["last_cost"] = 0.0
     _save_state()
 
-    # Show the last 2 rounds of the resumed session so V can recognize which
-    # thread it is — picker's 48-char first-user preview is often ambiguous
-    # between nearby sessions. Fall back to bare confirm if JSONL has no
-    # text-bearing turns yet (fresh session, or all turns were tool-only).
+    # Cross-bucket fork: 跨 cwd-bucket 选的 sid, cc 已 import 成新 uuid 写到
+    # babata bucket (见 cc._import_jsonl_to_bucket). 这里用 cc._session_id 反映
+    # 真实激活的 sid, 让 V 知道发生了 fork.
+    active_sid = cc._session_id or sid
+    forked = active_sid != sid
+
+    # 读 turn 用 *原* sid — 源文件还在原 bucket 完整可读, fork 后的副本内容跟原
+    # 一致, 任选其一. 用原 sid 走 _find_jsonl_any_bucket 避免依赖 import 完整性.
     turns = cc.get_recent_turns(sid, pairs=2)
+    head = (
+        f"✅ 已恢复 <code>{sid[:8]}</code> "
+        f"(fork → <code>{active_sid[:8]}</code>)"
+        if forked else
+        f"✅ 已恢复 <code>{active_sid[:8]}</code>"
+    )
     if turns:
         blocks = []
         for role, text in turns:
@@ -2080,20 +2145,23 @@ async def on_resume_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             blocks.append(f"<b>{who}:</b> {html.escape(text)}")
         preview = "\n\n".join(blocks)
         body = (
-            f"✅ 已恢复 <code>{sid[:8]}</code>\n\n"
+            f"{head}\n\n"
             f"<blockquote>{preview}</blockquote>\n\n"
             "继续发消息即可。"
         )
-        parse = "HTML"
     else:
-        body = f"✅ 已恢复 {sid[:8]},继续发消息即可。"
-        parse = None
+        body = f"{head},继续发消息即可。"
     try:
-        await query.edit_message_text(body, parse_mode=parse)
+        await query.edit_message_text(body, parse_mode="HTML")
     except Exception:
-        # HTML rejection (escaped something TG parser still dislikes) — retry plain
+        # HTML rejection — retry plain.
         try:
-            await query.edit_message_text(f"✅ 已恢复 {sid[:8]},继续发消息即可。")
+            plain = (
+                f"✅ 已恢复 {sid[:8]} (fork → {active_sid[:8]}),继续发消息即可。"
+                if forked else
+                f"✅ 已恢复 {active_sid[:8]},继续发消息即可。"
+            )
+            await query.edit_message_text(plain)
         except Exception:
             pass
 
@@ -2208,7 +2276,29 @@ async def _post_init(app: Application) -> None:
             log.warning("startup notice send failed: %s", e)
 
 
+def _spawn_weixin_if_configured() -> "subprocess.Popen | None":
+    """装了 WX 就 spawn weixin_bot.py 子进程 — 让 babata 一条命令跑 TG+WX.
+    判据: ~/.babata/weixin/accounts/ 有 token 文件. 没有则 V 没装 WX, 不 spawn.
+    生产 launchd 模式各 channel 独立 plist 跑, 通过 BABATA_NO_AUTO_WX=1 关掉.
+    """
+    if os.environ.get("BABATA_NO_AUTO_WX"):
+        return None
+    accounts = Path.home() / ".babata" / "weixin" / "accounts"
+    if not accounts.exists() or not any(accounts.iterdir()):
+        return None
+    weixin_main = Path(__file__).parent / "weixin_bot.py"
+    if not weixin_main.exists():
+        return None
+    log.info("WX channel detected — spawning weixin_bot.py")
+    py = VENV_PYTHON if Path(VENV_PYTHON).exists() else "python3"
+    proc = subprocess.Popen([py, str(weixin_main)])
+    import atexit
+    atexit.register(lambda: proc.terminate() if proc.poll() is None else None)
+    return proc
+
+
 def main() -> None:
+    _spawn_weixin_if_configured()
     app = Application.builder().token(TOKEN).concurrent_updates(True).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("status", cmd_status))
@@ -2221,9 +2311,10 @@ def main() -> None:
     app.add_handler(CommandHandler("new", on_text))
     app.add_handler(CallbackQueryHandler(on_verbose_click, pattern=r"^verbose:"))
     app.add_handler(CallbackQueryHandler(on_provider_click, pattern=r"^provider:"))
-    # resume-ch: 必须注册在 resume: 之前匹配更精确, 但 ^resume: 不会吞 ^resume-ch:
-    # (第 7 个字符 '-' vs ':'), 两者 pattern 互斥, 顺序无关紧要.
+    # resume-ch: / resume-back / resume: 三个 pattern 互斥 (第 7 字符不同),
+    # 注册顺序无关紧要; 仍按 specific → generic 排列利于阅读.
     app.add_handler(CallbackQueryHandler(on_resume_channel_pick, pattern=r"^resume-ch:"))
+    app.add_handler(CallbackQueryHandler(on_resume_back, pattern=r"^resume-back$"))
     app.add_handler(CallbackQueryHandler(on_resume_click, pattern=r"^resume:"))
     app.add_handler(CallbackQueryHandler(on_button_click, pattern=r"^mcp:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
