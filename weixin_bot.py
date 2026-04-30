@@ -14,7 +14,9 @@ contextToken routing, markdown stripping for WeChat's plain-text display.
 
 import asyncio
 import base64
+import fcntl
 import logging
+import os
 import re
 import secrets
 import signal
@@ -831,7 +833,62 @@ async def main() -> None:
         await bridge.stop()
 
 
+_SINGLETON_LOCK_PATH = Path("/tmp/babata-weixin.lock")
+_singleton_lock_fd = None  # module-global so fd stays open for process lifetime
+
+
+def _acquire_singleton_lock() -> None:
+    """OS-level singleton: one weixin_bot per host.
+
+    Multiple launchd plists / OSS spawn paths / manual double-clicks all
+    converge here. Lock holder owns /tmp/babata-weixin-bridge.sock and the
+    iLink long-poll cursor. Lock auto-releases on process death (BSD flock).
+
+    Without this guard, weixin_bridge.start() does os.unlink(SOCKET_PATH)
+    before bind, so a second instance silently steals the socket from a
+    live first instance — both keep long-polling iLink, race-handling each
+    inbound, V's WeChat replies get duplicated.
+
+    Loser behavior:
+      - normal mode: exit 0. Pair with KeepAlive dict + SuccessfulExit=false
+        in any launchd plist so launchd does NOT relaunch on intentional
+        bow-out (default KeepAlive=true would spin-loop every ThrottleInterval).
+      - --login mode: exit 1 with explicit error (interactive account-add;
+        silent exit would confuse the user).
+
+    Open with "a+" not "w" so a loser does not truncate the holder's PID
+    breadcrumb before reading it for the log.
+    """
+    global _singleton_lock_fd
+    _singleton_lock_fd = open(_SINGLETON_LOCK_PATH, "a+")
+    try:
+        fcntl.flock(_singleton_lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        _singleton_lock_fd.seek(0)
+        try:
+            other = _singleton_lock_fd.read().strip() or "?"
+        except Exception:
+            other = "?"
+        if "--login" in sys.argv:
+            log.error(
+                "another weixin_bot holds %s (pid=%s) — "
+                "stop the running bot before adding an account",
+                _SINGLETON_LOCK_PATH, other,
+            )
+            sys.exit(1)
+        log.warning(
+            "another weixin_bot holds %s (pid=%s) — exiting",
+            _SINGLETON_LOCK_PATH, other,
+        )
+        sys.exit(0)
+    _singleton_lock_fd.seek(0)
+    _singleton_lock_fd.truncate()
+    _singleton_lock_fd.write(f"{os.getpid()}\n")
+    _singleton_lock_fd.flush()
+
+
 if __name__ == "__main__":
+    _acquire_singleton_lock()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
