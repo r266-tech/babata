@@ -167,6 +167,34 @@ SVCEOF
           systemctl --user enable --now babata.service 2>/dev/null && SVC_OK=1
         # enable-linger: user 没登录 systemd 也跑. 容器里可能没 /var/lib/systemd/linger 写权限, 失败不致命.
         sudo loginctl enable-linger "$USER" 2>/dev/null || true
+
+        # auto-update timer — hourly git pull + uv sync + claude update + 自动重启 bot.
+        # OSS 用户跟着 main 走, V 推 commit 1h 内 ripple 到所有装了的用户.
+        UPDATE_SVC="$HOME/.config/systemd/user/babata-update.service"
+        UPDATE_TIMER="$HOME/.config/systemd/user/babata-update.timer"
+        cat > "$UPDATE_SVC" <<UPDEOF
+[Unit]
+Description=babata auto-update (git pull + uv sync + claude update)
+
+[Service]
+Type=oneshot
+ExecStart=$REPO_DIR/scripts/auto-update.sh
+UPDEOF
+        cat > "$UPDATE_TIMER" <<TIMEREOF
+[Unit]
+Description=babata auto-update hourly
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMEREOF
+        systemctl --user daemon-reload
+        systemctl --user enable --now babata-update.timer 2>/dev/null || true
+
         if [[ $SVC_OK -eq 1 ]]; then
             cat <<EOF
 ── Install done. Bot 后台常驻已启动 (systemd). ──────
@@ -174,6 +202,7 @@ SVCEOF
   - 状态:        systemctl --user status babata
   - 停:          systemctl --user stop babata
   - 重启:        systemctl --user restart babata
+  - 自动更新:    每小时 git pull + uv sync (journalctl --user -u babata-update)
 
 EOF
         fi
@@ -205,6 +234,31 @@ PLISTEOF
         elif launchctl load -w "$PLIST" 2>/dev/null; then
             SVC_OK=1
         fi
+
+        # auto-update plist — StartInterval=3600 → 每小时跑 auto-update.sh
+        UPDATE_PLIST="$HOME/Library/LaunchAgents/com.babata.update.plist"
+        cat > "$UPDATE_PLIST" <<UPLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.babata.update</string>
+    <key>ProgramArguments</key>
+    <array><string>$REPO_DIR/scripts/auto-update.sh</string></array>
+    <key>WorkingDirectory</key><string>$REPO_DIR</string>
+    <key>StartInterval</key><integer>3600</integer>
+    <key>RunAtLoad</key><false/>
+    <key>StandardOutPath</key><string>$REPO_DIR/logs/auto-update.log</string>
+    <key>StandardErrorPath</key><string>$REPO_DIR/logs/auto-update.log</string>
+    <key>EnvironmentVariables</key>
+    <dict><key>PATH</key><string>$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+</dict>
+</plist>
+UPLISTEOF
+        launchctl bootout "gui/$UID/com.babata.update" 2>/dev/null || true
+        launchctl bootstrap "gui/$UID" "$UPDATE_PLIST" 2>/dev/null || \
+          launchctl load -w "$UPDATE_PLIST" 2>/dev/null || true
+
         if [[ $SVC_OK -eq 1 ]]; then
             cat <<EOF
 ── Install done. Bot 后台常驻已启动 (launchd). ──────
@@ -212,6 +266,7 @@ PLISTEOF
   - 状态:        launchctl print gui/\$UID/com.babata | head -20
   - 停:          launchctl bootout gui/\$UID/com.babata
   - 重启:        launchctl kickstart -k gui/\$UID/com.babata
+  - 自动更新:    每小时 git pull + uv sync (logs/auto-update.log)
 
 EOF
         fi
