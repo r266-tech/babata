@@ -140,16 +140,18 @@ else
 fi
 
 echo
-# 启动命令用绝对路径 — 当前 shell 还没 source rc, \`babata\` / \`claude\` 这些全局
-# 命令要开新终端才生效. 不靠 PATH 就不会卡用户.
 if [[ $SETUP_EXIT -eq 0 ]]; then
+    # 装完直接启动 bot, 不再 prompt — 装到这一步就是为了用.
+    # 非交互终端 (CI / pipe) 才打印 hint, 不 spawn 卡住的 foreground.
+    if [[ -t 0 ]] && [[ -t 1 ]]; then
+        echo "── Install done. 启动 bot (Ctrl+C 退出). ─────────────"
+        echo
+        exec "$REPO_DIR/.venv/bin/babata"
+    fi
     cat <<EOF
-── Install done. Next: ─────────────────────────
-  - 启动 bot:         $REPO_DIR/.venv/bin/babata    (foreground, Ctrl+C to stop)
-  - 重跑引导配置:     $REPO_DIR/.venv/bin/python $REPO_DIR/wizard.py
-  - 后台常驻 (macOS): docs/persist-macos.md
-
-  (开新终端后, 直接 \`babata\` / \`claude\` 也能用 — PATH 已加到 shell rc)
+── Install done. ────────────────────────────────
+  - 启动 bot:         $REPO_DIR/.venv/bin/babata
+  - 重跑引导:         $REPO_DIR/.venv/bin/python $REPO_DIR/wizard.py
 
 EOF
 elif [[ $SETUP_EXIT -eq 99 ]]; then
