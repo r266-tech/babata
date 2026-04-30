@@ -50,21 +50,9 @@ if ! need ffmpeg; then
     [[ $PLATFORM == linux ]] && echo "   Install: sudo apt install ffmpeg"
 fi
 
-# 4) Claude Code CLI
+# 4) Claude Code CLI — babata 强依赖, 没装就直接装, 不 ask (跟 uv 一样)
 if ! need claude; then
-    echo
-    echo "Claude Code CLI not found. babata uses it as the engine."
-    # 非交互 (CI / `bash install.sh < /dev/null`) 时, read 会立刻拿到 EOF + set -e
-    # 让脚本提前退出, 不到下面的引导. 显式 TTY guard 给非交互 case 明确指引.
-    if [[ -t 0 ]] && [[ -t 1 ]]; then
-        read -r -p "Install now? [Y/n] " ans
-        if [[ "$ans" =~ ^[Nn] ]]; then
-            echo "❌ babata 需要 Claude Code. 装好后再跑此脚本."
-            exit 1
-        fi
-    else
-        echo "(非交互终端, 自动装 Claude Code)"
-    fi
+    echo "Installing Claude Code CLI (babata 内核)..."
     curl -fsSL https://claude.ai/install.sh | bash
     export PATH="$HOME/.local/bin:$PATH"
     if ! need claude; then
