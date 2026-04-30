@@ -143,19 +143,92 @@ fi
 
 echo
 if [[ $SETUP_EXIT -eq 0 ]]; then
-    # 装完直接启动 bot, 不再 prompt — 装到这一步就是为了用.
-    # 非交互终端 (CI / pipe) 才打印 hint, 不 spawn 卡住的 foreground.
-    if [[ -t 0 ]] && [[ -t 1 ]]; then
-        echo "── Install done. 启动 bot (Ctrl+C 退出). ─────────────"
-        echo
-        exec "$REPO_DIR/.venv/bin/babata"
+    # 配 systemd (Linux) / launchd (macOS) auto-start — 装完后台常驻,
+    # 关终端不影响, 重启机器自动起, crash 自动重启. 真用户友好.
+    SVC_OK=0
+    if [[ $PLATFORM == linux ]] && need systemctl; then
+        SERVICE="$HOME/.config/systemd/user/babata.service"
+        mkdir -p "$(dirname "$SERVICE")"
+        cat > "$SERVICE" <<SVCEOF
+[Unit]
+Description=babata bot (TG + WX)
+After=network.target
+
+[Service]
+ExecStart=$REPO_DIR/.venv/bin/babata
+Restart=always
+RestartSec=5
+Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
+SVCEOF
+        systemctl --user daemon-reload && \
+          systemctl --user enable --now babata.service 2>/dev/null && SVC_OK=1
+        # enable-linger: user 没登录 systemd 也跑. 容器里可能没 /var/lib/systemd/linger 写权限, 失败不致命.
+        sudo loginctl enable-linger "$USER" 2>/dev/null || true
+        if [[ $SVC_OK -eq 1 ]]; then
+            cat <<EOF
+── Install done. Bot 后台常驻已启动 (systemd). ──────
+  - 看 log:      journalctl --user -u babata -f
+  - 状态:        systemctl --user status babata
+  - 停:          systemctl --user stop babata
+  - 重启:        systemctl --user restart babata
+
+EOF
+        fi
+    elif [[ $PLATFORM == mac ]]; then
+        PLIST="$HOME/Library/LaunchAgents/com.babata.plist"
+        mkdir -p "$(dirname "$PLIST")"
+        cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.babata</string>
+    <key>ProgramArguments</key>
+    <array><string>$REPO_DIR/.venv/bin/babata</string></array>
+    <key>WorkingDirectory</key><string>$REPO_DIR</string>
+    <key>KeepAlive</key><true/>
+    <key>RunAtLoad</key><true/>
+    <key>StandardOutPath</key><string>$HOME/babata.log</string>
+    <key>StandardErrorPath</key><string>$HOME/babata.log</string>
+    <key>EnvironmentVariables</key>
+    <dict><key>PATH</key><string>$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+</dict>
+</plist>
+PLISTEOF
+        # 已 load 的先 bootout (idempotent), 再 bootstrap. 旧 launchctl 用 load fallback.
+        launchctl bootout "gui/$UID/com.babata" 2>/dev/null || true
+        if launchctl bootstrap "gui/$UID" "$PLIST" 2>/dev/null; then
+            SVC_OK=1
+        elif launchctl load -w "$PLIST" 2>/dev/null; then
+            SVC_OK=1
+        fi
+        if [[ $SVC_OK -eq 1 ]]; then
+            cat <<EOF
+── Install done. Bot 后台常驻已启动 (launchd). ──────
+  - 看 log:      tail -f ~/babata.log
+  - 状态:        launchctl print gui/\$UID/com.babata | head -20
+  - 停:          launchctl bootout gui/\$UID/com.babata
+  - 重启:        launchctl kickstart -k gui/\$UID/com.babata
+
+EOF
+        fi
     fi
-    cat <<EOF
-── Install done. ────────────────────────────────
+    if [[ $SVC_OK -ne 1 ]]; then
+        # 没 systemd / launchd, 或 service 配失败 → 沦为 foreground demo + 提示
+        echo "⚠️  没探测到 systemd/launchd, 装到 auto-start 失败. Foreground 启动:"
+        echo
+        if [[ -t 0 ]] && [[ -t 1 ]]; then
+            exec "$REPO_DIR/.venv/bin/babata"
+        fi
+        cat <<EOF
   - 启动 bot:         $REPO_DIR/.venv/bin/babata
   - 重跑引导:         $REPO_DIR/.venv/bin/python $REPO_DIR/wizard.py
 
 EOF
+    fi
 elif [[ $SETUP_EXIT -eq 99 ]]; then
     cat <<EOF
 ── Install 完成, 配置待手动 ──────────────────
