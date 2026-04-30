@@ -79,6 +79,23 @@ echo "Installing Python deps..."
 uv sync --quiet
 echo "✓ venv ready at .venv/"
 
+# Pre-push leak guard — dev mode only (git clone 副本才有 .git/hooks/).
+# 防 V (或任何 fork dev) 私人字符串混进 public commit. CI 也会兜底, 但
+# 本地 hook 在 `git push` 一秒拦掉, 不用等 5 分钟 CI 跑完才发现。
+# Forks: 改 tests/leak_guard.sh BLACKLIST 加自己的私人串, 或 `git push --no-verify` 紧急绕过.
+if [[ -d "$REPO_DIR/.git/hooks" ]]; then
+    HOOK="$REPO_DIR/.git/hooks/pre-push"
+    if [[ ! -e "$HOOK" ]] || ! grep -q 'leak_guard' "$HOOK" 2>/dev/null; then
+        cat > "$HOOK" <<'PRE_PUSH_EOF'
+#!/usr/bin/env bash
+# Auto-installed by babata install.sh. Bypass: git push --no-verify
+exec bash "$(git rev-parse --show-toplevel)/tests/leak_guard.sh" --pre-push
+PRE_PUSH_EOF
+        chmod +x "$HOOK"
+        echo "✓ pre-push leak guard installed"
+    fi
+fi
+
 # 6) .env scaffold (wizard.py 会自动填; 这里只确保文件存在)
 if [[ ! -f .env ]]; then
     cp .env.example .env
