@@ -143,6 +143,19 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "prompt": "page_snapshot(tab_id?, window_id?, limit?) — 可见页面地图: ref / role / name / selector / rect / is_new",
     },
     {
+        "name": "article_extract",
+        "dispatch": "bridge",
+        "description": (
+            "Extract the main readable article/content from V's current tab. "
+            "Returns url/title/site metadata, paragraph list with ids, plain text "
+            "with [pN] anchors, markdown, char_count, and extraction_method. Use "
+            "when you decide the user's question needs the page's original text; "
+            "do not use shell/curl to read the current tab."
+        ),
+        "inputSchema": {"type": "object", "properties": _target_props()},
+        "prompt": "article_extract(tab_id?, window_id?) — 抽取当前页正文: metadata / paragraphs / [pN] text / markdown",
+    },
+    {
         "name": "page_click_ref",
         "dispatch": "bridge",
         "description": (
@@ -196,7 +209,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "dispatch": "notify",
         "description": (
             "Push prediction chips to the sidepanel UI. After reading a page / "
-            "answering V's question, you may forecast 1–6 likely follow-up "
+            "answering V's question, you may forecast 1–2 likely follow-up "
             "prompts (e.g. '总结全文' / '提取人物关系' / '帮我填表'). UI "
             "renders them as click-to-send chips. Don't over-suggest — only "
             "when you genuinely predict V's next move; empty list clears."
@@ -207,12 +220,12 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
                 "prompts": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "1–6 short prompts (under 20 chars each ideal)",
+                    "description": "1–2 high-leverage short prompts (under 20 chars each ideal)",
                 },
             },
             "required": ["prompts"],
         },
-        "prompt": "suggest_prompts(prompts) — 推 1-6 个 follow-up chip 到 sidepanel UI",
+        "prompt": "suggest_prompts(prompts) — 推 1-2 个高杠杆 follow-up chip 到 sidepanel UI",
     },
     {
         "name": "mascot_speak",

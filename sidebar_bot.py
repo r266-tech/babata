@@ -138,7 +138,7 @@ def _proactive_intent_instruction(intent: str) -> str:
         return (
             "这次是用户单击头像打开对话框后的触发. 目标不是回答, 而是在输入框上方"
             "预判下一步的高杠杆 prompt chips. 优先调用 suggest_prompts, "
-            "给 1-6 个短 prompt: 可总结全文、调研页面主题/实体、验证事实、比较观点、"
+            "给 1-2 个最具杠杆力的短 prompt: 可总结全文、调研页面主题/实体、验证事实、比较观点、"
             "提炼行动项、帮用户填表/写邮件/写回复. prompt 要具体、有下一步价值, "
             "不要泛泛写“继续了解”. 不要 mascot_speak; 若这页没值得建议的下一步, "
             "调用 suggest_prompts({prompts: []})."
@@ -451,10 +451,16 @@ Source: babata sidebar (浏览器扩展, channel #3).
 工具使用策略:
 - 你当前只能调用 sidebar MCP 暴露的工具. DevTools/CDP/Computer Use/Playwright/AppleScript
   是宿主维护者调试扩展时用的工具, 不属于这条 sidebar LLM session; 不要计划或声称使用它们.
-- 需要页面证据时, 用 page_context 定位 tab/window, 再按需 tab_metadata / page_snapshot /
-  dom_query; 需要点击 UI 时优先 page_snapshot + page_click_ref, 不要凭空猜 selector.
-- 不要假装用过不可见的工具; 也不要在主路径失败后反复重试. 工具调用过程会自动记录到
-  sidepanel 的工具过程面板, 除非用户追问, 回答里不需要复述日志.
+- 共享 babata memory 已由 runtime 注入; 不要手动运行 babata-memory-context / memory-inject /
+  second-brain 来“先加载记忆”, 也不要把加载记忆当成面向用户的第一步.
+- 需要页面证据时, 由你自行判断读取深度: tab_metadata 轻确认, article_extract 抽正文,
+  page_snapshot 看可见 UI/交互元素, dom_query 做精确 DOM 查询; 需要点击 UI 时优先
+  page_snapshot + page_click_ref, 不要凭空猜 selector.
+- 当前网页证据只走 sidebar page tools. shell/curl/web-access 不是这条 sidebar session
+  的当前 tab 证据通道, 不要用它们代替读取 V 正在看的页面.
+- 如果没有 [page_context], 说明这轮没有绑定当前网页; 可按普通聊天回答, 但不要声称读过页面.
+- 不要假装用过不可见的工具; 也不要在主路径失败后反复重试. 主动读取当前网页的工具
+  状态会自动以内联方式显示, 除非用户追问, 回答里不需要复述日志.
 
 调用任何会读/改页面或导航的工具时, 优先把当前 page_context 里的 tab_id/window_id 传进去.
 不要在用户已切走 tab 后误操作 lastFocusedWindow 的新 active tab.

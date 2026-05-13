@@ -91,7 +91,9 @@ def _codex_sandbox() -> str:
     )
 
 
-def _codex_cwd() -> str:
+def _codex_cwd(source: str | None = None) -> str:
+    if source == "sidebar":
+        return str(Path(__file__).parent)
     if os.environ.get("BABATA_FULL_TRUST") == "1":
         return str(Path.home())
     return str(Path(__file__).parent)
@@ -163,7 +165,7 @@ def _memory_reflex_for_prompt(source: str, user_prompt: str | None) -> dict[str,
                 "--message", "-",
                 "--source", source,
                 "--cpu", "codex",
-                "--cwd", _codex_cwd(),
+                "--cwd", _codex_cwd(source),
             ],
             input=user_prompt,
             stdout=subprocess.PIPE,
@@ -422,6 +424,12 @@ def _extract_tool_name(item: dict[str, Any]) -> str | None:
         name = item.get("name") or item.get("tool_name")
         return str(name) if name else None
     if item_type.endswith("tool_call") or item_type in {"mcp_call", "function_call"}:
+        tool = item.get("tool")
+        server = item.get("server")
+        if tool and server:
+            return f"{server}.{tool}"
+        if tool:
+            return str(tool)
         return str(item.get("name") or item.get("tool_name") or item_type)
     return None
 
@@ -513,6 +521,8 @@ class CodexEngine(CC):
                     file_content = last_file.read_text().strip()
                     if file_content:
                         content = file_content
+            if content and on_stream:
+                await on_stream(None, None, content, None)
             sid = result["sid"] or self._session_id or ""
             if sid:
                 old_sid = self._session_id
@@ -611,7 +621,7 @@ class CodexEngine(CC):
             "--json",
             "--skip-git-repo-check",
             "--sandbox", _codex_sandbox(),
-            "-C", _codex_cwd(),
+            "-C", _codex_cwd(source),
             "-o", str(last_file),
             *image_args,
             "-",
@@ -683,7 +693,6 @@ class CodexEngine(CC):
         tools: list[str] = []
         running_tools: dict[str, str] = {}
         usage: dict[str, int] = {}
-        streamed = False
         failure_message: str | None = None
 
         def remember_tool(name: str) -> None:
@@ -750,9 +759,6 @@ class CodexEngine(CC):
                         text = str(item.get("text") or "").strip()
                         if text:
                             content = text
-                            if on_stream and not streamed:
-                                await on_stream(None, None, text, None)
-                                streamed = True
                     else:
                         item_id = _extract_tool_id(item)
                         name = _extract_tool_name(item)
