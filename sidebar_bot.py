@@ -1239,6 +1239,7 @@ def build_app() -> web.Application:
     app.add_routes([
         web.get("/health", handle_health),
         web.get("/history", handle_history),
+        web.post("/history", handle_history),
         web.get("/ws", handle_ws),
         web.post("/chat", handle_chat),
         web.post("/proactive", handle_proactive),
