@@ -33,6 +33,8 @@ runtime_file_for_label() {
 
 restart() {
     local label="${1:-$LABEL_PREFIX}"
+    shift || true
+    local reason="${*:-manual: self-ops restart}"
 
     # Self-suicide guard: if the caller is itself running under the launchd
     # service we are about to kickstart -k, we'd SIGKILL our own ancestor
@@ -85,7 +87,7 @@ restart() {
         local state_dir="${PROJECT_STATE_DIR:-$REPO_DIR/state}"
         {
             mkdir -p "$state_dir" && \
-            printf '%s\n' "manual: self-ops restart" > "$state_dir/restart-reason-${label}.txt"
+            printf '%s\n' "$reason" > "$state_dir/restart-reason-${label}.txt"
         } || echo "WARN: failed to write restart-reason file, kickstarting anyway"
     fi
     local runtime_file
@@ -112,7 +114,11 @@ except Exception:
 PY
 )
             [ "$busy" != "1" ] && break
-            [ "$(date +%s)" -ge "$deadline" ] && break
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "WARN: $label still in_flight after ${wait_s}s; skip restart"
+                launchctl remove "$helper" >/dev/null 2>&1 || true
+                exit 1
+            fi
             sleep 1
         done
         launchctl kickstart -k "gui/$uid_n/$label"
@@ -160,10 +166,23 @@ except Exception:
 PY
 )
             [ "$busy" != "1" ] && break
-            [ "$(date +%s)" -ge "$deadline" ] && break
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "WARN: $label still in_flight after ${wait_s}s; skip reload"
+                launchctl remove "$helper" >/dev/null 2>&1 || true
+                exit 1
+            fi
             sleep 1
         done
         launchctl bootout "gui/$uid_n/$label" 2>/dev/null || true
+        for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+            launchctl print "gui/$uid_n/$label" >/dev/null 2>&1 || break
+            sleep 1
+        done
+        if launchctl print "gui/$uid_n/$label" >/dev/null 2>&1; then
+            echo "WARN: $label still loaded after bootout; skip bootstrap"
+            launchctl remove "$helper" >/dev/null 2>&1 || true
+            exit 1
+        fi
         launchctl bootstrap "gui/$uid_n" "$plist"
         launchctl remove "$helper" >/dev/null 2>&1 || true
     ' bash "$DELAY" "$UID_N" "$label" "$plist" "$helper" "$runtime_file" "$RESTART_IDLE_WAIT_SECONDS"
@@ -189,5 +208,5 @@ case "${1:-}" in
     reload-plist)   shift; reload_plist "$@" ;;
     bootstrap)      shift; bootstrap_plist "$@" ;;
     update-claude)  update_claude ;;
-    *) echo "Usage: $0 {restart [<label>] | reload-plist [<label> [<plist>]] | bootstrap <plist> | update-claude}" >&2; exit 1 ;;
+    *) echo "Usage: $0 {restart [<label> [reason...]] | reload-plist [<label> [<plist>]] | bootstrap <plist> | update-claude}" >&2; exit 1 ;;
 esac

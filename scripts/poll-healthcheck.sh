@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# babata-poll-healthcheck — 检测 4 个 bot 的 long-poll 是否 alive,
+# babata-poll-healthcheck — 检测 4 个 bot 的 TG long-poll 是否 alive,
 # stale 就 SIGKILL 让 launchd respawn.
 #
 # 触发场景: Mac sleep / WiFi 断 / VPN 重连 — bot.py 进程活但 polling
@@ -24,36 +24,52 @@ if [ -f "$ENV_FILE" ] && [ -z "${PROJECT_STATE_DIR:-}" ]; then
 fi
 
 LOG_DIR="$HOME/Library/Logs"
-STALE_S="${BABATA_POLL_STALE_S:-90}"  # log 多久没更新算 hang. long-poll
+STATE_DIR_R="${PROJECT_STATE_DIR:-$REPO_DIR/state}"
+STALE_S="${BABATA_POLL_STALE_S:-90}"  # poll heartbeat 多久没更新算 hang.
                                        # 默认 10s, 90s = 9 个周期没动 = 真 hang.
 NOW=$(date +%s)
 UID_N=$(id -u)
 EXIT_CODE=0
 
-# log_stem → launchd label. 只覆盖 3 个 TG bot.
+# poll heartbeat → process heartbeat → legacy err.log, runtime status, launchd label.
+# 只覆盖 TG bot. poll heartbeat 来自 httpx getUpdates 成功记录; process
+# heartbeat 只用于新代码发布前的兼容窗口, 防止静默日志变更触发误杀风暴.
 # weixin 故意排除: 它的 ilink long-poll 35s + claude 处理期间 stall 是正常行为,
 # 实测可见 12 分钟无 log 仍健康 (2026-04-28 验证). 90s 阈值会频繁误杀.
 # 此外 weixin 半夜 V 不发消息也无 sleep wake 风险 — 它有 inbound 触发自动恢复.
 declare -a CHECKS=(
-    "babata|com.babata"
-    "babata-vvv|com.babata.vvv"
-    "babata-vvvv|com.babata.vvvv"
-    "babata-vvvvv|com.babata.vvvvv"
+    "babata-tg-poll-heartbeat|babata-tg-heartbeat|babata|runtime-status-.json|com.babata"
+    "babata-tg-vvv-poll-heartbeat|babata-tg-vvv-heartbeat|babata-vvv|runtime-status-vvv.json|com.babata.vvv"
+    "babata-tg-vvvv-poll-heartbeat|babata-tg-vvvv-heartbeat|babata-vvvv|runtime-status-vvvv.json|com.babata.vvvv"
+    "babata-tg-vvvvv-poll-heartbeat|babata-tg-vvvvv-heartbeat|babata-vvvvv|runtime-status-vvvvv.json|com.babata.vvvvv"
 )
 
 for entry in "${CHECKS[@]}"; do
-    log_stem="${entry%%|*}"
-    label="${entry#*|}"
+    IFS='|' read -r poll_stem process_stem log_stem runtime_stem label <<< "$entry"
+    poll_file="$STATE_DIR_R/$poll_stem"
+    process_file="$STATE_DIR_R/$process_stem"
+    runtime_file="$STATE_DIR_R/$runtime_stem"
     log_file="$LOG_DIR/$log_stem.err.log"
+    sensor_file=""
+    sensor_desc=""
 
-    if [[ ! -f "$log_file" ]]; then
-        echo "[skip] $log_file 不存在"
+    if [[ -f "$poll_file" ]]; then
+        sensor_file="$poll_file"
+        sensor_desc="$poll_stem"
+    elif [[ -f "$process_file" ]]; then
+        sensor_file="$process_file"
+        sensor_desc="$process_stem (compat)"
+    elif [[ -f "$log_file" ]]; then
+        sensor_file="$log_file"
+        sensor_desc="$log_stem.err.log (legacy)"
+    else
+        echo "[skip] no health sensor for $label"
         continue
     fi
 
     # macOS stat -f %m: epoch mtime. coreutils stat 不同, plist env PATH
     # 已确保走 macOS native /usr/bin/stat.
-    last_mtime=$(stat -f %m "$log_file")
+    last_mtime=$(stat -f %m "$sensor_file")
     age=$((NOW - last_mtime))
 
     if (( age <= STALE_S )); then
@@ -61,22 +77,40 @@ for entry in "${CHECKS[@]}"; do
         continue
     fi
 
+    if [[ -f "$runtime_file" ]]; then
+        in_flight=$(/usr/bin/python3 - "$runtime_file" <<'PY' 2>/dev/null || printf '0\n'
+import json
+import sys
+
+try:
+    data = json.load(open(sys.argv[1]))
+    print(1 if int(data.get("in_flight") or 0) > 0 and not data.get("shutdown_requested") else 0)
+except Exception:
+    print(0)
+PY
+)
+        if [[ "$in_flight" == "1" ]]; then
+            echo "[$label] ${sensor_desc} ${age}s stale 但 in_flight>0, skip kill"
+            continue
+        fi
+    fi
+
     # Stale — find current PID via launchctl. 第三列是 label, 第一列 PID.
     pid=$(launchctl list | awk -v lbl="$label" '$3 == lbl {print $1}')
     if [[ -z "$pid" || "$pid" == "-" ]]; then
-        echo "[$label] log ${age}s stale 但 launchd 无 PID, 可能正在 respawn, skip"
+        echo "[$label] ${sensor_desc} ${age}s stale 但 launchd 无 PID, 可能正在 respawn, skip"
         continue
     fi
 
-    echo "[$label] log ${age}s stale (>${STALE_S}s), kill -9 PID $pid → launchd respawn"
+    echo "[$label] ${sensor_desc} ${age}s stale (>${STALE_S}s), kill -9 PID $pid → launchd respawn"
     # Restart reason channel: SIGKILL 跳过 graceful shutdown, 所以 bot 在重启
     # 后的 startup alert 里读这个 file 报告. 写在 kill 前确保 file 存在.
     # set -e 防御: 单独一个 group + `|| true`, write 任何环节失败都不阻断 kill —
     # V 至少看到 "上线" alert (只是缺 reason 行), 比 watchdog exit 不杀进程好.
-    state_dir_r="${PROJECT_STATE_DIR:-$HOME/cc-workspace/state}"
+    state_dir_r="$STATE_DIR_R"
     {
         mkdir -p "$state_dir_r" && \
-        printf '%s\n' "watchdog: $log_stem.err.log ${age}s stale (>${STALE_S}s), 强杀让 launchd 拉起" \
+        printf '%s\n' "watchdog: ${sensor_desc} ${age}s stale (>${STALE_S}s), 强杀让 launchd 拉起" \
             > "$state_dir_r/restart-reason-${label}.txt"
     } || echo "[$label] WARN: failed to write restart-reason file, killing anyway"
     if kill -9 "$pid" 2>/dev/null; then

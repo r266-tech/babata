@@ -21,6 +21,8 @@ fi
 PROJECT_NAMESPACE="${PROJECT_NAMESPACE:-babata}"
 LABEL="com.${PROJECT_NAMESPACE}"
 SERVICE="${PROJECT_NAMESPACE}.service"
+STATE_DIR_R="${PROJECT_STATE_DIR:-$SCRIPT_DIR/state}"
+RESTART_IDLE_WAIT_SECONDS="${RESTART_IDLE_WAIT_SECONDS:-3600}"
 
 LOG="$SCRIPT_DIR/logs/auto-update.log"
 mkdir -p "$(dirname "$LOG")"
@@ -40,6 +42,41 @@ CLAUDE_BIN="${CLAUDE_CLI_PATH:-$(command -v claude 2>/dev/null || echo "$HOME/.l
 CODE_CHANGED=0
 DEPS_CHANGED=0
 CLI_CHANGED=0
+
+runtime_file_for_label() {
+    local label="$1"
+    local instance=""
+    if [ "$label" != "com.${PROJECT_NAMESPACE}" ]; then
+        instance="${label#com.${PROJECT_NAMESPACE}.}"
+    fi
+    printf '%s/runtime-status-%s.json\n' "$STATE_DIR_R" "$instance"
+}
+
+wait_runtime_idle() {
+    local label="$1"
+    local runtime_file
+    runtime_file="$(runtime_file_for_label "$label")"
+    local deadline=$(( $(date +%s) + RESTART_IDLE_WAIT_SECONDS ))
+    while [ -f "$runtime_file" ]; do
+        busy=$(python3 - "$runtime_file" <<'PY' 2>/dev/null || echo 0
+import json, sys, time
+try:
+    data=json.load(open(sys.argv[1]))
+    fresh=time.time()-float(data.get("ts", 0)) < 120
+    print(1 if fresh and int(data.get("in_flight") or 0) > 0 and not data.get("shutdown_requested") else 0)
+except Exception:
+    print(0)
+PY
+)
+        [ "$busy" != "1" ] && return 0
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "runtime busy for ${RESTART_IDLE_WAIT_SECONDS}s; skip restart: $label"
+            return 1
+        fi
+        sleep 1
+    done
+    return 0
+}
 
 # 1) git pull (ff-only, 本地有 modify 时 skip 避冲突)
 if [ -d .git ]; then
@@ -101,10 +138,11 @@ if [ "$CODE_CHANGED" = "1" ] || [ "$DEPS_CHANGED" = "1" ] || [ "$CLI_CHANGED" = 
             ;;
         Darwin)
             if launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
-                STATE_DIR_R="${PROJECT_STATE_DIR:-$SCRIPT_DIR/state}"
                 mkdir -p "$STATE_DIR_R" 2>/dev/null && \
                     printf '%s\n' "$REASON" > "$STATE_DIR_R/restart-reason-${LABEL}.txt"
-                launchctl kickstart -k "gui/$UID/$LABEL" && echo "launchd kickstarted: $LABEL"
+                if wait_runtime_idle "$LABEL"; then
+                    launchctl kickstart -k "gui/$UID/$LABEL" && echo "launchd kickstarted: $LABEL"
+                fi
             fi
             ;;
     esac
