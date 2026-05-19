@@ -192,9 +192,11 @@ def reset_bot_globals(monkeypatch, tmp_path):
     monkeypatch.setattr(bot, "_STATE_PATH", tmp_path / "state.json")
     monkeypatch.setattr(bot, "PROCESSED_UPDATES_FILE", tmp_path / "processed.json")
     monkeypatch.setattr(bot, "PENDING_UPDATES_FILE", tmp_path / "pending.json")
+    monkeypatch.setattr(bot, "PENDING_DELIVERIES_FILE", tmp_path / "pending-deliveries.json")
     monkeypatch.setattr(bot, "RUNTIME_STATUS_FILE", tmp_path / "runtime.json")
     bot._processed_set = set()
     bot._pending_update_records = {}
+    bot._pending_delivery_records = {}
     bot._state = {}
     bot._verbose = 1
     bot._in_flight = 0
@@ -939,6 +941,106 @@ def test_channel_worker_stream_error_replays_active_then_pending(monkeypatch, tm
         await wait_for(lambda: bot._in_flight == 0)
         assert (42, 2, "👌") in ctx.bot.reactions
         assert (42, 2, "💔") not in ctx.bot.reactions
+
+        await worker.stop()
+
+    asyncio.run(run())
+
+
+def test_turn_end_delivery_failure_does_not_mark_processed(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        processed: list[int] = []
+
+        async def fake_mark_processed(update_id):
+            if update_id is not None:
+                processed.append(update_id)
+
+        monkeypatch.setattr(bot, "_mark_processed", fake_mark_processed)
+
+        class FailingMessage(FakeMessage):
+            async def reply_text(self, text: str, parse_mode=None, reply_markup=None):
+                raise RuntimeError("telegram down")
+
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        await worker.start()
+
+        chat = FakeChat(chat_id=42)
+        ctx = FakeCtx()
+        msg = FailingMessage(7, "needs visible reply")
+        await worker.submit(
+            bot.Payload(
+                update=FakeUpdate(msg, chat),
+                ctx=ctx,
+                text="needs visible reply",
+                update_id=101,
+            )
+        )
+
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="done", session_id="sid-1", cost=0.01),
+            )
+        )
+
+        await wait_for(lambda: bot._in_flight == 0)
+        assert processed == []
+        assert "101" in bot._pending_delivery_records
+        await wait_for(lambda: (42, 7, "💔") in ctx.bot.reactions)
+
+        await worker.stop()
+
+    asyncio.run(run())
+
+
+def test_pending_delivery_replays_before_model_replay(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+
+        ctx = FakeCtx()
+        bot._pending_update_records = {
+            "501": {
+                "update_id": 501,
+                "chat_id": 42,
+                "message_id": 7,
+                "text": "already answered",
+                "images": [],
+                "received_at": 1.0,
+            },
+        }
+        bot._pending_delivery_records = {
+            "501": {
+                "delivery_id": "501",
+                "update_ids": [501],
+                "anchor_update_id": 501,
+                "chat_id": 42,
+                "message_id": 7,
+                "content": "cached final answer",
+                "resume_note": None,
+                "session_id": "sid-1",
+                "created_at": 1.0,
+            },
+        }
+
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        monkeypatch.setattr(bot, "_channel_worker", worker)
+        await worker.start()
+        app = type("FakeApp", (), {"bot": ctx.bot})()
+
+        delivery_replay = await bot._replay_pending_deliveries(app)
+        assert delivery_replay.delivered == 1
+        assert ctx.bot.sent_messages[-1]["text"] == "cached final answer"
+        assert ctx.bot.sent_messages[-1]["reply_to_message_id"] == 7
+        assert 501 in bot._processed_set
+        assert bot._pending_delivery_records == {}
+        assert bot._pending_update_records == {}
+
+        pending_replay = await bot._replay_pending_updates(app)
+        assert pending_replay.replayed == 0
+        assert session.submitted == []
 
         await worker.stop()
 

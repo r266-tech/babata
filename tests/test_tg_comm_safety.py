@@ -163,6 +163,22 @@ def test_fmt_tool_summarizes_common_operational_commands():
     ) == "🚀 Launchd · list babata labels"
 
 
+def test_restart_reason_peek_survives_until_startup(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot, "STATE_DIR", tmp_path)
+
+    bot._write_restart_reason("watchdog: poll heartbeat stale")
+
+    assert bot._read_restart_reason() == "watchdog: poll heartbeat stale"
+    assert bot._startup_restart_reason() == "watchdog: poll heartbeat stale"
+    assert not (tmp_path / "restart-reason-com.babata.txt").exists()
+
+
+def test_startup_restart_reason_is_never_omitted(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot, "STATE_DIR", tmp_path)
+
+    assert bot._startup_restart_reason().startswith("未指定")
+
+
 def test_fmt_tool_marks_subagent_and_web_search():
     assert bot._fmt_tool("Task", {"description": "review bot.py"}) == "👥 Subagent · review bot.py"
     assert bot._fmt_tool("WebSearch", {"query": "openclaw telegram progress"}) == (

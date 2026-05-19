@@ -14,6 +14,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -72,6 +73,36 @@ ALLOWED_USER = int(os.environ.get("ALLOWED_USER_ID", "0"))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 log = logging.getLogger(PROJECT)
 
+_TG_POLL_HEARTBEAT = STATE_DIR / f"{PROJECT}-tg{'-' + INSTANCE if INSTANCE else ''}-poll-heartbeat"
+
+
+class _SuppressHttpInfoFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not (
+            record.name.startswith(("httpx", "httpcore"))
+            and record.levelno < logging.WARNING
+        )
+
+
+class _TelegramPollHeartbeatHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if "getUpdates" not in record.getMessage():
+                return
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            _TG_POLL_HEARTBEAT.touch()
+        except Exception:
+            pass
+
+
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_SuppressHttpInfoFilter())
+
+_httpx_log = logging.getLogger("httpx")
+_httpx_log.setLevel(logging.INFO)
+_httpx_log.addHandler(_TelegramPollHeartbeatHandler(level=logging.INFO))
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 _TG_MCP_SCRIPT = str(Path(__file__).parent / "tg_mcp.py")
 
 # ── Idempotency: TG update_id 持久化 (无感重启) ────────────────────────
@@ -84,6 +115,7 @@ _TG_MCP_SCRIPT = str(Path(__file__).parent / "tg_mcp.py")
 # 物理无解, V "做到物理极限就行").
 PROCESSED_UPDATES_FILE = STATE_DIR / f"processed-updates-{INSTANCE}.json"
 PENDING_UPDATES_FILE = STATE_DIR / f"pending-updates-{INSTANCE}.json"
+PENDING_DELIVERIES_FILE = STATE_DIR / f"pending-deliveries-{INSTANCE}.json"
 RUNTIME_STATUS_FILE = STATE_DIR / f"runtime-status-{INSTANCE}.json"
 _PROCESSED_MAX = 1000  # 滚动窗口
 
@@ -100,6 +132,7 @@ def _write_runtime_status(event: str = "") -> None:
                     "in_flight": _in_flight,
                     "shutdown_requested": _shutdown_requested,
                     "pending_updates": len(_pending_update_records),
+                    "pending_deliveries": len(_pending_delivery_records),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -129,6 +162,16 @@ class PendingReplaySummary:
     total: int = 0
     replayed: int = 0
     skipped_processed: int = 0
+    skipped_delivery_pending: int = 0
+    malformed: int = 0
+    failed: int = 0
+
+
+@dataclass(frozen=True)
+class DeliveryReplaySummary:
+    total: int = 0
+    delivered: int = 0
+    skipped_processed: int = 0
     malformed: int = 0
     failed: int = 0
 
@@ -137,9 +180,21 @@ def _pending_replay_notice_lines(summary: PendingReplaySummary) -> list[str]:
     lines: list[str] = []
     if summary.replayed:
         lines.append(f"已恢复 {summary.replayed} 个未完成任务")
+    if summary.skipped_delivery_pending:
+        lines.append(f"{summary.skipped_delivery_pending} 个任务等待补发上次回复")
     if summary.failed or summary.malformed:
         failed = summary.failed + summary.malformed
         lines.append(f"⚠️ {failed} 个未完成任务恢复失败，见日志")
+    return lines
+
+
+def _delivery_replay_notice_lines(summary: DeliveryReplaySummary) -> list[str]:
+    lines: list[str] = []
+    if summary.delivered:
+        lines.append(f"已补发 {summary.delivered} 个上次已生成但未送达回复")
+    if summary.failed or summary.malformed:
+        failed = summary.failed + summary.malformed
+        lines.append(f"⚠️ {failed} 个已生成回复补发失败，见日志")
     return lines
 
 
@@ -164,6 +219,102 @@ def _load_pending_updates() -> dict[str, dict[str, Any]]:
 
 _pending_updates_lock = asyncio.Lock()
 _pending_update_records: dict[str, dict[str, Any]] = _load_pending_updates()
+
+
+def _load_pending_deliveries() -> dict[str, dict[str, Any]]:
+    if not PENDING_DELIVERIES_FILE.exists():
+        return {}
+    try:
+        data = json.loads(PENDING_DELIVERIES_FILE.read_text())
+        records = data.get("pending", {})
+        if isinstance(records, dict):
+            return {str(k): v for k, v in records.items() if isinstance(v, dict)}
+    except Exception as e:
+        log.warning("pending-deliveries load failed: %s, treating as empty", e)
+    return {}
+
+
+_pending_deliveries_lock = asyncio.Lock()
+_pending_delivery_records: dict[str, dict[str, Any]] = _load_pending_deliveries()
+
+
+def _write_pending_deliveries_locked() -> None:
+    tmp = PENDING_DELIVERIES_FILE.with_suffix(".json.partial")
+    PENDING_DELIVERIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(
+        json.dumps(
+            {"pending": _pending_delivery_records},
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    os.replace(tmp, PENDING_DELIVERIES_FILE)
+
+
+def _delivery_id_for_update_ids(update_ids: list[int | None]) -> str | None:
+    valid = [str(int(u)) for u in update_ids if u is not None]
+    return ",".join(valid) if valid else None
+
+
+async def _record_pending_delivery(
+    *,
+    payload: "Payload",
+    resp: "Response",
+    update_ids: list[int | None],
+) -> str | None:
+    delivery_id = _delivery_id_for_update_ids(update_ids)
+    if not delivery_id:
+        return None
+    chat = payload.update.effective_chat
+    msg = payload.update.effective_message
+    if chat is None or msg is None:
+        return None
+    record = {
+        "delivery_id": delivery_id,
+        "update_ids": [int(u) for u in update_ids if u is not None],
+        "anchor_update_id": payload.update_id,
+        "chat_id": chat.id,
+        "message_id": msg.message_id,
+        "content": resp.content,
+        "resume_note": resp.resume_note,
+        "session_id": resp.session_id,
+        "created_at": time.time(),
+    }
+    async with _pending_deliveries_lock:
+        _pending_delivery_records[delivery_id] = record
+        try:
+            _write_pending_deliveries_locked()
+        except Exception as e:
+            log.warning("pending-deliveries write failed: %s", e)
+            return None
+    return delivery_id
+
+
+async def _ack_pending_delivery(delivery_id: str | None) -> None:
+    if not delivery_id:
+        return
+    async with _pending_deliveries_lock:
+        if delivery_id not in _pending_delivery_records:
+            return
+        _pending_delivery_records.pop(delivery_id, None)
+        try:
+            _write_pending_deliveries_locked()
+        except Exception as e:
+            log.warning("pending-deliveries ack failed: %s", e)
+
+
+async def _pending_delivery_update_ids() -> set[int]:
+    async with _pending_deliveries_lock:
+        records = list(_pending_delivery_records.values())
+    update_ids: set[int] = set()
+    for record in records:
+        for raw in record.get("update_ids") or []:
+            try:
+                update_ids.add(int(raw))
+            except (TypeError, ValueError):
+                continue
+    return update_ids
 
 
 def _write_pending_updates_locked() -> None:
@@ -368,13 +519,38 @@ async def _wait_inflight_drain(poll: float = 0.5) -> None:
 # ── Restart reason channel (file-based, one-shot) ─────────────────────
 # 触发重启的外部脚本 (auto-update / babata-daily-restart / self-ops /
 # poll-healthcheck) 在 kickstart/kill 前向 STATE_DIR/restart-reason-{LABEL}.txt
-# 写一行 reason. 本进程在两处消费它 (各自 read+unlink, 一次性):
-#   1) graceful shutdown (SIGTERM 路径) → 拼到 "重启中..." TG alert
-#   2) 进程 startup → 拼到 "上线" alert (兜底 SIGKILL 路径, graceful 没跑过)
-# 任一路径读到都 unlink, 双重报告自然不发生 (file 只存在到第一次读).
+# 写一行 reason. 本进程在两处使用它:
+#   1) graceful shutdown (SIGTERM 路径) → 只 peek, 拼到 "重启中..." TG alert
+#   2) 进程 startup → pop, 拼到 "上线" alert, 作为每次重启的强制字段
 # 没文件 = 未指定原因 (KeepAlive 自动拉起 / 异常 crash / 人工 launchctl).
 def _self_launchd_label() -> str:
     return f"{LAUNCHD_PREFIX}.{INSTANCE}" if INSTANCE else LAUNCHD_PREFIX
+
+
+def _restart_reason_file() -> Path:
+    return STATE_DIR / f"restart-reason-{_self_launchd_label()}.txt"
+
+
+def _write_restart_reason(reason: str) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        _restart_reason_file().write_text(reason.strip() or _unknown_restart_reason(), encoding="utf-8")
+    except Exception as e:
+        log.warning("write restart-reason failed: %s", e)
+
+
+def _read_restart_reason() -> str | None:
+    try:
+        return _restart_reason_file().read_text(encoding="utf-8").strip() or None
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log.warning("read restart-reason failed: %s", e)
+        return None
+
+
+def _unknown_restart_reason() -> str:
+    return "未指定 (KeepAlive 自动拉起 / 异常 crash / 人工 launchctl)"
 
 
 def _pop_restart_reason() -> str | None:
@@ -383,7 +559,7 @@ def _pop_restart_reason() -> str | None:
     sibling .consumed path *first*, any crash after rename leaves nothing at
     the canonical path for the next pop to pick up.
     """
-    reason_file = STATE_DIR / f"restart-reason-{_self_launchd_label()}.txt"
+    reason_file = _restart_reason_file()
     consumed = reason_file.with_name(reason_file.name + ".consumed")
     try:
         os.replace(reason_file, consumed)
@@ -404,6 +580,10 @@ def _pop_restart_reason() -> str | None:
     return reason or None
 
 
+def _startup_restart_reason() -> str:
+    return _pop_restart_reason() or _unknown_restart_reason()
+
+
 async def _graceful_shutdown(app: "Application", reason: str) -> None:
     """Wait for the live turn, notify V via TG, then exit."""
     global _shutdown_requested
@@ -414,10 +594,12 @@ async def _graceful_shutdown(app: "Application", reason: str) -> None:
     _write_runtime_status("shutdown_requested")
     log.info("Graceful shutdown requested: %s (in_flight=%d)", reason, _in_flight)
 
-    # One-shot read: external trigger 写的具体原因 (e.g. SDK 升级版本号).
-    # 没文件 → 未指定 (KeepAlive 拉起 / 人工 launchctl). startup alert 也读
-    # 同一路径, 但本路径先 unlink 后, 进程死前的 startup 不会再读到.
-    trigger = _pop_restart_reason() or "未指定 (KeepAlive 拉起 / 异常 / 人工 launchctl)"
+    # External trigger writes the concrete reason (e.g. SDK upgrade). Internal
+    # /restart has no external writer, so make the reason durable for startup.
+    trigger = _read_restart_reason()
+    if not trigger:
+        trigger = f"manual: {reason}"
+        _write_restart_reason(trigger)
 
     if _in_flight > 0 and ALLOWED_USER:
         try:
@@ -589,7 +771,11 @@ _TOOL_EMOJI = {
     "WebFetch": "\U0001f4c4",       # 📄 page fetch
     "WebSearch": "\U0001f310",      # 🌐 web search
     "Task": "\U0001f500",           # 🔀 delegate
-    "TodoWrite": "\u2705",          # ✅
+    "TodoWrite": "\u2705",          # ✅ (legacy SDK <=0.1.x; 0.2.x split into Task*)
+    "TaskCreate": "\u2705",         # ✅ task new (SDK 0.2.x)
+    "TaskUpdate": "\u2611\ufe0f",  # ☑️ task update
+    "TaskGet": "\U0001f4cb",        # 📋 task read
+    "TaskList": "\U0001f5c2\ufe0f",# 🗂️ task list
     "NotebookEdit": "\U0001f4d3",   # 📓
     "Skill": "\U0001f4da",          # 📚 skill library
     "ToolSearch": "\U0001f9f0",     # 🧰 toolbox
@@ -1034,6 +1220,10 @@ def _fmt_tool(name: str, inp: dict) -> str:
         "Glob": "Files",
         "Grep": "Search",
         "TodoWrite": "Todo",
+        "TaskCreate": "Task+",
+        "TaskUpdate": "Task~",
+        "TaskGet": "Task?",
+        "TaskList": "Tasks",
         "NotebookEdit": "Notebook",
     }.get(name, name or "Tool")
     emoji = _TOOL_EMOJI.get(name, "\U0001f9f0")
@@ -2178,6 +2368,9 @@ class ChannelWorker:
                 or self._turn_payload
                 or self._latest_payload
             )
+            active_uids = list(self._active_update_ids)
+            delivery_ok = False
+            delivery_id: str | None = None
             # P1.3: try/finally guarantees turn state resets even if TG edits
             # raise — otherwise _in_flight stays >0 and graceful shutdown hangs.
             try:
@@ -2187,10 +2380,24 @@ class ChannelWorker:
                     )
                     self._apply_accounting(resp)
                     return
+                delivery_id = await _record_pending_delivery(
+                    payload=payload,
+                    resp=resp,
+                    update_ids=active_uids,
+                )
                 try:
-                    await self._deliver_response(payload, resp)
+                    delivery_ok = await self._deliver_response(payload, resp)
                 except Exception as e:
                     log.exception("deliver_response failed: %s", e)
+                    delivery_ok = False
+                if delivery_ok:
+                    await _ack_pending_delivery(delivery_id)
+                else:
+                    log.warning(
+                        "turn_end response not acknowledged by TG delivery; "
+                        "leaving update_ids=%s pending",
+                        [u for u in active_uids if u is not None],
+                    )
                 self._apply_accounting(resp)
                 if resp.cost > 0:
                     log.info(
@@ -2210,10 +2417,13 @@ class ChannelWorker:
                 done_uids = self._active_update_ids
                 self._active_marks = []
                 self._active_update_ids = []
-                if done_marks:
+                if done_marks and delivery_ok:
                     self._schedule_marks(done_marks, "💔" if resp.stopped else "👌")
-                for _uid in done_uids:
-                    await _mark_processed(_uid)
+                elif done_marks and not resp.stopped:
+                    self._schedule_marks(done_marks, "💔")
+                if delivery_ok:
+                    for _uid in done_uids:
+                        await _mark_processed(_uid)
                 self._reset_turn_state(exit_inflight=True)
                 # Turn 结束 → 清 bridge.reply_to. 不清的话, V turn 之后 cron
                 # 走 mcp__tg__tg_send_* 发的消息 (gmail PR-merged 通报 / weekly
@@ -2339,10 +2549,10 @@ class ChannelWorker:
             except Exception:
                 pass
 
-    async def _deliver_response(self, payload: Payload, resp: Response) -> None:
+    async def _deliver_response(self, payload: Payload, resp: Response) -> bool:
         msg = payload.update.effective_message
         if msg is None:
-            return
+            return False
 
         if self._tool_status and _verbose == 1:
             try:
@@ -2354,7 +2564,7 @@ class ChannelWorker:
             try:
                 await msg.reply_text(resp.resume_note)
             except Exception:
-                pass
+                return False
 
         # Delete stale partials early — must run before any return path so
         # they don't stay visible if resp.content is empty.
@@ -2368,7 +2578,7 @@ class ChannelWorker:
 
         if not resp.content:
             await msg.reply_text("(no response)")
-            return
+            return True
 
         # Streaming has already shipped `_streamed_bubble_count` bubbles via
         # reply_text in _handle_text_delta; _text_message (if any) holds the
@@ -2381,21 +2591,29 @@ class ChannelWorker:
             bubbles.pop(0)
         pending = bubbles[self._streamed_bubble_count:]
         if not pending:
-            return
+            if bubbles or self._streamed_bubble_count:
+                return True
+            await msg.reply_text("(no response)")
+            return True
 
-        async def _send_bubble(bubble: str) -> None:
+        async def _send_bubble(bubble: str) -> bool:
             bubble = bubble.strip()
             if not bubble:
-                return
+                return True
             parts, parse_mode = _format_bubble_parts(bubble)
             for part in parts:
                 try:
                     await msg.reply_text(part, **_parse_kwargs(parse_mode))
                 except Exception:
                     if parse_mode:
-                        for pp in _split(bubble):
-                            await msg.reply_text(pp)
-                    break
+                        try:
+                            for pp in _split(bubble):
+                                await msg.reply_text(pp)
+                            return True
+                        except Exception:
+                            return False
+                    return False
+            return True
 
         if self._text_message:
             # First pending bubble = trailing partial in _text_message; finalize.
@@ -2403,10 +2621,12 @@ class ChannelWorker:
             target_text = target.strip()
             parts, parse_mode = _format_bubble_parts(target_text)
             if parts:
+                first_delivered = False
                 try:
                     await self._text_message.edit_text(
                         parts[0], **_parse_kwargs(parse_mode)
                     )
+                    first_delivered = True
                 except Exception:
                     try:
                         raw_parts = _split(target_text)
@@ -2414,19 +2634,32 @@ class ChannelWorker:
                         for pp in raw_parts[1:]:
                             await msg.reply_text(pp)
                         parts = []
+                        first_delivered = True
                     except Exception:
-                        pass
+                        self._stale_text_messages.append(self._text_message)
+                if not first_delivered:
+                    if not await _send_bubble(target_text):
+                        return False
+                    parts = []
                 for part in parts[1:]:
                     try:
                         await msg.reply_text(part, **_parse_kwargs(parse_mode))
                     except Exception:
                         if parse_mode:
-                            await msg.reply_text(part)
+                            try:
+                                await msg.reply_text(part)
+                            except Exception:
+                                return False
+                        else:
+                            return False
             for bubble in pending[1:]:
-                await _send_bubble(bubble)
+                if not await _send_bubble(bubble):
+                    return False
         else:
             for bubble in pending:
-                await _send_bubble(bubble)
+                if not await _send_bubble(bubble):
+                    return False
+        return True
 
     def _apply_accounting(self, resp: Response) -> None:
         global _session_cost, _session_turns, _last_model, _last_context_window
@@ -2641,6 +2874,7 @@ async def _replay_pending_updates(app: Application) -> PendingReplaySummary:
         records = list(_pending_update_records.values())
     if not records:
         return PendingReplaySummary()
+    delivery_pending_ids = await _pending_delivery_update_ids()
 
     def _sort_key(record: dict[str, Any]) -> tuple[float, int]:
         try:
@@ -2655,6 +2889,7 @@ async def _replay_pending_updates(app: Application) -> PendingReplaySummary:
 
     replayed = 0
     skipped_processed = 0
+    skipped_delivery_pending = 0
     malformed = 0
     failed = 0
     for record in sorted(records, key=_sort_key):
@@ -2666,6 +2901,9 @@ async def _replay_pending_updates(app: Application) -> PendingReplaySummary:
         if update_id in _processed_set:
             await _ack_pending_update(update_id)
             skipped_processed += 1
+            continue
+        if update_id in delivery_pending_ids:
+            skipped_delivery_pending += 1
             continue
         payload = _payload_from_pending_record(app.bot, record)
         if payload is None:
@@ -2683,6 +2921,84 @@ async def _replay_pending_updates(app: Application) -> PendingReplaySummary:
     return PendingReplaySummary(
         total=len(records),
         replayed=replayed,
+        skipped_processed=skipped_processed,
+        skipped_delivery_pending=skipped_delivery_pending,
+        malformed=malformed,
+        failed=failed,
+    )
+
+
+async def _replay_pending_deliveries(app: Application) -> DeliveryReplaySummary:
+    async with _pending_deliveries_lock:
+        records = list(_pending_delivery_records.values())
+    if not records:
+        return DeliveryReplaySummary()
+
+    def _sort_key(record: dict[str, Any]) -> tuple[float, str]:
+        try:
+            created = float(record.get("created_at") or 0)
+        except (TypeError, ValueError):
+            created = 0.0
+        return (created, str(record.get("delivery_id") or ""))
+
+    delivered = 0
+    skipped_processed = 0
+    malformed = 0
+    failed = 0
+    for record in sorted(records, key=_sort_key):
+        delivery_id = str(record.get("delivery_id") or "")
+        try:
+            update_ids = [int(u) for u in (record.get("update_ids") or [])]
+            chat_id = int(record["chat_id"])
+            message_id = int(record["message_id"])
+            anchor_update_id = int(record.get("anchor_update_id") or update_ids[-1])
+        except (KeyError, TypeError, ValueError, IndexError):
+            log.warning("pending delivery record is malformed: delivery_id=%s", delivery_id)
+            malformed += 1
+            continue
+        if update_ids and all(uid in _processed_set for uid in update_ids):
+            await _ack_pending_delivery(delivery_id)
+            skipped_processed += 1
+            continue
+        payload = _payload_from_pending_record(
+            app.bot,
+            {
+                "update_id": anchor_update_id,
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": "[pending delivery replay]",
+                "images": [],
+            },
+        )
+        if payload is None:
+            log.warning("pending delivery payload is malformed: delivery_id=%s", delivery_id)
+            malformed += 1
+            continue
+        try:
+            ok = await _worker()._deliver_response(
+                payload,
+                Response(
+                    content=str(record.get("content") or ""),
+                    session_id=str(record.get("session_id") or ""),
+                    cost=0.0,
+                    resume_note=record.get("resume_note") or None,
+                ),
+            )
+        except Exception as e:
+            log.warning("pending delivery replay failed: delivery_id=%s: %s", delivery_id, e)
+            ok = False
+        if not ok:
+            failed += 1
+            continue
+        for uid in update_ids:
+            await _mark_processed(uid)
+        await _ack_pending_delivery(delivery_id)
+        delivered += 1
+    if delivered:
+        log.warning("replayed %d pending TG response delivery record(s)", delivered)
+    return DeliveryReplaySummary(
+        total=len(records),
+        delivered=delivered,
         skipped_processed=skipped_processed,
         malformed=malformed,
         failed=failed,
@@ -3915,13 +4231,25 @@ def _current_codex_label() -> str:
     return data.get("codex_accounts", {}).get(key, {}).get("display_name", key)
 
 
+def _provider_switch_prefix(rc: int, body: str, *, codex: bool = False) -> str:
+    if rc != 0:
+        return f"⚠️ exit={rc}"
+    if "already current" in body:
+        return "✓ 已是当前 Codex" if codex else "✓ 已是当前渠道"
+    if "re-materialized" in body or "normalized" in body:
+        return "✓ Codex 状态已修复" if codex else "✓ 渠道状态已修复"
+    if "switched to" in body:
+        return "🔄 Codex 切换中" if codex else "🔄 切换中"
+    return "✓ 完成"
+
+
 async def _run_cc_router_switch(key: str) -> tuple[int, str]:
     if not _CC_ROUTER_CLI:
         return 2, "/provider 未配置 (需要 BABATA_CC_ROUTER_DIR env)"
     try:
         result = await asyncio.to_thread(
             subprocess.run,
-            [_CC_ROUTER_CLI, "switch", key],
+            [sys.executable, _CC_ROUTER_CLI, "switch", key],
             capture_output=True,
             text=True,
             timeout=15,
@@ -3936,42 +4264,67 @@ async def _run_cc_router_switch(key: str) -> tuple[int, str]:
 
 async def _run_cc_router_codex(slot: str) -> tuple[int, str]:
     """Run `cli.py codex <slot>` — swaps ~/.codex/auth.json + Codex.app profile
-    symlinks. Doesn't touch ~/.claude/settings.json and doesn't restart babata
+    symlinks, normalizes the Codex App thread namespace, and relaunches
+    Codex.app. Doesn't touch ~/.claude/settings.json and doesn't restart babata
     (babata fork-execs codex per message; new symlink picked up by next fork)."""
     if not _CC_ROUTER_CLI:
         return 2, "/provider 未配置 (需要 BABATA_CC_ROUTER_DIR env)"
     try:
         result = await asyncio.to_thread(
             subprocess.run,
-            [_CC_ROUTER_CLI, "codex", slot],
+            [sys.executable, _CC_ROUTER_CLI, "codex", slot],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=45,
         )
         body = (result.stdout + result.stderr).strip() or "(no output)"
         return result.returncode, body
     except subprocess.TimeoutExpired:
-        return 124, "/provider codex 超时 (15s)"
+        return 124, "/provider codex 超时 (45s)"
     except Exception as e:
         return 2, f"/provider codex 失败: {type(e).__name__}: {e}"
 
 
-async def _run_cc_router_codex_add_relay(base_url: str, api_key: str) -> tuple[int, str]:
-    """Register a new relay-mode codex slot. Slot name auto-derived from URL host."""
+async def _run_cc_router_codex_remove(slot: str) -> tuple[int, str]:
+    """Soft-remove a codex slot — drop providers.json entry; on-disk files stay."""
     if not _CC_ROUTER_CLI:
         return 2, "/provider 未配置 (需要 BABATA_CC_ROUTER_DIR env)"
     try:
         result = await asyncio.to_thread(
             subprocess.run,
-            [_CC_ROUTER_CLI, "codex", "add-relay", base_url, api_key],
+            [sys.executable, _CC_ROUTER_CLI, "codex", "remove", slot],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=10,
         )
         body = (result.stdout + result.stderr).strip() or "(no output)"
         return result.returncode, body
     except subprocess.TimeoutExpired:
-        return 124, "add-relay 超时 (15s)"
+        return 124, "remove 超时 (10s)"
+    except Exception as e:
+        return 2, f"remove 失败: {type(e).__name__}: {e}"
+
+
+async def _run_cc_router_codex_add_relay(base_url: str, api_key: str) -> tuple[int, str]:
+    """Register a new relay-mode codex slot. Slot name auto-derived from URL host.
+
+    cli.py probes /v1/models (~10s budget) before persisting, so allow up to
+    25s of subprocess wallclock — a slow relay + python startup shouldn't get
+    cut short and look like a bot bug."""
+    if not _CC_ROUTER_CLI:
+        return 2, "/provider 未配置 (需要 BABATA_CC_ROUTER_DIR env)"
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, _CC_ROUTER_CLI, "codex", "add-relay", base_url, api_key],
+            capture_output=True,
+            text=True,
+            timeout=25,
+        )
+        body = (result.stdout + result.stderr).strip() or "(no output)"
+        return result.returncode, body
+    except subprocess.TimeoutExpired:
+        return 124, "add-relay 超时 (25s) — 中转 probe 卡住"
     except Exception as e:
         return 2, f"add-relay 失败: {type(e).__name__}: {e}"
 
@@ -3988,7 +4341,10 @@ def _codex_main_menu_markup(current_key: str):
         )]
         for name, key in choices
     ]
-    buttons.append([InlineKeyboardButton("➕ 新增", callback_data="codex_add:menu")])
+    buttons.append([
+        InlineKeyboardButton("➕ 新增", callback_data="codex_add:menu"),
+        InlineKeyboardButton("🗑 删除", callback_data="codex_del:menu"),
+    ])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -4015,7 +4371,7 @@ async def cmd_provider(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # codex CPU: 切 codex 账号 (symlink swap, 不重启 babata, 下条 message 生效)
         if arg:
             rc, body = await _run_cc_router_codex(arg)
-            prefix = "🔄 Codex 切换中" if rc == 0 and "switched to" in body else f"⚠️ exit={rc}"
+            prefix = _provider_switch_prefix(rc, body, codex=True)
             await update.message.reply_text(f"{prefix}\n```\n{body}\n```", parse_mode="Markdown")
             return
         current_key = _current_codex_key()
@@ -4035,7 +4391,7 @@ async def cmd_provider(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # claude CPU: 切 Anthropic 渠道 (改 settings.json + 重启 babata)
     if arg:
         rc, body = await _run_cc_router_switch(arg)
-        prefix = "🔄 切换中" if rc == 0 and "switched to" in body else f"⚠️ exit={rc}"
+        prefix = _provider_switch_prefix(rc, body)
         await update.message.reply_text(f"{prefix}\n```\n{body}\n```", parse_mode="Markdown")
         return
     current_key = _current_provider_key()
@@ -4072,7 +4428,7 @@ async def on_provider_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     target_name = dict((k, n) for n, k in _provider_choices()).get(key, key)
     await q.edit_message_text(f"🔄 切换到 {target_name}…")
     rc, body = await _run_cc_router_switch(key)
-    prefix = "🔄 切换中" if rc == 0 and "switched to" in body else f"⚠️ exit={rc}"
+    prefix = _provider_switch_prefix(rc, body)
     await q.edit_message_text(f"{prefix}\n```\n{body}\n```", parse_mode="Markdown")
 
 
@@ -4091,7 +4447,7 @@ async def on_codex_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     target_name = dict((k, n) for n, k in _codex_choices()).get(key, key)
     await q.edit_message_text(f"🔄 切换 Codex 到 {target_name}…")
     rc, body = await _run_cc_router_codex(key)
-    prefix = "🔄 切换中" if rc == 0 and "switched to" in body else f"⚠️ exit={rc}"
+    prefix = _provider_switch_prefix(rc, body, codex=True)
     await q.edit_message_text(f"{prefix}\n```\n{body}\n```", parse_mode="Markdown")
 
 
@@ -4187,6 +4543,86 @@ async def on_codex_add_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         f"Codex 账号 (当前: {current_label}):",
         reply_markup=_codex_main_menu_markup(current_key),
     )
+
+
+async def on_codex_del_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Dispatcher for `codex_del:*`: menu → pick:<slot> → do:<slot> → back.
+    Two-step (pick then confirm) because removing an entry drops the api_key
+    along with it — V's only copy if they didn't save it elsewhere."""
+    q = update.callback_query
+    if not await _callback_allowed(q):
+        return
+    await q.answer()
+    if _current_cpu_name() != "codex":
+        await q.edit_message_text("CPU 已切到 Claude, Codex 删除入口失效。")
+        return
+    data = q.data or ""
+    action_and_arg = data.split(":", 2)
+    action = action_and_arg[1] if len(action_and_arg) > 1 else ""
+    arg = action_and_arg[2] if len(action_and_arg) > 2 else ""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    def main_menu_view():
+        cur_key = _current_codex_key()
+        cur_label = _current_codex_label()
+        return f"Codex 账号 (当前: {cur_label}):", _codex_main_menu_markup(cur_key)
+
+    if action == "back":
+        title, markup = main_menu_view()
+        await q.edit_message_text(title, reply_markup=markup)
+        return
+
+    if action == "menu":
+        current_key = _current_codex_key()
+        choices = _codex_choices()
+        deletable = [(name, key) for name, key in choices if key != current_key]
+        if not deletable:
+            await q.edit_message_text(
+                "没有可删的 slot — 只剩当前 slot 在用。\n先 /provider 切到别的 slot 再回来删。",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← 返回", callback_data="codex_del:back")]]),
+            )
+            return
+        rows = [
+            [InlineKeyboardButton(f"🗑 {name}", callback_data=f"codex_del:pick:{key}")]
+            for name, key in deletable
+        ]
+        rows.append([InlineKeyboardButton("← 返回", callback_data="codex_del:back")])
+        await q.edit_message_text(
+            f"选择要删除的 slot (当前: {_current_codex_label()} 不可删):",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if action == "pick" and arg:
+        # Confirmation step. Display name pulled from current choices so we
+        # don't trust the callback string for anything but slot key.
+        label = dict((k, n) for n, k in _codex_choices()).get(arg, arg)
+        await q.edit_message_text(
+            f"确定删除 {label} ({arg})?\n\n"
+            f"只动 providers.json 条目,auth.{arg}.json 和 Codex.{arg}/ 保留(可手动 rm)。",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✓ 确认删除", callback_data=f"codex_del:do:{arg}"),
+                    InlineKeyboardButton("✗ 取消", callback_data="codex_del:menu"),
+                ],
+            ]),
+        )
+        return
+
+    if action == "do" and arg:
+        rc, body = await _run_cc_router_codex_remove(arg)
+        prefix = "✓ 已删除" if rc == 0 else f"⚠️ 失败 exit={rc}"
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        await q.edit_message_text(
+            f"{prefix}\n```\n{body}\n```\n",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← 返回菜单", callback_data="codex_del:back")]]),
+        )
+        return
+
+    # Unknown — fall back to main menu.
+    title, markup = main_menu_view()
+    await q.edit_message_text(title, reply_markup=markup)
 
 
 def _parse_relay_add_text(text: str) -> tuple[str, str] | tuple[None, str]:
@@ -4783,6 +5219,7 @@ async def _post_init(app: Application) -> None:
     # 跑完再退 (cmd_restart / launchd SIGTERM / Ctrl+C 都走这条).
     _install_signal_handlers(app)
     await _sync_bot_commands(app.bot)
+    delivery_replay = await _replay_pending_deliveries(app)
     pending_replay = await _replay_pending_updates(app)
 
     # 意外重启 / launchd kickstart / 任务中 /restart → bot 重连后主动告知 V 当
@@ -4797,11 +5234,11 @@ async def _post_init(app: Application) -> None:
         sid = cc._session_id
         sid_display = sid if sid else "(new)"
         lines = [f"[{_CURRENT_LABEL}] 上线 · session: {sid_display}"]
-        # SIGKILL 兜底: graceful shutdown 没跑过 (e.g. poll-healthcheck SIGKILL),
-        # reason file 还在, 启动时读出来报告。Graceful 路径已 unlink, 这里 None.
-        startup_trigger = _pop_restart_reason()
-        if startup_trigger:
-            lines.append(f"上次重启原因: {startup_trigger}")
+        # Startup alert must always carry a reason. Graceful shutdown only peeks
+        # the file, so the new process consumes and reports it here. If a crash
+        # or raw launchctl bypassed the reason channel, surface that explicitly.
+        lines.append(f"上次重启原因: {_startup_restart_reason()}")
+        lines.extend(_delivery_replay_notice_lines(delivery_replay))
         lines.extend(_pending_replay_notice_lines(pending_replay))
         if sid and cc.is_last_turn_orphan(sid):
             lines.append("⚠️ 上次 session 最后一条 user 无 assistant 回复 (可能 SIGKILL)")
@@ -4850,6 +5287,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(_with_transcript("cb_provider", on_provider_click), pattern=r"^provider:"))
     app.add_handler(CallbackQueryHandler(_with_transcript("cb_codex", on_codex_click), pattern=r"^codex:"))
     app.add_handler(CallbackQueryHandler(_with_transcript("cb_codex_add", on_codex_add_click), pattern=r"^codex_add:"))
+    app.add_handler(CallbackQueryHandler(_with_transcript("cb_codex_del", on_codex_del_click), pattern=r"^codex_del:"))
     # resume-ch: / resume-back / resume: 三个 pattern 互斥 (第 7 字符不同),
     # 注册顺序无关紧要; 仍按 specific → generic 排列利于阅读.
     app.add_handler(CallbackQueryHandler(_with_transcript("cb_resume_channel", on_resume_channel_pick), pattern=r"^resume-ch:"))
