@@ -1047,6 +1047,12 @@ async def _run_account(account_id: str) -> None:
         token=meta["token"],
         account_id=account_id,
     )
+    # Make the live client available to bridge before any inbound message.
+    # Enables proactive cron pushes (e.g. codex2api-grabber) on bot boot —
+    # to/context_token still fall back to persistent peer (see
+    # weixin_bridge._restore_peer_from_disk).
+    bridge.client = client
+    bridge.account_id = account_id
     log.info("long-poll starting for %s", account_id)
 
     asyncio.create_task(_heartbeat_loop(client, account_id))

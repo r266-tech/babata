@@ -77,7 +77,19 @@ class WeixinBridge:
             request = json.loads(data.decode())
             action = request.get("action", "send_text")
 
-            if not self.client or not self.to:
+            if not self.client:
+                await self._respond(writer, "Error: weixin client not logged in")
+                return
+
+            # Fall back to persistent peer when no in-memory context (e.g. cron
+            # / proactive push before the user has touched the bot since boot).
+            # Restoration is non-destructive: we only set self.to/context_token
+            # when they are unset; an active inbound conversation keeps its
+            # own peer.
+            if not self.to:
+                self._restore_peer_from_disk()
+
+            if not self.to:
                 await self._respond(writer, "Error: no weixin conversation context")
                 return
 
@@ -107,6 +119,43 @@ class WeixinBridge:
     async def _respond(self, writer, result: str) -> None:
         writer.write(json.dumps({"result": result}).encode() + b"\n")
         await writer.drain()
+
+    def _restore_peer_from_disk(self) -> None:
+        """Recover (account_id, to, context_token) from persistent state.
+
+        Lets proactive cron pushes (e.g. codex2api-grabber) work without
+        requiring the user to text the bot first after each bot restart.
+        Prefers an account whose allowFrom list yields a peer with a saved
+        context_token. Silent no-op if persistence is empty.
+        """
+        try:
+            from weixin_account import (
+                list_account_ids, load_allow_from, get_context_token,
+            )
+        except Exception as e:
+            log.debug("restore_peer: account module import failed: %s", e)
+            return
+        try:
+            for aid in list_account_ids():
+                allowed = load_allow_from(aid)
+                for uid in allowed:
+                    if not uid:
+                        continue
+                    ctx = get_context_token(aid, uid)
+                    if ctx:
+                        self.to = uid
+                        self.context_token = ctx
+                        self.account_id = aid
+                        log.info("bridge: restored peer from disk account=%s peer=%s", aid, uid[:8] + "…")
+                        return
+                # No saved ctx but allowed user exists — try without ctx
+                if allowed and allowed[0]:
+                    self.to = allowed[0]
+                    self.account_id = aid
+                    log.info("bridge: restored peer (no ctx) account=%s peer=%s", aid, allowed[0][:8] + "…")
+                    return
+        except Exception as e:
+            log.warning("restore_peer failed: %s", e)
 
     # ── handlers ──────────────────────────────────────────────────────
 
