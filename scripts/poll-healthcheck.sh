@@ -27,6 +27,12 @@ LOG_DIR="$HOME/Library/Logs"
 STATE_DIR_R="${PROJECT_STATE_DIR:-$REPO_DIR/state}"
 STALE_S="${BABATA_POLL_STALE_S:-90}"  # poll heartbeat 多久没更新算 hang.
                                        # 默认 10s, 90s = 9 个周期没动 = 真 hang.
+# 一个卡住的 in_flight=1 还能保护多久不被杀. runtime-status 的 ts 在 inflight-enter
+# 时打、turn 进行中不刷新, 所以这实际是个"最大 turn 天花板": 我们只有在 poll 心跳已
+# stale 时才走到这里, 若此时 in_flight 还=1 且 ts 比这个窗口更老 = turn 跟 polling 一起
+# 卡死 → 该杀. 不设上限就是原 critical bug (看门狗在该触发时自我缴械). 兄弟脚本
+# self-ops / auto-update 用 120s 是另一用途; 看门狗要够大才不会误杀正常长 turn.
+INFLIGHT_STALE_S="${BABATA_INFLIGHT_STALE_S:-600}"
 NOW=$(date +%s)
 UID_N=$(id -u)
 EXIT_CODE=0
@@ -78,13 +84,20 @@ for entry in "${CHECKS[@]}"; do
     fi
 
     if [[ -f "$runtime_file" ]]; then
-        in_flight=$(/usr/bin/python3 - "$runtime_file" <<'PY' 2>/dev/null || printf '0\n'
+        in_flight=$(/usr/bin/python3 - "$runtime_file" "$INFLIGHT_STALE_S" <<'PY' 2>/dev/null || printf '0\n'
 import json
 import sys
+import time
 
 try:
     data = json.load(open(sys.argv[1]))
-    print(1 if int(data.get("in_flight") or 0) > 0 and not data.get("shutdown_requested") else 0)
+    fresh_window = float(sys.argv[2])
+    age = time.time() - float(data.get("ts") or 0)
+    busy = int(data.get("in_flight") or 0) > 0 and not data.get("shutdown_requested")
+    # A stale in_flight (ts older than the ceiling) means the turn is hung along
+    # with polling; do NOT let it suppress the kill — that was the original bug
+    # where the watchdog disarmed itself in exactly the hang it exists to catch.
+    print(1 if busy and age < fresh_window else 0)
 except Exception:
     print(0)
 PY

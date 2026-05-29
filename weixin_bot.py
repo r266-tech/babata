@@ -381,28 +381,8 @@ async def _decode_item(
 
     if itype == ITEM_VOICE:
         voice = item.get("voice_item") or {}
-        # DIAGNOSTIC: dump full inbound voice_item to compare vs our outbound fields
-        try:
-            import json as _json
-            log.warning("INBOUND voice_item raw: %s", _json.dumps(voice, ensure_ascii=False, default=str)[:1500])
-        except Exception:
-            pass
-        # DIAGNOSTIC: server-side STT fast path skips download — force silk
-        # download + copy BEFORE the fast-path so we always have a sample to
-        # diff against our outbound silk magic bytes / structure.
         media = voice.get("media") or {}
-        if media:
-            try:
-                _raw = await client.download_media(media)
-                _keep = Path("/tmp/inbound-voice-sample.silk")
-                _keep.write_bytes(_raw)
-                log.warning(
-                    "INBOUND silk saved to %s (%d bytes), magic=%r",
-                    _keep, _keep.stat().st_size, _raw[:16],
-                )
-            except Exception as e:
-                log.warning("silk diag pre-fetch failed: %s", e)
-        if voice.get("text"):  # server-provided transcription
+        if voice.get("text"):  # server-provided transcription (fast path, no download)
             return (f"[语音] {voice['text']}", [])
         silk_path: Path | None = None
         try:
