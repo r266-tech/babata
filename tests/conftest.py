@@ -6,6 +6,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _disable_codex_memory_inject_by_default(monkeypatch):
+    monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "0")
+    monkeypatch.setenv("BABATA_CC_MEMORY_INJECT", "0")
+    monkeypatch.setenv("BABATA_TURN_LEDGER", "0")
+    monkeypatch.setenv("BABATA_REVIEW_BUS", "0")
+    monkeypatch.setenv("BABATA_DECLARED_CHECKS", "0")
+
 
 @dataclass
 class ClaudeAgentOptions:
@@ -19,6 +30,7 @@ class ClaudeAgentOptions:
     cwd: str | Path | None = None
     cli_path: str | Path | None = None
     include_partial_messages: bool = False
+    model: str | None = None
     setting_sources: list[str] | None = None
     max_buffer_size: int | None = None
     can_use_tool: Any = None
@@ -104,6 +116,13 @@ class PermissionResultAllow:
 
 
 @dataclass
+class PermissionResultDeny:
+    behavior: str = "deny"
+    message: str = ""
+    interrupt: bool = False
+
+
+@dataclass
 class ToolPermissionContext:
     signal: Any | None = None
     suggestions: list[Any] = field(default_factory=list)
@@ -128,6 +147,7 @@ sys.modules["claude_agent_sdk"] = sdk
 
 sdk_types = types.ModuleType("claude_agent_sdk.types")
 sdk_types.PermissionResultAllow = PermissionResultAllow
+sdk_types.PermissionResultDeny = PermissionResultDeny
 sdk_types.StreamEvent = StreamEvent
 sdk_types.ToolPermissionContext = ToolPermissionContext
 sys.modules["claude_agent_sdk.types"] = sdk_types

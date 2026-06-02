@@ -1,0 +1,6 @@
+*.zip
+*.tmp
+.pytest_cache/
+__pycache__/
+*.pyc
+Thumbs.db

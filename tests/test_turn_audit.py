@@ -1,0 +1,177 @@
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import turn_audit
+from cc import Response
+
+
+def _init_repo(path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True)
+    (path / "README.md").write_text("base\n")
+    subprocess.run(["git", "add", "README.md"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=path, check=True, capture_output=True)
+
+
+def _jsonl(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def test_turn_audit_records_ledger_guards_checks_and_review_bus(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("BABATA_TURN_LEDGER", "1")
+    monkeypatch.setenv("BABATA_DETERMINISTIC_GUARDS", "observe")
+    monkeypatch.setenv("BABATA_DECLARED_CHECKS", "1")
+    monkeypatch.setenv("BABATA_REVIEW_BUS", "queue")
+    monkeypatch.setenv("BABATA_AUDIT_DIR", str(audit_dir))
+
+    checks_dir = repo / ".babata"
+    checks_dir.mkdir()
+    (checks_dir / "checks.json").write_text(json.dumps({
+        "checks": [
+            {
+                "name": "smoke",
+                "command": f"{sys.executable} -c 'print(\"ok\")'",
+                "when": ["always"],
+            }
+        ]
+    }))
+    subprocess.run(["git", "add", ".babata/checks.json"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "checks"], cwd=repo, check=True, capture_output=True)
+
+    turn = turn_audit.begin_turn(
+        cpu="codex",
+        channel="test",
+        prompt="please edit",
+        session_id_before="sid-0",
+        cwd=repo,
+    )
+    assert turn is not None
+
+    (repo / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-testsecret0000000000000000\n")
+
+    summary = turn_audit.finish_turn(
+        turn,
+        response=Response(content="done", session_id="sid-1", cost=0.0, tools=["Bash"]),
+        tools=["Bash"],
+        tool_uses=[{"name": "Bash", "command": "git status --short"}],
+    )
+
+    assert summary is not None
+    assert any(f["rule"] == "env-file-changed" for f in summary["guard_findings"])
+    assert any(f["rule"].startswith("secret-pattern") for f in summary["guard_findings"])
+    assert summary["declared_checks"][0]["name"] == "smoke"
+    assert summary["declared_checks"][0]["status"] == "passed"
+    assert {task["kind"] for task in summary["review_tasks"]} >= {"security", "general_code"}
+
+    ledger = _jsonl(audit_dir / "babata-turn-ledger.jsonl")
+    assert [row["event"] for row in ledger] == ["begin", "finish"]
+    assert ".env" in ledger[-1]["git"]["changed_files"]
+    review_rows = _jsonl(audit_dir / "babata-review-bus.jsonl")
+    assert review_rows
+    assert review_rows[0]["source_cpu"] == "codex"
+
+
+def test_permission_guard_can_enforce_dangerous_commands(monkeypatch):
+    monkeypatch.setenv("BABATA_DETERMINISTIC_GUARDS", "enforce")
+    block, reason = turn_audit.should_block_for_permission(
+        "Bash",
+        {"command": "git reset --hard HEAD"},
+    )
+    assert block is True
+    assert reason and "dangerous-git-command" in reason
+
+
+def test_permission_guard_can_enforce_secret_file_writes(monkeypatch):
+    monkeypatch.setenv("BABATA_DETERMINISTIC_GUARDS", "enforce")
+    block, reason = turn_audit.should_block_for_permission(
+        "Write",
+        {
+            "file_path": ".env",
+            "content": "ANTHROPIC_API_KEY=sk-ant-testsecret0000000000000000",
+        },
+    )
+    assert block is True
+    assert reason and "env-file-tool-request" in reason
+
+
+def test_declared_checks_skip_without_config(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    monkeypatch.setenv("BABATA_DECLARED_CHECKS", "1")
+
+    results = turn_audit.run_declared_checks(
+        repo_root=repo,
+        changed_files=["README.md"],
+        guard_findings=[],
+    )
+
+    assert results == [{"status": "skipped", "reason": "no .babata/checks.json"}]
+
+
+def test_declared_checks_skip_config_created_during_turn(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("BABATA_TURN_LEDGER", "1")
+    monkeypatch.setenv("BABATA_AUDIT_DIR", str(audit_dir))
+    monkeypatch.setenv("BABATA_DECLARED_CHECKS", "1")
+    monkeypatch.setenv("BABATA_REVIEW_BUS", "off")
+
+    turn = turn_audit.begin_turn(
+        cpu="codex",
+        channel="test",
+        prompt="create config",
+        session_id_before=None,
+        cwd=repo,
+    )
+    (repo / ".babata").mkdir()
+    (repo / ".babata/checks.json").write_text(json.dumps({
+        "checks": [{"name": "unsafe", "command": "false", "when": ["always"]}]
+    }))
+
+    summary = turn_audit.finish_turn(
+        turn,
+        response=Response(content="done", session_id="sid-1", cost=0.0),
+    )
+
+    assert summary is not None
+    assert summary["declared_checks"] == [
+        {"status": "skipped", "reason": "declared checks config changed during turn"}
+    ]
+
+
+def test_turn_audit_does_not_attribute_preexisting_dirty_files(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("BABATA_TURN_LEDGER", "1")
+    monkeypatch.setenv("BABATA_AUDIT_DIR", str(audit_dir))
+    monkeypatch.setenv("BABATA_REVIEW_BUS", "queue")
+
+    (repo / "README.md").write_text("dirty before turn\n")
+    turn = turn_audit.begin_turn(
+        cpu="claude",
+        channel="test",
+        prompt="no file changes",
+        session_id_before=None,
+        cwd=repo,
+    )
+    summary = turn_audit.finish_turn(
+        turn,
+        response=Response(content="done", session_id="sid-1", cost=0.0),
+    )
+
+    assert summary is not None
+    ledger = _jsonl(audit_dir / "babata-turn-ledger.jsonl")
+    assert ledger[-1]["git"]["changed_files"] == []
+    assert summary["review_tasks"] == []

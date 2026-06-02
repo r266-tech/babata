@@ -9,20 +9,21 @@ chat popup / 刷新页面都能恢复完整聊天记录.
 - history 是 chronological chat turns (V 发了什么 / babata 回了什么)
 
 Schema (jsonl, append-only):
-  {ts, role: "user"|"assistant"|"boundary", text, url?, title?, has_image?, has_video?, has_file?}
+  {ts, role: "user"|"assistant"|"boundary", text, url?, title?, has_image?, has_video?, has_file?, tool_trace?}
   boundary 标记 V 触发新对话 (/new) — UI mount 时只拉最后一个 boundary 之后的 turns.
 """
 
 import json
 import logging
 import time
-from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from constants import SIDEBAR_DATA_DIR
+
 log = logging.getLogger(__name__)
 
-HISTORY_DIR = Path.home() / ".babata" / "sidebar"
+HISTORY_DIR = SIDEBAR_DATA_DIR
 HISTORY_FILE = HISTORY_DIR / "chat_history.jsonl"
 _lock = Lock()
 

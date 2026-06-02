@@ -1,7 +1,7 @@
 """Per-account persistence for the WeChat channel.
 
 Layout (override with BABATA_WEIXIN_DIR env var):
-    ~/.babata/weixin/
+    <WEIXIN_DATA_DIR>/
     ├── accounts.json                                 # [accountId, ...]
     └── accounts/
         ├── {accountId}.json                          # {token, baseUrl, userId, savedAt}
@@ -9,8 +9,9 @@ Layout (override with BABATA_WEIXIN_DIR env var):
         ├── {accountId}.context-tokens.json           # {userId: contextToken, ...}
         └── {accountId}.allow.json                    # {version, allowFrom: [userId, ...]}
 
-Mirrors the openclaw-weixin plugin layout 1:1 but rooted at ~/.babata/ so the
-two can coexist. All writes are atomic (tmp + rename).
+Mirrors the openclaw-weixin plugin layout 1:1. New installs root it under
+PROJECT_STATE_DIR/weixin; legacy ~/.babata/weixin is only a pre-migration
+fallback. All writes are atomic (tmp + rename).
 """
 
 import json
@@ -20,9 +21,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+from constants import WEIXIN_DATA_DIR
+
 log = logging.getLogger(__name__)
 
-_ROOT = Path(os.environ.get("BABATA_WEIXIN_DIR") or Path.home() / ".babata" / "weixin")
+_ROOT = WEIXIN_DATA_DIR
 
 
 def _root() -> Path:
@@ -157,14 +160,29 @@ def add_allow_from(account_id: str, user_id: str) -> None:
 
 
 def is_allowed(account_id: str, user_id: str) -> bool:
-    """Return True if user is allowed.
+    """Return True if the user is authorized for this account.
 
-    Empty allowFrom = allow all (dev default — the iLink bot ID returned at
-    login does not always match inbound from_user_id formatting, so the safe
-    default is open; V adds entries manually via add_allow_from to lock down).
+    Fail closed: an empty allowFrom denies all inbound (logging a warning to run
+    add_allow_from). An open default would let any WeChat user who can reach the
+    bot drive the full CPU. The login flow seeds allowFrom via add_allow_from; if
+    iLink omitted the user id, the operator must add an entry. A deliberate
+    dev-open mode requires the explicit env flag BABATA_WEIXIN_ALLOW_ALL=1.
     """
     allow = load_allow_from(account_id)
-    return (not allow) or (user_id in allow)
+    if allow:
+        return user_id in allow
+    if os.environ.get("BABATA_WEIXIN_ALLOW_ALL") == "1":
+        log.warning(
+            "weixin %s: empty allowFrom + BABATA_WEIXIN_ALLOW_ALL=1 → allowing ALL inbound (insecure dev mode)",
+            account_id,
+        )
+        return True
+    log.warning(
+        "weixin %s: empty allowFrom → denying inbound user %s (run add_allow_from to authorize)",
+        account_id,
+        user_id,
+    )
+    return False
 
 
 # ── multi-account cleanup ────────────────────────────────────────────

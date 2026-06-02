@@ -688,7 +688,7 @@ def step_wx() -> bool:
         return False
 
     if proc.returncode == 0:
-        print("✓ 微信 channel 配置完成 (token 存在 ~/.babata/weixin/)")
+        print("✓ 微信 channel 配置完成 (token 存在 WEIXIN_DATA_DIR)")
         return True
     print("✗ 微信登录失败 (退出码", proc.returncode, ")")
     return False
@@ -736,7 +736,7 @@ def main() -> int:
         write_env({"TELEGRAM_BOT_TOKEN": "", "ALLOWED_USER_ID": ""})
         tg_configured = False
 
-    # 4. WX channel (state 在 ~/.babata/weixin/, 不写 .env)
+    # 4. WX channel (state 在 WEIXIN_DATA_DIR, 不写 .env)
     wx_configured = step_wx()
 
     banner("配置完成" if (tg_configured or wx_configured) else "配置未完成")

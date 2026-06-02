@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -71,12 +72,43 @@ class FakeChat:
         self.actions.append(action)
 
 
+class FakeUser:
+    def __init__(self, user_id: int):
+        self.id = user_id
+
+
 class FakeUpdate:
-    def __init__(self, message: FakeMessage, chat: FakeChat):
+    def __init__(
+        self,
+        message: FakeMessage,
+        chat: FakeChat,
+        user_id: int | None = None,
+        update_id: int | None = None,
+    ):
+        self.update_id = update_id
         self.effective_message = message
         self.message = message
         self.effective_chat = chat
-        self.effective_user = None
+        self.effective_user = FakeUser(user_id) if user_id is not None else None
+
+
+class FakeCallbackQuery:
+    def __init__(self, user_id: int, data: str):
+        self.from_user = FakeUser(user_id)
+        self.data = data
+        self.answers = []
+        self.edits = []
+
+    async def answer(self, text=None, **kwargs):
+        self.answers.append((text, kwargs))
+
+    async def edit_message_text(self, text, **kwargs):
+        self.edits.append((text, kwargs))
+
+
+class FakeCallbackUpdate:
+    def __init__(self, query: FakeCallbackQuery):
+        self.callback_query = query
 
 
 class FakeBot:
@@ -85,9 +117,22 @@ class FakeBot:
 
     def __init__(self):
         self.reactions: list[tuple[int, int, str]] = []
+        self.commands: list[tuple[str, str]] = []
+        self.sent_messages: list[dict] = []
+        self.chat_actions: list[tuple[int, str]] = []
 
     async def set_message_reaction(self, *, chat_id, message_id, reaction):
         self.reactions.append((chat_id, message_id, reaction))
+
+    async def set_my_commands(self, commands):
+        self.commands = list(commands)
+
+    async def send_chat_action(self, *, chat_id, action):
+        self.chat_actions.append((chat_id, action))
+
+    async def send_message(self, **kwargs):
+        self.sent_messages.append(kwargs)
+        return FakeSentMessage(kwargs["text"])
 
 
 class FakeCtx:
@@ -145,6 +190,13 @@ async def wait_for(predicate, timeout: float = 1.0):
 def reset_bot_globals(monkeypatch, tmp_path):
     monkeypatch.setattr(bot, "bridge", FakeBridge())
     monkeypatch.setattr(bot, "_STATE_PATH", tmp_path / "state.json")
+    monkeypatch.setattr(bot, "PROCESSED_UPDATES_FILE", tmp_path / "processed.json")
+    monkeypatch.setattr(bot, "PENDING_UPDATES_FILE", tmp_path / "pending.json")
+    monkeypatch.setattr(bot, "PENDING_DELIVERIES_FILE", tmp_path / "pending-deliveries.json")
+    monkeypatch.setattr(bot, "RUNTIME_STATUS_FILE", tmp_path / "runtime.json")
+    bot._processed_set = set()
+    bot._pending_update_records = {}
+    bot._pending_delivery_records = {}
     bot._state = {}
     bot._verbose = 1
     bot._in_flight = 0
@@ -154,6 +206,332 @@ def reset_bot_globals(monkeypatch, tmp_path):
     bot._last_context_window = None
     bot._last_used_tokens = 0
     bot._last_cost = 0.0
+    bot._channel_worker = None
+    bot._shutdown_requested = False
+
+
+class FakeCpuSession:
+    def __init__(self, name: str, state_file: Path | None = None, sid: str | None = None):
+        self._babata_engine_name = name
+        self._state_file = state_file
+        self._session_id = sid
+
+    def _load_state(self):
+        if self._state_file is None:
+            return {}
+        try:
+            return json.loads(self._state_file.read_text())
+        except Exception:
+            return {}
+
+    def _record_sid(self, sid: str | None):
+        if self._state_file is None:
+            return
+        try:
+            state = json.loads(self._state_file.read_text())
+        except Exception:
+            state = {}
+        state["session_id"] = sid
+        engine_sids = state.get("engine_session_ids")
+        if not isinstance(engine_sids, dict):
+            engine_sids = {}
+        engine_sids[self._babata_engine_name] = sid or ""
+        state["engine_session_ids"] = engine_sids
+        self._state_file.write_text(json.dumps(state))
+
+
+class FakeCpuWorker:
+    instances: list["FakeCpuWorker"] = []
+
+    def __init__(self, session, *, instance_label: str):
+        self.session = session
+        self.instance_label = instance_label
+        self._turn_active = False
+        self.started = False
+        self.stopped = False
+        FakeCpuWorker.instances.append(self)
+
+    async def start(self):
+        self.started = True
+
+    async def stop(self):
+        self.stopped = True
+
+
+def test_switch_cpu_rebuilds_worker_and_persists_choice(monkeypatch, tmp_path):
+    async def run():
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({"session_id": "claude-old"}))
+        monkeypatch.setattr(bot, "SESSION_FILE", state_file)
+        monkeypatch.setattr(bot, "_STATE_PATH", state_file)
+        bot._state = {}
+        bot._in_flight = 0
+        monkeypatch.setattr(bot, "cc", FakeCpuSession("claude", state_file, "claude-old"))
+        old_worker = FakeCpuWorker(bot.cc, instance_label="test")
+        monkeypatch.setattr(bot, "_channel_worker", old_worker)
+        FakeCpuWorker.instances = [old_worker]
+
+        def fake_make(target=None):
+            return FakeCpuSession(target or "claude")
+
+        monkeypatch.setattr(bot, "_make_tg_engine", fake_make)
+        monkeypatch.setattr(bot, "ChannelWorker", FakeCpuWorker)
+
+        result = await bot._switch_cpu("codex")
+
+        assert result == "CPU: Claude Code → Codex"
+        assert old_worker.stopped is True
+        assert bot._channel_worker is FakeCpuWorker.instances[-1]
+        assert bot._channel_worker.started is True
+        assert bot._current_cpu_name() == "codex"
+        state = json.loads(state_file.read_text())
+        assert state["assistant_engine"] == "codex"
+        assert state["engine_session_ids"]["claude"] == "claude-old"
+
+    asyncio.run(run())
+
+
+def test_bot_commands_are_filtered_by_cpu():
+    claude = [name for name, _ in bot._bot_commands_for_cpu("claude")]
+    codex = [name for name, _ in bot._bot_commands_for_cpu("codex")]
+
+    assert "context" in claude
+    assert "stop" in claude
+    assert "provider" in claude
+    assert "context" not in codex
+    assert "stop" in codex
+    assert "provider" in codex
+    assert {"new", "resume", "status", "verbose", "cpu", "stop", "restart", "provider"} <= set(codex)
+
+
+def test_codex_rejects_context_supports_stop_and_shows_provider(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        monkeypatch.setattr(bot, "ALLOWED_USER", 7)
+        monkeypatch.setattr(bot, "cc", FakeCpuSession("codex"))
+        monkeypatch.setattr(bot, "_current_codex_key", lambda: "personal")
+        monkeypatch.setattr(bot, "_current_codex_label", lambda: "Codex · personal")
+        monkeypatch.setattr(bot, "_codex_choices", lambda: [("Codex · personal", "personal")])
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        await worker.start()
+        monkeypatch.setattr(bot, "_channel_worker", worker)
+
+        ctx = FakeCtx()
+        chat = FakeChat()
+
+        context_msg = FakeMessage(10, "/context")
+        await bot.cmd_context(FakeUpdate(context_msg, chat, user_id=7), ctx)
+        assert "不支持" in context_msg.replies[-1].text
+
+        active_msg = FakeMessage(9, "active")
+        await worker.submit(
+            bot.Payload(update=FakeUpdate(active_msg, chat), ctx=ctx, text="active")
+        )
+        stop_msg = FakeMessage(11, "/stop")
+        await bot.cmd_stop(FakeUpdate(stop_msg, chat, user_id=7), ctx)
+        assert stop_msg.replies == []
+        assert session.interrupted is True
+
+        provider_msg = FakeMessage(12, "/provider")
+        await bot.cmd_provider(FakeUpdate(provider_msg, chat, user_id=7), ctx)
+        assert "Codex 账号" in provider_msg.replies[-1].text
+        await worker.stop()
+
+    asyncio.run(run())
+
+
+def test_codex_rejects_provider_callback(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        monkeypatch.setattr(bot, "ALLOWED_USER", 7)
+        monkeypatch.setattr(bot, "cc", FakeCpuSession("codex"))
+
+        async def fail_switch(*args, **kwargs):
+            raise AssertionError("provider switch should not run in Codex mode")
+
+        monkeypatch.setattr(bot, "_run_cc_router_switch", fail_switch)
+        query = FakeCallbackQuery(user_id=7, data="provider:openrouter")
+
+        await bot.on_provider_click(FakeCallbackUpdate(query), FakeCtx())
+
+        assert query.answers == [(None, {})]
+        assert "失效" in query.edits[-1][0]
+
+    asyncio.run(run())
+
+
+def test_codex_resume_picker_only_shows_current_channel(monkeypatch, tmp_path):
+    reset_bot_globals(monkeypatch, tmp_path)
+    monkeypatch.setattr(bot, "cc", FakeCpuSession("codex", sid="sid-12345678"))
+
+    _header, markup = bot._render_resume_channel_picker()
+
+    buttons = markup[0][0]
+    assert len(buttons) == 1
+    button = buttons[0][0]
+    assert button[0][0] == "当前 Codex"
+    assert button[1]["callback_data"] == "resume-ch:tg"
+
+
+def test_codex_status_reads_session_usage(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        monkeypatch.setattr(bot, "ALLOWED_USER", 7)
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({"recent_sids": ["sid-1"]}))
+        monkeypatch.setattr(bot, "cc", FakeCpuSession("codex", state_file, "sid-1"))
+        monkeypatch.setattr(bot, "_last_model", "codex")
+        monkeypatch.setattr(bot, "_codex_version", lambda: "0.128.0")
+        session_file = tmp_path / "rollout-sid-1.jsonl"
+        session_file.write_text("\n".join([
+            json.dumps({
+                "type": "turn_context",
+                "payload": {
+                    "model": "gpt-5.5",
+                    "effort": "xhigh",
+                },
+            }),
+            json.dumps({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 1000,
+                            "output_tokens": 200,
+                            "reasoning_output_tokens": 50,
+                        },
+                        "model_context_window": 2000,
+                    },
+                },
+                "rate_limits": {
+                    "primary": {"used_percent": 12, "resets_at": 1_778_418_860},
+                    "secondary": {"used_percent": 34, "resets_at": 1_778_911_266},
+                    "plan_type": "prolite",
+                },
+            }),
+        ]))
+        monkeypatch.setattr(bot, "_codex_session_file", lambda sid: session_file)
+        monkeypatch.setattr(bot, "_codex_sessions_root", lambda: tmp_path)
+        monkeypatch.setattr(bot, "_codex_config", lambda: {"model": "gpt-5.5", "model_reasoning_effort": "xhigh"})
+        monkeypatch.setattr(bot, "_fetch_codex_app_rate_limits", lambda: asyncio.sleep(0, result=None))
+
+        msg = FakeMessage(13, "/status")
+        await bot.cmd_status(FakeUpdate(msg, FakeChat(), user_id=7), FakeCtx())
+
+        text = msg.replies[-1].text
+        assert "50%" in text
+        assert "gpt-5.5 xhigh" in text
+        assert "1.0K in" in text
+        assert "200 out" in text
+        assert "50 reasoning" in text
+        assert "5h limit 88% left" in text
+        assert "weekly limit 66% left" in text
+        assert "plan prolite" in text
+        assert "Codex v0.128.0" in text
+        assert "current <code>gpt-5.5</code> · effort <code>xhigh</code>" not in text
+
+    asyncio.run(run())
+
+
+def test_codex_status_prefers_live_app_server_limits(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        monkeypatch.setattr(bot, "ALLOWED_USER", 7)
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({"recent_sids": ["sid-1"]}))
+        monkeypatch.setattr(bot, "cc", FakeCpuSession("codex", state_file, "sid-1"))
+        monkeypatch.setattr(bot, "_last_model", "codex")
+        monkeypatch.setattr(bot, "_codex_version", lambda: "0.128.0")
+        session_file = tmp_path / "rollout-sid-1.jsonl"
+        session_file.write_text("\n".join([
+            json.dumps({
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.5", "effort": "xhigh"},
+            }),
+            json.dumps({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {"input_tokens": 1000},
+                        "model_context_window": 2000,
+                    },
+                },
+                "rate_limits": {
+                    "primary": {"used_percent": 12, "resets_at": 1_778_418_860},
+                    "secondary": {"used_percent": 34, "resets_at": 1_778_911_266},
+                    "plan_type": "stale",
+                },
+            }),
+        ]))
+        monkeypatch.setattr(bot, "_codex_session_file", lambda sid: session_file)
+        monkeypatch.setattr(bot, "_codex_config", lambda: {"model": "gpt-5.5", "model_reasoning_effort": "xhigh"})
+        monkeypatch.setattr(bot, "_fetch_codex_app_rate_limits", lambda: asyncio.sleep(0, result={
+            "primary": {"used_percent": 29, "window_minutes": 300, "resets_at": 1_778_494_266},
+            "secondary": {"used_percent": 33, "window_minutes": 10_080, "resets_at": 1_778_911_266},
+            "plan_type": "prolite",
+        }))
+
+        msg = FakeMessage(13, "/status")
+        await bot.cmd_status(FakeUpdate(msg, FakeChat(), user_id=7), FakeCtx())
+
+        text = msg.replies[-1].text
+        assert "5h limit 71% left" in text
+        assert "weekly limit 67% left" in text
+        assert "plan prolite" in text
+        assert "5h limit 88% left" not in text
+        assert "plan stale" not in text
+
+    asyncio.run(run())
+
+
+def test_codex_rate_limits_normalizes_app_server_shape():
+    result = {
+        "rateLimits": {
+            "limitId": "codex",
+            "primary": {"usedPercent": 40, "windowDurationMins": 300, "resetsAt": 111},
+            "secondary": {"usedPercent": 50, "windowDurationMins": 10_080, "resetsAt": 222},
+            "planType": "prolite",
+        },
+        "rateLimitsByLimitId": {
+            "codex": {
+                "limitId": "codex",
+                "limitName": None,
+                "primary": {"usedPercent": 29, "windowDurationMins": 300, "resetsAt": 333},
+                "secondary": {"usedPercent": 33, "windowDurationMins": 10_080, "resetsAt": 444},
+                "credits": {"hasCredits": False, "unlimited": False, "balance": "0"},
+                "planType": "prolite",
+                "rateLimitReachedType": None,
+            },
+        },
+    }
+
+    normalized = bot._normalize_codex_rate_limits_response(result)
+
+    assert normalized == {
+        "limit_id": "codex",
+        "limit_name": None,
+        "primary": {"used_percent": 29, "window_minutes": 300, "resets_at": 333},
+        "secondary": {"used_percent": 33, "window_minutes": 10_080, "resets_at": 444},
+        "credits": {"hasCredits": False, "unlimited": False, "balance": "0"},
+        "plan_type": "prolite",
+        "rate_limit_reached_type": None,
+    }
+
+
+def test_codex_rate_limits_rejects_empty_app_server_snapshot():
+    result = {
+        "rateLimitsByLimitId": {
+            "codex": {
+                "limitId": "codex",
+                "planType": "prolite",
+            },
+        },
+    }
+
+    assert bot._normalize_codex_rate_limits_response(result) is None
 
 
 def test_channel_worker_single_turn_clean_reset(monkeypatch, tmp_path):
@@ -282,6 +660,126 @@ def test_channel_worker_cut_in_waits_for_next_turn(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
+def test_channel_worker_codex_coalesces_pending_cut_ins(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        processed: list[int] = []
+
+        async def fake_mark_processed(update_id):
+            if update_id is not None:
+                processed.append(update_id)
+
+        monkeypatch.setattr(bot, "_mark_processed", fake_mark_processed)
+        session = FakeSession()
+        session.supports_hot_input = False
+        worker = bot.ChannelWorker(session, instance_label="test")
+        await worker.start()
+
+        chat = FakeChat(chat_id=42)
+        ctx = FakeCtx()
+        m1 = FakeMessage(1, "first")
+        m2 = FakeMessage(2, "second")
+        m3 = FakeMessage(3, "third")
+
+        await worker.submit(
+            bot.Payload(
+                update=FakeUpdate(m1, chat),
+                ctx=ctx,
+                text="first",
+                update_id=101,
+            )
+        )
+        await worker.submit(
+            bot.Payload(
+                update=FakeUpdate(m2, chat),
+                ctx=ctx,
+                text="second",
+                update_id=102,
+            )
+        )
+        await worker.submit(
+            bot.Payload(
+                update=FakeUpdate(m3, chat),
+                ctx=ctx,
+                text="third",
+                update_id=103,
+            )
+        )
+
+        assert session.submitted == [("first", None)]
+        assert session.interrupted is False
+
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="done1", session_id="sid-1", cost=0.01),
+            )
+        )
+        await wait_for(lambda: len(session.submitted) == 2)
+        prompt, images = session.submitted[1]
+        assert images is None
+        assert "follow-up Telegram messages" in prompt
+        assert "<user_message n=1 update_id=102 message_id=2>" in prompt
+        assert "second" in prompt
+        assert "<user_message n=2 update_id=103 message_id=3>" in prompt
+        assert "third" in prompt
+        assert processed == [101]
+
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="batch done", session_id="sid-2", cost=0.01),
+            )
+        )
+        await wait_for(lambda: processed == [101, 102, 103])
+        await wait_for(lambda: (42, 2, "👌") in ctx.bot.reactions)
+        await wait_for(lambda: (42, 3, "👌") in ctx.bot.reactions)
+        assert len(m2.replies) == 0
+        assert any("batch done" in r.text for r in m3.replies)
+        await wait_for(lambda: bot._in_flight == 0)
+
+        await worker.stop()
+
+    asyncio.run(run())
+
+def test_channel_worker_stopped_turn_marks_active_failed(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        await worker.start()
+
+        chat = FakeChat(chat_id=42)
+        ctx = FakeCtx()
+        msg = FakeMessage(1, "stop me")
+
+        await worker.submit(
+            bot.Payload(update=FakeUpdate(msg, chat), ctx=ctx, text="stop me")
+        )
+        await wait_for(lambda: (42, 1, "👀") in ctx.bot.reactions)
+
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(
+                    content="当前 Codex turn 已停止。",
+                    session_id="sid-1",
+                    cost=0.0,
+                    stopped=True,
+                ),
+            )
+        )
+
+        await wait_for(lambda: (42, 1, "💔") in ctx.bot.reactions)
+        assert (42, 1, "👌") not in ctx.bot.reactions
+        assert any("已停止" in r.text for r in msg.replies)
+        await wait_for(lambda: bot._in_flight == 0)
+
+        await worker.stop()
+
+    asyncio.run(run())
+
+
 def test_channel_worker_reaction_eye_then_ok_single_turn(monkeypatch, tmp_path):
     """单条消息: submit → 👀 立即 fire (因为 _begin_turn inline); turn_end → 👌."""
     async def run():
@@ -357,6 +855,372 @@ def test_channel_worker_reaction_back_to_back_messages(monkeypatch, tmp_path):
         )
         await wait_for(lambda: (42, 2, "👌") in ctx.bot.reactions)
         await wait_for(lambda: bot._in_flight == 0)
+
+        await worker.stop()
+
+    asyncio.run(run())
+
+
+def test_channel_worker_stream_error_replays_active_then_pending(monkeypatch, tmp_path):
+    """Recoverable CPU stream error must replay N before continuing N+1.
+
+    The old behavior marked active+pending as processed and 💔, permanently
+    dropping the queue. The required channel contract is FIFO replay after the
+    supervisor reconnects.
+    """
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        processed: list[int] = []
+
+        async def fake_mark_processed(update_id):
+            if update_id is not None:
+                processed.append(update_id)
+
+        monkeypatch.setattr(bot, "_mark_processed", fake_mark_processed)
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        await worker.start()
+
+        chat = FakeChat(chat_id=42)
+        m1 = FakeMessage(1, "first")
+        m2 = FakeMessage(2, "second")
+        ctx = FakeCtx()
+
+        await worker.submit(
+            bot.Payload(
+                update=FakeUpdate(m1, chat),
+                ctx=ctx,
+                text="first",
+                update_id=101,
+            )
+        )
+        await worker.submit(
+            bot.Payload(
+                update=FakeUpdate(m2, chat),
+                ctx=ctx,
+                text="second",
+                update_id=102,
+            )
+        )
+        assert session.submitted == [("first", None)]
+
+        session.queue.put_nowait(Event(kind="error", exception=RuntimeError("boom")))
+
+        # After reconnect, m1 is replayed first; m2 stays queued.
+        await wait_for(lambda: session.submitted == [("first", None), ("first", None)])
+        assert processed == []
+        assert (42, 1, "💔") not in ctx.bot.reactions
+        assert (42, 2, "💔") not in ctx.bot.reactions
+        assert bot._in_flight == 1
+        assert worker._turn_anchor == 1
+
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="ok1", session_id="sid-1", cost=0.01),
+            )
+        )
+        await wait_for(
+            lambda: session.submitted == [
+                ("first", None),
+                ("first", None),
+                ("second", None),
+            ]
+        )
+        await wait_for(lambda: 101 in processed)
+        assert (42, 1, "👌") in ctx.bot.reactions
+        assert worker._turn_anchor == 2
+
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="ok2", session_id="sid-2", cost=0.01),
+            )
+        )
+        await wait_for(lambda: 102 in processed)
+        await wait_for(lambda: bot._in_flight == 0)
+        assert (42, 2, "👌") in ctx.bot.reactions
+        assert (42, 2, "💔") not in ctx.bot.reactions
+
+        await worker.stop()
+
+    asyncio.run(run())
+
+
+def test_turn_end_delivery_failure_does_not_mark_processed(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        processed: list[int] = []
+
+        async def fake_mark_processed(update_id):
+            if update_id is not None:
+                processed.append(update_id)
+
+        monkeypatch.setattr(bot, "_mark_processed", fake_mark_processed)
+
+        class FailingMessage(FakeMessage):
+            async def reply_text(self, text: str, parse_mode=None, reply_markup=None):
+                raise RuntimeError("telegram down")
+
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        await worker.start()
+
+        chat = FakeChat(chat_id=42)
+        ctx = FakeCtx()
+        msg = FailingMessage(7, "needs visible reply")
+        await worker.submit(
+            bot.Payload(
+                update=FakeUpdate(msg, chat),
+                ctx=ctx,
+                text="needs visible reply",
+                update_id=101,
+            )
+        )
+
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="done", session_id="sid-1", cost=0.01),
+            )
+        )
+
+        await wait_for(lambda: bot._in_flight == 0)
+        assert processed == []
+        assert "101" in bot._pending_delivery_records
+        await wait_for(lambda: (42, 7, "💔") in ctx.bot.reactions)
+
+        await worker.stop()
+
+    asyncio.run(run())
+
+
+def test_pending_delivery_replays_before_model_replay(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+
+        ctx = FakeCtx()
+        bot._pending_update_records = {
+            "501": {
+                "update_id": 501,
+                "chat_id": 42,
+                "message_id": 7,
+                "text": "already answered",
+                "images": [],
+                "received_at": 1.0,
+            },
+        }
+        bot._pending_delivery_records = {
+            "501": {
+                "delivery_id": "501",
+                "update_ids": [501],
+                "anchor_update_id": 501,
+                "chat_id": 42,
+                "message_id": 7,
+                "content": "cached final answer",
+                "resume_note": None,
+                "session_id": "sid-1",
+                "created_at": 1.0,
+            },
+        }
+
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        monkeypatch.setattr(bot, "_channel_worker", worker)
+        await worker.start()
+        app = type("FakeApp", (), {"bot": ctx.bot})()
+
+        delivery_replay = await bot._replay_pending_deliveries(app)
+        assert delivery_replay.delivered == 1
+        assert ctx.bot.sent_messages[-1]["text"] == "cached final answer"
+        assert ctx.bot.sent_messages[-1]["reply_to_message_id"] == 7
+        assert 501 in bot._processed_set
+        assert bot._pending_delivery_records == {}
+        assert bot._pending_update_records == {}
+
+        pending_replay = await bot._replay_pending_updates(app)
+        assert pending_replay.replayed == 0
+        assert session.submitted == []
+
+        await worker.stop()
+
+    asyncio.run(run())
+
+
+def test_tg_pending_update_replays_after_restart_and_acks(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+
+        session1 = FakeSession()
+        worker1 = bot.ChannelWorker(session1, instance_label="test")
+        monkeypatch.setattr(bot, "_channel_worker", worker1)
+        await worker1.start()
+
+        ctx = FakeCtx()
+        chat = FakeChat(chat_id=42)
+        msg = FakeMessage(7, "needs replay")
+        update = FakeUpdate(msg, chat, user_id=7, update_id=501)
+
+        await bot._process(update, ctx, "needs replay")
+        assert session1.submitted == [("needs replay", None)]
+        pending = json.loads((tmp_path / "pending.json").read_text())["pending"]
+        assert pending["501"]["text"] == "needs replay"
+
+        # Simulate process death before turn_end: no processed mark was written.
+        await worker1.stop()
+
+        session2 = FakeSession()
+        worker2 = bot.ChannelWorker(session2, instance_label="test")
+        monkeypatch.setattr(bot, "_channel_worker", worker2)
+        await worker2.start()
+        app = type("FakeApp", (), {"bot": ctx.bot})()
+
+        replay = await bot._replay_pending_updates(app)
+        assert replay.total == 1
+        assert replay.replayed == 1
+        assert replay.failed == 0
+        assert session2.submitted == [("needs replay", None)]
+
+        session2.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="done", session_id="sid-1", cost=0.01),
+            )
+        )
+        await wait_for(lambda: "501" not in bot._pending_update_records)
+        assert 501 in bot._processed_set
+        assert json.loads((tmp_path / "pending.json").read_text())["pending"] == {}
+        assert ctx.bot.sent_messages[-1]["reply_to_message_id"] == 7
+
+        await worker2.stop()
+
+    asyncio.run(run())
+
+
+def test_tg_replay_pending_fifo_without_interrupt(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        ctx = FakeCtx()
+        bot._pending_update_records = {
+            "501": {
+                "update_id": 501,
+                "chat_id": 42,
+                "message_id": 7,
+                "text": "first",
+                "images": [],
+                "received_at": 1.0,
+            },
+            "502": {
+                "update_id": 502,
+                "chat_id": 42,
+                "message_id": 8,
+                "text": "second",
+                "images": [],
+                "received_at": 2.0,
+            },
+        }
+
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        monkeypatch.setattr(bot, "_channel_worker", worker)
+        await worker.start()
+
+        app = type("FakeApp", (), {"bot": ctx.bot})()
+        replay = await bot._replay_pending_updates(app)
+        assert replay.total == 2
+        assert replay.replayed == 2
+        assert replay.failed == 0
+
+        assert session.submitted == [("first", None)]
+        assert session.interrupted is False
+        assert [p.text for p in worker._pending_payloads] == ["second"]
+
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="done1", session_id="sid-1", cost=0.01),
+            )
+        )
+        await wait_for(lambda: session.submitted == [("first", None), ("second", None)])
+
+        await worker.stop()
+
+    asyncio.run(run())
+
+
+def test_tg_startup_notice_surfaces_pending_replay_summary():
+    assert bot._pending_replay_notice_lines(
+        bot.PendingReplaySummary(total=1, replayed=1)
+    ) == ["已恢复 1 个未完成任务"]
+
+    assert bot._pending_replay_notice_lines(
+        bot.PendingReplaySummary(total=3, replayed=2, failed=1)
+    ) == ["已恢复 2 个未完成任务", "⚠️ 1 个未完成任务恢复失败，见日志"]
+
+
+def test_tg_shutdown_records_new_update_for_restart_replay(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        bot._shutdown_requested = True
+
+        ctx = FakeCtx()
+        chat = FakeChat(chat_id=42)
+        msg = FakeMessage(7, "during restart")
+        update = FakeUpdate(msg, chat, user_id=7, update_id=501)
+
+        await bot._process(update, ctx, "during restart")
+
+        assert json.loads((tmp_path / "pending.json").read_text())["pending"]["501"]["text"] == "during restart"
+
+    asyncio.run(run())
+
+
+def test_channel_worker_unfinished_work_includes_pending_cut_ins(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        await worker.start()
+
+        ctx = FakeCtx()
+        chat = FakeChat(chat_id=42)
+        await worker.submit(
+            bot.Payload(
+                update=FakeUpdate(FakeMessage(7, "first"), chat, update_id=501),
+                ctx=ctx,
+                text="first",
+                update_id=501,
+            )
+        )
+        await worker.submit(
+            bot.Payload(
+                update=FakeUpdate(FakeMessage(8, "second"), chat, update_id=502),
+                ctx=ctx,
+                text="second",
+                update_id=502,
+            )
+        )
+
+        assert await worker.has_unfinished_work() is True
+        assert [p.text for p in worker._pending_payloads] == ["second"]
+
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="done1", session_id="sid-1", cost=0.01),
+            )
+        )
+        await wait_for(lambda: session.submitted == [("first", None), ("second", None)])
+        assert await worker.has_unfinished_work() is True
+
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="done2", session_id="sid-2", cost=0.01),
+            )
+        )
+        await wait_for(lambda: bot._in_flight == 0)
+        assert await worker.has_unfinished_work() is False
 
         await worker.stop()
 
