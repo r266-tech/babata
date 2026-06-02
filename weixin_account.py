@@ -1,7 +1,7 @@
 """Per-account persistence for the WeChat channel.
 
 Layout (override with BABATA_WEIXIN_DIR env var):
-    ~/.babata/weixin/
+    <WEIXIN_DATA_DIR>/
     ├── accounts.json                                 # [accountId, ...]
     └── accounts/
         ├── {accountId}.json                          # {token, baseUrl, userId, savedAt}
@@ -9,8 +9,9 @@ Layout (override with BABATA_WEIXIN_DIR env var):
         ├── {accountId}.context-tokens.json           # {userId: contextToken, ...}
         └── {accountId}.allow.json                    # {version, allowFrom: [userId, ...]}
 
-Mirrors the openclaw-weixin plugin layout 1:1 but rooted at ~/.babata/ so the
-two can coexist. All writes are atomic (tmp + rename).
+Mirrors the openclaw-weixin plugin layout 1:1. New installs root it under
+PROJECT_STATE_DIR/weixin; legacy ~/.babata/weixin is only a pre-migration
+fallback. All writes are atomic (tmp + rename).
 """
 
 import json
@@ -20,9 +21,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+from constants import WEIXIN_DATA_DIR
+
 log = logging.getLogger(__name__)
 
-_ROOT = Path(os.environ.get("BABATA_WEIXIN_DIR") or Path.home() / ".babata" / "weixin")
+_ROOT = WEIXIN_DATA_DIR
 
 
 def _root() -> Path:

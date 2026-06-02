@@ -7,9 +7,9 @@ grep 当前 url 最近事件摘要塞 page_context (= page memory).
 
 Schema (松散, 每条带 ts/url/kind, 余字段按 kind 自由):
   translate_hit       — L1/L2 cache 命中, 不调 LLM
-  translate_spawn     — spawn `claude -p` 翻 N 段
-  translate_done      — spawn 完成 (含 spawn_ms 用时)
-  translate_fail      — spawn 失败 (timeout / parse / rc)
+  translate_spawn     — provider 翻 N 段
+  translate_done      — provider 完成 (含 spawn_ms 用时)
+  translate_fail      — provider 失败 (timeout / parse / HTTP error)
   chat_turn           — V 在 sidepanel 发了一条
   proactive_run       — V 切 tab 触发 proactive (含 url/title)
   viewport            — content script 推 viewport_hashes (V 当前可见段)
@@ -19,13 +19,14 @@ Schema (松散, 每条带 ts/url/kind, 余字段按 kind 自由):
 import json
 import logging
 import time
-from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from constants import SIDEBAR_DATA_DIR
+
 log = logging.getLogger(__name__)
 
-EVENTS_DIR = Path.home() / ".babata" / "sidebar"
+EVENTS_DIR = SIDEBAR_DATA_DIR
 EVENTS_FILE = EVENTS_DIR / "events.jsonl"
 _lock = Lock()
 

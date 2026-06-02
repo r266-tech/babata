@@ -16,13 +16,14 @@ Schema (jsonl, append-only):
 import json
 import logging
 import time
-from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from constants import SIDEBAR_DATA_DIR
+
 log = logging.getLogger(__name__)
 
-HISTORY_DIR = Path.home() / ".babata" / "sidebar"
+HISTORY_DIR = SIDEBAR_DATA_DIR
 HISTORY_FILE = HISTORY_DIR / "chat_history.jsonl"
 _lock = Lock()
 

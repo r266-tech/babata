@@ -39,7 +39,10 @@ load_dotenv(override=False)
 # Namespace / paths derive from PROJECT_NAMESPACE + BABATA_INSTANCE env.
 # See constants.py for the full derivation. Propagate BRIDGE_SOCKET to
 # bridge.py (imported next) and to tg_mcp subprocess below.
-from constants import BRIDGE_SOCKET, INSTANCE, INSTANCE_LABELS, LAUNCHD_PREFIX, PROJECT, SESSION_FILE, STATE_DIR, STATE_FILE
+from constants import (
+    BRIDGE_SOCKET, INSTANCE, INSTANCE_LABELS, LAUNCHD_PREFIX, PROJECT,
+    SESSION_FILE, STATE_DIR, STATE_FILE, WEIXIN_DATA_DIR,
+)
 os.environ["BABATA_BRIDGE_SOCKET"] = BRIDGE_SOCKET
 
 from telegram import Update
@@ -65,6 +68,7 @@ from engine import (
     persist_engine,
 )
 from media import image_to_base64, transcribe_voice, understand_video
+from review_health import review_health_snapshot
 from tg_transcript import install_bot_transcript, record_update, transcript_source
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -122,6 +126,7 @@ _PROCESSED_MAX = 1000  # 滚动窗口
 
 def _write_runtime_status(event: str = "") -> None:
     try:
+        review_health = review_health_snapshot()
         tmp = RUNTIME_STATUS_FILE.with_suffix(".json.partial")
         tmp.write_text(
             json.dumps(
@@ -133,6 +138,7 @@ def _write_runtime_status(event: str = "") -> None:
                     "shutdown_requested": _shutdown_requested,
                     "pending_updates": len(_pending_update_records),
                     "pending_deliveries": len(_pending_delivery_records),
+                    "blocking_review": review_health,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -3613,6 +3619,24 @@ def _fmt_codex_reset(value: Any) -> str:
     return dt.strftime("%H:%M on %-d %b")
 
 
+def _fmt_review_health_line(snapshot: dict[str, Any] | None = None) -> str:
+    snap = snapshot or review_health_snapshot()
+    status = str(snap.get("status") or "unknown")
+    strict = "strict" if snap.get("strict") else "soft"
+    probes = snap.get("probes") if isinstance(snap.get("probes"), dict) else {}
+    bad = [
+        name
+        for name, probe in probes.items()
+        if isinstance(probe, dict) and not probe.get("ok")
+    ]
+    if status == "ok":
+        return f"review ok · {strict}"
+    if status in {"disabled", "deterministic-only"}:
+        return f"review {status} · {strict}"
+    suffix = f" ({', '.join(bad)})" if bad else ""
+    return f"review {status}{suffix} · {strict}"
+
+
 def _progress_bar(pct: float, width: int = 15) -> str:
     """Render a block progress bar. Uses █ (full) vs ░ (light) — solid contrast
     renders cleanly in TG's iOS system font; ▓ (medium shade) gets rendered as
@@ -3807,6 +3831,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"{bar} {pct_ctx:.0f}% · {html.escape(_short_model(actual))} {html.escape(str(effort))} ({window_short})",
             "",
             html.escape(token_line),
+            html.escape(_fmt_review_health_line()),
         ]
         if five_hour_line:
             lines.append(html.escape(five_hour_line))
@@ -3953,6 +3978,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "",
         f"{bar} {pct_ctx:.0f}% · {html.escape(model_short)} ({window_short})",
         "",
+        html.escape(_fmt_review_health_line()),
     ]
     if session_line:
         lines.append(html.escape(session_line))
@@ -5250,12 +5276,12 @@ async def _post_init(app: Application) -> None:
 
 def _spawn_weixin_if_configured() -> "subprocess.Popen | None":
     """装了 WX 就 spawn weixin_bot.py 子进程 — 让 babata 一条命令跑 TG+WX.
-    判据: ~/.babata/weixin/accounts/ 有 token 文件. 没有则 V 没装 WX, 不 spawn.
+    判据: WEIXIN_DATA_DIR/accounts/ 有 token 文件. 没有则 V 没装 WX, 不 spawn.
     生产 launchd 模式各 channel 独立 plist 跑, 通过 BABATA_NO_AUTO_WX=1 关掉.
     """
     if os.environ.get("BABATA_NO_AUTO_WX"):
         return None
-    accounts = Path.home() / ".babata" / "weixin" / "accounts"
+    accounts = WEIXIN_DATA_DIR / "accounts"
     if not accounts.exists() or not any(accounts.iterdir()):
         return None
     weixin_main = Path(__file__).parent / "weixin_bot.py"

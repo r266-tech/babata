@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import signal
 import time
 from pathlib import Path
@@ -33,13 +34,25 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from constants import PROJECT, STATE_DIR
-from engine import VENV_PYTHON, make_engine
+from engine import (
+    VENV_PYTHON,
+    engine_choices,
+    engine_label,
+    engine_name,
+    make_engine,
+    normalize_engine,
+    persist_engine,
+)
 from media import image_to_base64, understand_video  # noqa: F401  (image_to_base64 unused now; kept for parity)
 import sidebar_events
 import sidebar_history
 from sidebar_bridge import bridge
 from sidebar_tool_registry import prompt_tool_lines
 from sidebar_translate import (
+    get_translation_provider_settings,
+    list_provider_models,
+    save_translation_provider_settings,
+    test_translation_provider,
     translate_batch,
 )
 
@@ -109,6 +122,8 @@ _AGENT_VIEW_TIMEOUT_SEC = float(os.environ.get("BABATA_AGENT_VIEW_TIMEOUT_SEC", 
 _CLEAN_READ_TIMEOUT_SEC = float(os.environ.get("BABATA_CLEAN_READ_TIMEOUT_SEC", "120"))
 _CLEAN_READ_INPUT_MAX_CHARS = int(os.environ.get("BABATA_CLEAN_READ_INPUT_MAX_CHARS", "65000"))
 _AVATAR_CLAUDE_MODEL = os.environ.get("BABATA_SIDEBAR_AVATAR_MODEL", "claude-opus-4-7")
+_SIDEBAR_SESSION_FILE = STATE_DIR / f"{PROJECT}-sidebar-session.json"
+_PROACTIVE_SESSION_FILE = STATE_DIR / f"{PROJECT}-sidebar-proactive-session.json"
 
 _AGENT_VIEW_SOURCE_PROMPT = """\
 Source: babata sidebar avatar agent-view.
@@ -439,7 +454,8 @@ Source: babata sidebar (浏览器扩展, channel #3).
 跨 channel 共享 ~/cc-workspace/chat-archive/ 长期原始记录和 babata 记忆层.
 
 哲学三角:
-- 渗透: 每条消息附 page_context = {url, title, url_changed, tab_id, window_id, selection?} 轻量 metadata. \
+- 渗透: 每条消息附 page_context = {same_page?, url?, title?, url_changed, tab_id, window_id, selection?} 轻量 metadata. \
+首次/页面变化时带 url/title; 同页连续对话只带 same_page + tab/window 锚点. \
 你知道用户当前在哪儿、刚切了页没切; 正文 / DOM 需要时自己取.
 - 能力: 你能在用户当前 tab 跑 raw DOM/page primitive, 能推 suggest_prompts, \
 能用 mascot_speak 轻量提醒, 能纯文本 translate. 这些是能力, 不是固定 workflow.
@@ -497,28 +513,37 @@ Sidepanel UI 渲染常用 GFM markdown (代码块 / 表格 / 列表 / 图片 / �
 
 # ── CC instance ───────────────────────────────────────────────────────
 
-cc = make_engine(
-    state_file=STATE_DIR / f"{PROJECT}-sidebar-session.json",
-    source_prompt=_SIDEBAR_SOURCE_PROMPT,
-    mcp_servers={
+def _sidebar_mcp_servers() -> dict[str, Any]:
+    return {
         "sidebar": {
             "command": VENV_PYTHON,
             "args": [_SIDEBAR_MCP_SCRIPT],
         },
-    },
-)
+    }
+
+
+def _make_sidebar_engine(target: str | None = None):
+    return make_engine(
+        state_file=_SIDEBAR_SESSION_FILE,
+        source_prompt=_SIDEBAR_SOURCE_PROMPT,
+        mcp_servers=_sidebar_mcp_servers(),
+        engine=target,
+    )
+
+
+def _make_proactive_engine(target: str | None = None):
+    return make_engine(
+        state_file=_PROACTIVE_SESSION_FILE,
+        source_prompt=_PROACTIVE_PROMPT,
+        mcp_servers=_sidebar_mcp_servers(),
+        engine=target,
+    )
+
+
+cc = _make_sidebar_engine()
 
 # Proactive CC — V 切 tab 触发, 单独 session 文件不污染主 chat.
-proactive_cc = make_engine(
-    state_file=STATE_DIR / f"{PROJECT}-sidebar-proactive-session.json",
-    source_prompt=_PROACTIVE_PROMPT,
-    mcp_servers={
-        "sidebar": {
-            "command": VENV_PYTHON,
-            "args": [_SIDEBAR_MCP_SCRIPT],
-        },
-    },
-)
+proactive_cc = _make_proactive_engine()
 
 agent_view_cc = make_engine(
     state_file=STATE_DIR / f"{PROJECT}-sidebar-agent-view-session.json",
@@ -539,6 +564,89 @@ _cc_lock = asyncio.Lock()
 _proactive_lock = asyncio.Lock()
 _agent_view_lock = asyncio.Lock()
 _clean_read_lock = asyncio.Lock()
+
+
+def _engine_name_for(obj: Any, state_file: Path) -> str:
+    name = getattr(obj, "_babata_engine_name", None)
+    if isinstance(name, str) and name.strip():
+        return normalize_engine(name)
+    return engine_name(state_file)
+
+
+def _cli_available(configured: str | None, fallback: str) -> bool:
+    raw = (configured or fallback).strip()
+    if not raw:
+        return False
+    if "/" in raw:
+        return Path(raw).expanduser().is_file()
+    return shutil.which(raw) is not None
+
+
+def _engine_available(name: str) -> bool:
+    normalized = normalize_engine(name)
+    if normalized == "codex":
+        return _cli_available(
+            os.environ.get("BABATA_CODEX_CLI_PATH") or os.environ.get("CODEX_CLI_PATH"),
+            "codex",
+        )
+    return _cli_available(os.environ.get("CLAUDE_CLI_PATH"), "claude")
+
+
+def _cpu_status_payload() -> dict[str, Any]:
+    current = _engine_name_for(cc, _SIDEBAR_SESSION_FILE)
+    proactive = _engine_name_for(proactive_cc, _PROACTIVE_SESSION_FILE)
+    return {
+        "ok": True,
+        "cpu": current,
+        "label": engine_label(current),
+        "proactive_cpu": proactive,
+        "proactive_label": engine_label(proactive),
+        "choices": [
+            {
+                "name": key,
+                "label": label,
+                "current": key == current,
+                "available": _engine_available(key),
+            }
+            for label, key in engine_choices()
+        ],
+        "session_id": getattr(cc, "_session_id", None),
+    }
+
+
+async def _switch_sidebar_cpu(target: str) -> dict[str, Any]:
+    global cc, proactive_cc
+
+    target_name = normalize_engine(target)
+    current_name = _engine_name_for(cc, _SIDEBAR_SESSION_FILE)
+    proactive_name = _engine_name_for(proactive_cc, _PROACTIVE_SESSION_FILE)
+    if target_name == current_name and target_name == proactive_name:
+        payload = _cpu_status_payload()
+        payload["changed"] = False
+        payload["message"] = f"CPU 已经是 {engine_label(target_name)}"
+        return payload
+
+    if _cc_lock.locked() or _proactive_lock.locked():
+        raise RuntimeError("当前还有 sidebar turn 在跑，等结束后再切 CPU")
+
+    # Preserve each current engine's sid in the per-engine slot before replacing
+    # the top-level session_id with the target CPU's stored sid.
+    for obj in (cc, proactive_cc):
+        if hasattr(obj, "_record_sid"):
+            obj._record_sid(getattr(obj, "_session_id", None))
+
+    cc = _make_sidebar_engine(target_name)
+    proactive_cc = _make_proactive_engine(target_name)
+    persist_engine(_SIDEBAR_SESSION_FILE, target_name)
+    persist_engine(_PROACTIVE_SESSION_FILE, target_name)
+    for obj in (cc, proactive_cc):
+        if hasattr(obj, "_record_sid"):
+            obj._record_sid(getattr(obj, "_session_id", None))
+
+    payload = _cpu_status_payload()
+    payload["changed"] = True
+    payload["message"] = f"CPU: {engine_label(current_name)} → {engine_label(target_name)}"
+    return payload
 
 
 # ── SSE helpers ───────────────────────────────────────────────────────
@@ -579,6 +687,11 @@ def _preview_text(value: Any, max_chars: int) -> str:
 
 
 def _origin_allowed(origin: str) -> bool:
+    if (
+        origin.startswith("chrome-extension://")
+        and os.environ.get("BABATA_SIDEBAR_ALLOW_ANY_EXTENSION_ORIGIN", "1") != "0"
+    ):
+        return True
     return origin in _ALLOWED_ORIGINS
 
 
@@ -617,15 +730,16 @@ def _reject_untrusted_origin(
 def _format_page_context(ctx: Any) -> str:
     if not isinstance(ctx, dict):
         return ""
+    same_page = bool(ctx.get("same_page"))
     url = (ctx.get("url") or "").strip()
     title = (ctx.get("title") or "").strip()
     changed = bool(ctx.get("url_changed"))
     tab_id = ctx.get("tab_id")
     window_id = ctx.get("window_id")
-    if not url:
+    if not url and not same_page:
         return ""
-    parts = [f"url={url}"]
-    if title:
+    parts = ["same_page=yes"] if same_page else [f"url={url}"]
+    if title and not same_page:
         parts.append(f"title={title}")
     parts.append(f"url_changed={'yes' if changed else 'no'}")
     if isinstance(tab_id, int):
@@ -646,13 +760,57 @@ def _format_page_context(ctx: Any) -> str:
     return line
 
 
+_page_context_bindings: dict[str, dict[str, str]] = {}
+
+
+def _page_context_binding_key(ctx: Any) -> str:
+    if not isinstance(ctx, dict):
+        return ""
+    tab_id = ctx.get("tab_id")
+    window_id = ctx.get("window_id")
+    if isinstance(tab_id, int):
+        return f"tab:{tab_id}"
+    if isinstance(window_id, int):
+        return f"window:{window_id}"
+    return ""
+
+
+def _remember_page_context(ctx: Any) -> None:
+    if not isinstance(ctx, dict):
+        return
+    url = (ctx.get("url") or "").strip()
+    if not url:
+        return
+    key = _page_context_binding_key(ctx)
+    if not key:
+        return
+    _page_context_bindings[key] = {
+        "url": url,
+        "title": (ctx.get("title") or "").strip(),
+    }
+
+
+def _page_context_bound_meta(ctx: Any) -> tuple[str, str]:
+    if not isinstance(ctx, dict):
+        return "", ""
+    url = (ctx.get("url") or "").strip()
+    title = (ctx.get("title") or "").strip()
+    if url:
+        return url, title
+    key = _page_context_binding_key(ctx)
+    if not key:
+        return "", ""
+    bound = _page_context_bindings.get(key) or {}
+    return bound.get("url", ""), bound.get("title", "")
+
+
 def _format_page_memory(ctx: Any) -> str:
     """Grep events.jsonl for prior interactions on this url, return one summary line.
 
     第一次看页面返空, LLM 不会引用 page memory. 多次访问 surface 历史给 LLM."""
     if not isinstance(ctx, dict):
         return ""
-    url = (ctx.get("url") or "").strip()
+    url, _title = _page_context_bound_meta(ctx)
     if not url:
         return ""
     try:
@@ -765,17 +923,58 @@ async def handle_health(request: web.Request) -> web.Response:
     rejected = _reject_untrusted_origin(request, allow_no_origin=True)
     if rejected:
         return rejected
-    return web.json_response(
-        {
-            "ok": True,
-            "channel": "sidebar",
-            "host": _SIDEBAR_HOST,
-            "port": _SIDEBAR_PORT,
-            "session_id": cc._session_id,  # noqa: SLF001 — exposed deliberately
-            "sw_attached": bridge.sw_attached,
-        },
-        headers=_cors_headers(request),
-    )
+    payload = _cpu_status_payload()
+    payload.update({
+        "channel": "sidebar",
+        "host": _SIDEBAR_HOST,
+        "port": _SIDEBAR_PORT,
+        "sw_attached": bridge.sw_attached,
+    })
+    return web.json_response(payload, headers=_cors_headers(request))
+
+
+async def handle_cpu(request: web.Request) -> web.Response:
+    rejected = _reject_untrusted_origin(request, allow_no_origin=True)
+    if rejected:
+        return rejected
+    return web.json_response(_cpu_status_payload(), headers=_cors_headers(request))
+
+
+async def handle_cpu_switch(request: web.Request) -> web.Response:
+    rejected = _reject_untrusted_origin(request)
+    if rejected:
+        return rejected
+    try:
+        data = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response(
+            {"ok": False, "error": "invalid json"},
+            status=400,
+            headers=_cors_headers(request),
+        )
+
+    target = (data.get("cpu") or data.get("engine") or "").strip()
+    if not target:
+        return web.json_response(
+            {"ok": False, "error": "cpu required"},
+            status=400,
+            headers=_cors_headers(request),
+        )
+    try:
+        payload = await _switch_sidebar_cpu(target)
+    except ValueError as e:
+        return web.json_response(
+            {"ok": False, "error": str(e)},
+            status=400,
+            headers=_cors_headers(request),
+        )
+    except RuntimeError as e:
+        return web.json_response(
+            {"ok": False, "error": str(e)},
+            status=409,
+            headers=_cors_headers(request),
+        )
+    return web.json_response(payload, headers=_cors_headers(request))
 
 
 async def handle_options(request: web.Request) -> web.Response:
@@ -848,10 +1047,83 @@ async def handle_translate_trace(request: web.Request) -> web.Response:
     return web.json_response({"ok": True}, headers=_cors_headers(request))
 
 
+async def handle_settings(request: web.Request) -> web.Response:
+    rejected = _reject_untrusted_origin(request, allow_no_origin=request.method == "GET")
+    if rejected:
+        return rejected
+    if request.method == "GET":
+        return web.json_response(
+            {
+                "ok": True,
+                "translation_provider": get_translation_provider_settings(),
+            },
+            headers=_cors_headers(request),
+        )
+
+    try:
+        data = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400, headers=_cors_headers(request))
+    provider = data.get("translation_provider") if isinstance(data, dict) else None
+    if not isinstance(provider, dict):
+        return web.json_response(
+            {"ok": False, "error": "translation_provider required"},
+            status=400,
+            headers=_cors_headers(request),
+        )
+    try:
+        saved = save_translation_provider_settings(provider)
+    except Exception as e:
+        return web.json_response(
+            {"ok": False, "error": f"{type(e).__name__}: {e}"},
+            status=400,
+            headers=_cors_headers(request),
+        )
+    return web.json_response({"ok": True, "translation_provider": saved}, headers=_cors_headers(request))
+
+
+async def handle_translate_models(request: web.Request) -> web.Response:
+    rejected = _reject_untrusted_origin(request)
+    if rejected:
+        return rejected
+    try:
+        data = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400, headers=_cors_headers(request))
+    try:
+        models = await list_provider_models(data if isinstance(data, dict) else {})
+    except Exception as e:
+        return web.json_response(
+            {"ok": False, "error": f"{type(e).__name__}: {e}"},
+            status=400,
+            headers=_cors_headers(request),
+        )
+    return web.json_response({"ok": True, "models": models}, headers=_cors_headers(request))
+
+
+async def handle_translate_test(request: web.Request) -> web.Response:
+    rejected = _reject_untrusted_origin(request)
+    if rejected:
+        return rejected
+    try:
+        data = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400, headers=_cors_headers(request))
+    try:
+        result = await test_translation_provider(data if isinstance(data, dict) else {})
+    except Exception as e:
+        return web.json_response(
+            {"ok": False, "error": f"{type(e).__name__}: {e}"},
+            status=400,
+            headers=_cors_headers(request),
+        )
+    return web.json_response({"ok": True, **result}, headers=_cors_headers(request))
+
+
 async def handle_translate(request: web.Request) -> web.Response:
     """Content script POST batch 翻译. {site, target, batch:[{hash,text}]} →
-    {ok, results:[{hash, translated}]}. L2 cache hit 直接返, miss spawn
-    local Claude CLI one-shot (sidebar_translate.translate_batch 实现)."""
+    {ok, results:[{hash, translated}]}. L2 cache hit 直接返, miss 走
+    stateless translation provider (sidebar_translate.translate_batch 实现)."""
     rejected = _reject_untrusted_origin(request)
     if rejected:
         return rejected
@@ -1007,6 +1279,7 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
         return web.json_response({"error": "empty message"}, status=400, headers=_cors_headers(request))
 
     page_context = data.get("page_context")
+    _remember_page_context(page_context)
     page_ctx_line = _format_page_context(page_context)
     page_memory_line = _format_page_memory(page_context)
 
@@ -1021,8 +1294,7 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
     chat_url = ""
     chat_title = ""
     if isinstance(page_context, dict):
-        chat_url = (page_context.get("url") or "").strip()
-        chat_title = (page_context.get("title") or "").strip()
+        chat_url, chat_title = _page_context_bound_meta(page_context)
         if chat_url:
             sidebar_events.append(chat_url, "chat_turn", message=message[:500])
 
@@ -1238,12 +1510,18 @@ def build_app() -> web.Application:
     app = web.Application(client_max_size=_CHAT_CLIENT_MAX_SIZE)
     app.add_routes([
         web.get("/health", handle_health),
+        web.get("/cpu", handle_cpu),
+        web.get("/settings", handle_settings),
+        web.post("/settings", handle_settings),
         web.get("/history", handle_history),
         web.post("/history", handle_history),
         web.get("/ws", handle_ws),
+        web.post("/cpu", handle_cpu_switch),
         web.post("/chat", handle_chat),
         web.post("/proactive", handle_proactive),
         web.post("/clean_read", handle_clean_read),
+        web.post("/translate/models", handle_translate_models),
+        web.post("/translate/test", handle_translate_test),
         web.post("/translate", handle_translate),
         web.post("/translate_trace", handle_translate_trace),
         web.post("/attention", handle_attention),

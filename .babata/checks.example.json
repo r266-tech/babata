@@ -1,0 +1,16 @@
+{
+  "checks": [
+    {
+      "name": "python-tests",
+      "command": ".venv/bin/python -m pytest tests/test_turn_audit.py -q",
+      "when": ["python", "security", "hooks"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "compile-engines",
+      "command": ".venv/bin/python -m py_compile cc.py codex_engine.py turn_audit.py blocking_review.py",
+      "when": ["always"],
+      "timeout_seconds": 60
+    }
+  ]
+}

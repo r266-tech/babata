@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-from constants import PROJECT, STATE_DIR
+from constants import PROJECT, STATE_DIR, WEIXIN_DATA_DIR
 from engine import VENV_PYTHON, make_engine
 from media import transcribe_silk, understand_video
 from weixin_account import (
@@ -323,7 +323,7 @@ def _safe_split_partial(text: str) -> tuple[str, str]:
 
 # ── inbound media decode ─────────────────────────────────────────────
 
-_INBOUND_DIR = Path.home() / f".{PROJECT}" / "weixin" / "media" / "inbound"
+_INBOUND_DIR = WEIXIN_DATA_DIR / "media" / "inbound"
 
 
 # Per-user typing_ticket cache. Mirrors plugin's config-cache.ts: cache the

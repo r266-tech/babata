@@ -21,9 +21,16 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from blocking_review import (
+    blocking_review_max_rounds,
+    build_repair_prompt,
+    run_blocking_review,
+    unresolved_review_message,
+)
 from constants import HOOKS_DIR as _HOOKS_DIR
 from cc import CC, Event, Response, StreamCB, _memory_source_from_prompt
 from skill_evolve_nudge import notify_skill_evolve_turn
+from turn_audit import begin_turn, finish_turn, summarize_tool_use
 
 log = logging.getLogger(__name__)
 
@@ -465,6 +472,35 @@ def _extract_tool_result(item: dict[str, Any]) -> dict[str, Any]:
     return {"is_error": is_error, "text": ""}
 
 
+def _codex_tool_summary(name: str, item: dict[str, Any]) -> dict[str, Any]:
+    item_type = str(item.get("type") or "")
+    if item_type == "command_execution":
+        command = str(item.get("command") or "")
+        return summarize_tool_use(
+            name,
+            {"command": command} if command else {},
+        )
+
+    tool_input: dict[str, Any] = {}
+    for key in ("arguments", "input", "params"):
+        value = item.get(key)
+        if isinstance(value, dict):
+            tool_input.update(value)
+        elif isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+            except Exception:
+                tool_input[key] = value
+            else:
+                if isinstance(decoded, dict):
+                    tool_input.update(decoded)
+                else:
+                    tool_input[key] = value
+    if not tool_input and item_type:
+        tool_input["type"] = item_type
+    return summarize_tool_use(name, tool_input)
+
+
 class CodexEngine(CC):
     """One-shot Codex CLI backend with babata-compatible state."""
 
@@ -499,7 +535,74 @@ class CodexEngine(CC):
             return Response(content="会话已重置。", session_id="", cost=0.0)
 
         self._check_idle_reset()
-        return await self._run_codex(prompt, images, on_stream)
+        audit = begin_turn(
+            cpu="codex",
+            channel=self._channel_label(),
+            prompt=prompt,
+            session_id_before=self._session_id,
+            cwd=_codex_cwd(_memory_source_from_prompt(self._source_prompt)),
+            images_count=len(images or []),
+        )
+        try:
+            resp = await self._run_codex(prompt, images, on_stream)
+        except Exception as e:
+            finish_turn(audit, error=e)
+            raise
+        resp.audit = finish_turn(
+            audit,
+            response=resp,
+            tools=resp.tools,
+            tool_uses=resp.audit.get("tool_uses", []) if isinstance(resp.audit, dict) else [],
+        )
+        return await self._apply_blocking_review_gate(resp)
+
+    async def _apply_blocking_review_gate(self, resp: Response) -> Response:
+        channel = self._channel_label()
+        max_rounds = blocking_review_max_rounds()
+        round_index = 0
+        while True:
+            # run_blocking_review spawns a counterpart-CPU subprocess that can run
+            # for minutes; never block the single event loop on it.
+            review = await asyncio.to_thread(
+                run_blocking_review,
+                resp.audit,
+                cpu="codex",
+                channel=channel,
+                response_content=resp.content,
+                round_index=round_index,
+            )
+            audit = dict(resp.audit or {})
+            audit["blocking_review"] = review
+            resp.audit = audit
+            if review.get("status") != "needs_fix":
+                return resp
+            if round_index >= max_rounds:
+                resp.content = unresolved_review_message(resp.content, review)
+                return resp
+            resp = await self._run_internal_repair_turn(build_repair_prompt(review))
+            round_index += 1
+
+    async def _run_internal_repair_turn(self, prompt: str) -> Response:
+        audit = begin_turn(
+            cpu="codex",
+            channel=self._channel_label(),
+            prompt=prompt,
+            session_id_before=self._session_id,
+            cwd=_codex_cwd(_memory_source_from_prompt(self._source_prompt)),
+            images_count=0,
+        )
+        try:
+            resp = await self._run_codex(prompt, None, None)
+        except Exception as e:
+            finish_turn(audit, error=e)
+            raise
+        resp.audit = finish_turn(
+            audit,
+            response=resp,
+            tools=resp.tools,
+            tool_uses=resp.audit.get("tool_uses", []) if isinstance(resp.audit, dict) else [],
+        )
+        return resp
 
     async def _run_codex(
         self,
@@ -508,7 +611,12 @@ class CodexEngine(CC):
         on_stream: StreamCB | None,
     ) -> Response:
         image_dir = Path(tempfile.mkdtemp(prefix="babata-codex-images."))
-        last_file = Path(tempfile.mkstemp(prefix="babata-codex-last.", text=True)[1])
+        # Only the on-disk path is needed (codex writes the last message via -o);
+        # close the fd immediately or the long-lived session leaks one fd/turn
+        # and exhausts RLIMIT_NOFILE after a few hundred turns.
+        _last_fd, _last_path = tempfile.mkstemp(prefix="babata-codex-last.", text=True)
+        os.close(_last_fd)
+        last_file = Path(_last_path)
         image_paths: list[Path] = []
         try:
             for img in images or []:
@@ -548,6 +656,7 @@ class CodexEngine(CC):
                 session_id=sid,
                 cost=0.0,
                 tools=result["tools"],
+                audit={"tool_uses": result.get("tool_uses", [])},
                 model=os.environ.get("BABATA_CODEX_MODEL") or "codex",
                 input_tokens=result["usage"].get("input_tokens", 0),
                 output_tokens=result["usage"].get("output_tokens", 0),
@@ -691,6 +800,7 @@ class CodexEngine(CC):
         sid: str | None = None
         content = ""
         tools: list[str] = []
+        tool_uses: list[dict[str, Any]] = []
         running_tools: dict[str, str] = {}
         usage: dict[str, int] = {}
         failure_message: str | None = None
@@ -698,6 +808,13 @@ class CodexEngine(CC):
         def remember_tool(name: str) -> None:
             if name not in tools:
                 tools.append(name)
+
+        def remember_tool_use(name: str, item: dict[str, Any]) -> None:
+            if not name:
+                return
+            summary = _codex_tool_summary(name, item)
+            if summary not in tool_uses:
+                tool_uses.append(summary)
 
         try:
             stall_timeout = _codex_stall_timeout()
@@ -747,6 +864,7 @@ class CodexEngine(CC):
                     name = _extract_tool_name(item)
                     if name:
                         remember_tool(name)
+                        remember_tool_use(name, item)
                         item_id = _extract_tool_id(item)
                         if item_id:
                             running_tools[item_id] = name
@@ -802,6 +920,7 @@ class CodexEngine(CC):
                     "sid": sid,
                     "content": _split_error_content(content),
                     "tools": tools,
+                    "tool_uses": tool_uses,
                     "usage": usage,
                 }
             raise
@@ -815,10 +934,17 @@ class CodexEngine(CC):
                     "sid": sid,
                     "content": _split_error_content(content),
                     "tools": tools,
+                    "tool_uses": tool_uses,
                     "usage": usage,
                 }
             raise RuntimeError(error_text or f"codex exited {rc}")
-        return {"sid": sid, "content": content, "tools": tools, "usage": usage}
+        return {
+            "sid": sid,
+            "content": content,
+            "tools": tools,
+            "tool_uses": tool_uses,
+            "usage": usage,
+        }
 
     def _record_codex_turn(self, sid: str, prompt: str, content: str) -> None:
         state = self._load_state()

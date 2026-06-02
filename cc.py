@@ -28,11 +28,21 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
+from blocking_review import (
+    blocking_review_max_rounds,
+    build_repair_prompt,
+    run_blocking_review,
+    unresolved_review_message,
+)
 from claude_agent_sdk.types import (
     PermissionResultAllow,
     StreamEvent,
     ToolPermissionContext,
 )
+try:
+    from claude_agent_sdk.types import PermissionResultDeny
+except ImportError:  # pragma: no cover - old SDK compatibility
+    PermissionResultDeny = None
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +65,13 @@ from constants import (
     STATE_DIR as _STATE_DIR,
 )
 from skill_evolve_nudge import notify_skill_evolve_turn
+from turn_audit import (
+    TurnAudit,
+    begin_turn,
+    finish_turn,
+    should_block_for_permission,
+    summarize_tool_use,
+)
 
 VENV_PYTHON = str(Path(__file__).parent / ".venv" / "bin" / "python")
 
@@ -354,7 +371,7 @@ async def _always_allow(
     tool_name: str,
     tool_input: dict[str, Any],
     ctx: ToolPermissionContext,
-) -> PermissionResultAllow:
+) -> PermissionResultAllow | Any:
     """Auto-approve every SDK permission prompt.
 
     bypassPermissions mode alone doesn't cover CC's "protected paths"
@@ -363,6 +380,12 @@ async def _always_allow(
     prompt that reaches SDK = hung tool call.
 
     Personal Mac full-trust — blanket allow."""
+    block, reason = should_block_for_permission(tool_name, tool_input)
+    if block:
+        message = reason or "Blocked by babata deterministic guard"
+        if PermissionResultDeny is not None:
+            return PermissionResultDeny(message=message)
+        raise PermissionError(message)
     return PermissionResultAllow()
 
 # Tunables. These are storage / token-budget params, not "importance judgments" —
@@ -700,6 +723,32 @@ def _tool_result_text(content: Any) -> str:
     return str(content)
 
 
+def _extract_tool_uses(messages: list[Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, AssistantMessage):
+            continue
+        for block in getattr(msg, "content", []) or []:
+            if not isinstance(block, ToolUseBlock):
+                continue
+            out.append(summarize_tool_use(
+                getattr(block, "name", "") or "",
+                getattr(block, "input", {}) or {},
+            ))
+    return out
+
+
+def _ordered_tool_names(existing: list[str], tool_uses: list[dict[str, Any]]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for name in existing + [str(t.get("name") or "") for t in tool_uses]:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
 @dataclass
 class Response:
     content: str
@@ -717,6 +766,25 @@ class Response:
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    audit: dict[str, Any] | None = None
+    # True when the SDK ResultMessage reported an error result (rate-limit /
+    # max_turns / API 5xx). Surfaced so the bot can show the real failure
+    # instead of an empty bubble.
+    is_error: bool = False
+
+
+def _result_error_text(subtype: str | None, result: Any) -> str:
+    """Human-facing message for an error ResultMessage so V sees the real
+    failure (limit / max_turns / API error) rather than an empty answer."""
+    labels = {
+        "error_max_turns": "本轮触及最大工具调用轮次上限 (max_turns)",
+        "error_during_execution": "执行期间出错",
+        "error_max_tokens": "本轮触及输出 token 上限",
+    }
+    label = labels.get(subtype or "", subtype or "未知错误")
+    detail = str(result).strip() if result else ""
+    base = f"⚠️ 本轮未正常完成：{label}"
+    return f"{base}\n{detail}" if detail else base
 
 
 @dataclass
@@ -1203,6 +1271,35 @@ class CC:
 
     # ── query ────────────────────────────────────────────────────────
 
+    def _make_query_options(
+        self,
+        *,
+        user_prompt: str,
+        include_partial_messages: bool,
+    ) -> ClaudeAgentOptions:
+        opts = ClaudeAgentOptions(
+            max_turns=200,
+            permission_mode=_PERMISSION_MODE,
+            can_use_tool=_always_allow,  # auto-approve protected-path prompts that bypassPermissions still forwards
+            cwd=_DEFAULT_CWD,
+            cli_path=os.environ.get("CLAUDE_CLI_PATH"),
+            include_partial_messages=include_partial_messages,
+            system_prompt=self._source_prompt_with_memory(user_prompt=user_prompt),
+            model=self._model,
+            setting_sources=_SETTING_SOURCES,  # 默认 [] 隔离; BABATA_SHARED_CC=1 → ["user"] 共享
+            mcp_servers=self._mcp_servers,
+            # SDK 默认 max_buffer_size = 1MB; V 发 PDF/大图 或 resume 含 base64
+            # 附件的老 session 时, CLI stdout 单条 JSON message 就超了 → 报
+            # "JSON message exceeded maximum buffer size" → SDK 抛 Exception
+            # → cc.query 走 resume-fail 分支 → fire 🔴 + 🟢 让 V 以为在瞎切 session.
+            # 64MB 一次性 settle (单条 JSON message 理论上限 ~ context window
+            # 文本量级, 远不到 64MB). 2026-04-22 根因: babata-vvv.err 11:20 事件.
+            max_buffer_size=64 * 1024 * 1024,
+        )
+        if self._session_id:
+            opts.resume = self._session_id
+        return opts
+
     async def query(
         self,
         prompt: str,
@@ -1221,35 +1318,33 @@ class CC:
         # Override via BABATA_IDLE_RESET_MINUTES env (0 disables).
         self._check_idle_reset()
 
-        opts = ClaudeAgentOptions(
-            max_turns=200,
-            permission_mode=_PERMISSION_MODE,
-            can_use_tool=_always_allow,  # auto-approve protected-path prompts that bypassPermissions still forwards
+        audit = begin_turn(
+            cpu="claude",
+            channel=_channel_label_from_state_file(self._state_file),
+            prompt=prompt,
+            session_id_before=self._session_id,
             cwd=_DEFAULT_CWD,
-            cli_path=os.environ.get("CLAUDE_CLI_PATH"),
-            include_partial_messages=on_stream is not None,
-            system_prompt=self._source_prompt_with_memory(user_prompt=prompt),
-            model=self._model,
-            setting_sources=_SETTING_SOURCES,  # 默认 [] 隔离; BABATA_SHARED_CC=1 → ["user"] 共享
-            mcp_servers=self._mcp_servers,
-            # SDK 默认 max_buffer_size = 1MB; V 发 PDF/大图 或 resume 含 base64
-            # 附件的老 session 时, CLI stdout 单条 JSON message 就超了 → 报
-            # "JSON message exceeded maximum buffer size" → SDK 抛 Exception
-            # → cc.query 走 resume-fail 分支 → fire 🔴 + 🟢 让 V 以为在瞎切 session.
-            # 64MB 一次性 settle (单条 JSON message 理论上限 ~ context window
-            # 文本量级, 远不到 64MB). 2026-04-22 根因: babata-vvv.err 11:20 事件.
-            max_buffer_size=64 * 1024 * 1024,
+            images_count=len(images or []),
         )
 
-        if self._session_id:
-            opts.resume = self._session_id
+        opts = self._make_query_options(
+            user_prompt=prompt,
+            include_partial_messages=on_stream is not None,
+        )
 
         try:
             resp = await self._run(opts, prompt, images, on_stream)
             self._record_memory_reflex_answer(resp.content)
-            return resp
+            resp.audit = finish_turn(
+                audit,
+                response=resp,
+                tools=resp.tools,
+                tool_uses=resp.audit.get("tool_uses", []) if isinstance(resp.audit, dict) else [],
+            )
+            return await self._apply_blocking_review_gate(resp, on_stream=on_stream)
         except Exception as e:
             if not self._session_id:
+                finish_turn(audit, error=e)
                 raise
             log.warning("Session resume failed (%s), injecting recent history", e)
             # Resume failed → old sid is effectively ending (SDK will spawn a
@@ -1265,10 +1360,80 @@ class CC:
                 note = f"⚠️ 会话重置 ({type(e).__name__}), 已从归档注入最近 {_RESUME_INJECT_PAIRS} 轮"
             else:
                 note = f"⚠️ 会话重置 ({type(e).__name__}), 历史归档也没找到"
-            resp = await self._run(opts, prompt, images, on_stream)
+            try:
+                resp = await self._run(opts, prompt, images, on_stream)
+            except Exception as retry_error:
+                finish_turn(audit, error=retry_error)
+                raise
             self._record_memory_reflex_answer(resp.content)
             resp.resume_note = note
-            return resp
+            resp.audit = finish_turn(
+                audit,
+                response=resp,
+                tools=resp.tools,
+                tool_uses=resp.audit.get("tool_uses", []) if isinstance(resp.audit, dict) else [],
+            )
+            return await self._apply_blocking_review_gate(resp, on_stream=on_stream)
+
+    async def _apply_blocking_review_gate(
+        self,
+        resp: Response,
+        *,
+        on_stream: StreamCB | None,
+    ) -> Response:
+        del on_stream
+        channel = _channel_label_from_state_file(self._state_file)
+        max_rounds = blocking_review_max_rounds()
+        round_index = 0
+        while True:
+            # Counterpart review spawns a subprocess that can run for minutes;
+            # offload it so the single event loop keeps servicing polling,
+            # heartbeats, the bridge, reactions, and cut-ins.
+            review = await asyncio.to_thread(
+                run_blocking_review,
+                resp.audit,
+                cpu="claude",
+                channel=channel,
+                response_content=resp.content,
+                round_index=round_index,
+            )
+            audit = dict(resp.audit or {})
+            audit["blocking_review"] = review
+            resp.audit = audit
+            if review.get("status") != "needs_fix":
+                return resp
+            if round_index >= max_rounds:
+                resp.content = unresolved_review_message(resp.content, review)
+                return resp
+            repair_prompt = build_repair_prompt(review)
+            resp = await self._run_internal_repair_turn(repair_prompt)
+            round_index += 1
+
+    async def _run_internal_repair_turn(self, prompt: str) -> Response:
+        audit = begin_turn(
+            cpu="claude",
+            channel=_channel_label_from_state_file(self._state_file),
+            prompt=prompt,
+            session_id_before=self._session_id,
+            cwd=_DEFAULT_CWD,
+            images_count=0,
+        )
+        opts = self._make_query_options(
+            user_prompt=prompt,
+            include_partial_messages=False,
+        )
+        try:
+            resp = await self._run(opts, prompt, None, None)
+        except Exception as e:
+            finish_turn(audit, error=e)
+            raise
+        resp.audit = finish_turn(
+            audit,
+            response=resp,
+            tools=resp.tools,
+            tool_uses=resp.audit.get("tool_uses", []) if isinstance(resp.audit, dict) else [],
+        )
+        return resp
 
     async def _run(
         self,
@@ -1344,6 +1509,9 @@ class CC:
         finally:
             await client.disconnect()
 
+        tool_uses = _extract_tool_uses(messages)
+        tools_seen = _ordered_tool_names(tools_seen, tool_uses)
+
         content = ""
         cost = 0.0
         sid = None
@@ -1351,6 +1519,8 @@ class CC:
         context_window: int | None = None
         max_output_tokens: int | None = None
         in_tok = out_tok = cache_r = cache_c = 0
+        is_error = False
+        err_subtype: str | None = None
 
         for msg in messages:
             if isinstance(msg, ResultMessage):
@@ -1359,6 +1529,8 @@ class CC:
                 result = getattr(msg, "result", None)
                 if result:
                     content = str(result).strip()
+                is_error = bool(getattr(msg, "is_error", False))
+                err_subtype = getattr(msg, "subtype", None)
                 # model_usage shape: {"claude-opus-4-N[1m]": {inputTokens, outputTokens,
                 # cacheReadInputTokens, cacheCreationInputTokens, contextWindow,
                 # maxOutputTokens, ...}}. First key = the model CC actually ran.
@@ -1385,6 +1557,9 @@ class CC:
 
         if not content and tools_seen:
             content = "(done)"
+
+        if is_error and not content:
+            content = _result_error_text(err_subtype, None)
 
         if sid:
             # Detect session boundary: SDK starts a fresh sid on first turn,
@@ -1416,6 +1591,8 @@ class CC:
             output_tokens=out_tok,
             cache_read_tokens=cache_r,
             cache_creation_tokens=cache_c,
+            audit={"tool_uses": tool_uses},
+            is_error=is_error,
         )
 
 
@@ -1455,6 +1632,8 @@ class LiveSession(CC):
         self._resume_note_next: str | None = None
         self._resume_recovered = False
         self._started_with_resume = False
+        self._pending_audits: list[TurnAudit | None] = []
+        self._blocking_review_round = 0
 
     @property
     def session_id(self) -> str | None:
@@ -1523,6 +1702,7 @@ class LiveSession(CC):
         async with self._connect_lock:
             super().reset()
             self._pending_replay.clear()
+            self._finish_pending_audits("live session reset before turn finished")
             self._resume_note_next = None
             self._resume_recovered = False
             await self._stop_client_locked(fire_session_end=False)
@@ -1538,6 +1718,7 @@ class LiveSession(CC):
             if not ok:
                 return False
             self._pending_replay.clear()
+            self._finish_pending_audits("live session resume before turn finished")
             self._resume_note_next = None
             self._resume_recovered = False
             await self._stop_client_locked(fire_session_end=False)
@@ -1549,7 +1730,34 @@ class LiveSession(CC):
         """Enqueue one user message without blocking the PTB update handler."""
         if self._closed or self._client is None:
             raise RuntimeError("LiveSession is not connected")
+        if not self._pending_audits:
+            self._blocking_review_round = 0
+        self._pending_audits.append(begin_turn(
+            cpu="claude",
+            channel=_channel_label_from_state_file(self._state_file),
+            prompt=prompt,
+            session_id_before=self._session_id,
+            cwd=_DEFAULT_CWD,
+            images_count=len(images or []),
+        ))
         self._inbox.put_nowait(self._user_message(prompt, images))
+
+    def _enqueue_internal_repair(self, prompt: str) -> None:
+        self._pending_audits.append(begin_turn(
+            cpu="claude",
+            channel=_channel_label_from_state_file(self._state_file),
+            prompt=prompt,
+            session_id_before=self._session_id,
+            cwd=_DEFAULT_CWD,
+            images_count=0,
+        ))
+        self._inbox.put_nowait(self._user_message(prompt, None))
+
+    def _finish_pending_audits(self, reason: str) -> None:
+        pending = self._pending_audits
+        self._pending_audits = []
+        for audit in pending:
+            finish_turn(audit, error=RuntimeError(reason))
 
     async def interrupt(self) -> None:
         if not self._client:
@@ -1589,12 +1797,15 @@ class LiveSession(CC):
                             tools_seen = []
                             self._pending_replay.clear()
                             self._started_with_resume = False
+                            repair_queued = await self._handle_live_blocking_review(response)
                             if changed:
                                 yield Event(
                                     kind="session_changed",
                                     old_sid=changed[0],
                                     new_sid=changed[1],
                                 )
+                            if repair_queued:
+                                continue
                             yield Event(kind="turn_end", response=response)
                             continue
 
@@ -1635,6 +1846,13 @@ class LiveSession(CC):
                         tools_seen = []
                         continue
                     log.warning("LiveSession event stream failed: %s", e)
+                    audit = self._pending_audits.pop(0) if self._pending_audits else None
+                    finish_turn(
+                        audit,
+                        error=e,
+                        tools=tools_seen,
+                        tool_uses=_extract_tool_uses(messages),
+                    )
                     # P1.2: tear down dead client/queue so future submit() raises
                     # RuntimeError instead of silently enqueueing into a dead inbox.
                     # ChannelWorker._consume_events supervises and reconnects.
@@ -1680,6 +1898,7 @@ class LiveSession(CC):
             with suppress(asyncio.CancelledError, Exception):
                 await client.disconnect()
         self._inbox = asyncio.Queue()
+        self._finish_pending_audits("live session stopped before turn finished")
 
         if fire_session_end and self._session_id:
             self._fire_hook(_HOOKS_DIR, "session-end.sh", self._session_id)
@@ -1787,6 +2006,7 @@ class LiveSession(CC):
                 with suppress(asyncio.CancelledError, Exception):
                     await client.disconnect()
             self._inbox = asyncio.Queue()
+            self._finish_pending_audits("live session error before turn finished")
 
     async def _stop_old_client_for_reconnect(
         self,
@@ -1872,6 +2092,8 @@ class LiveSession(CC):
         tools_seen: list[str],
     ) -> tuple[Response, tuple[str | None, str] | None]:
         response = self._response_from_messages(messages, tools_seen)
+        tool_uses = _extract_tool_uses(messages)
+        response.tools = _ordered_tool_names(response.tools, tool_uses)
         if self._resume_note_next:
             response.resume_note = self._resume_note_next
             self._resume_note_next = None
@@ -1891,9 +2113,40 @@ class LiveSession(CC):
                 source=_memory_source_from_prompt(self._source_prompt),
                 channel=_channel_label_from_state_file(self._state_file),
                 state_file=self._state_file,
-                metadata={"tools": tools_seen, "engine": "claude-live"},
+                metadata={"tools": response.tools, "engine": "claude-live"},
             )
+        audit = self._pending_audits.pop(0) if self._pending_audits else None
+        response.audit = finish_turn(
+            audit,
+            response=response,
+            tools=response.tools,
+            tool_uses=tool_uses,
+        )
         return response, changed
+
+    async def _handle_live_blocking_review(self, response: Response) -> bool:
+        # Offload the counterpart-review subprocess (minutes-long) off the loop.
+        review = await asyncio.to_thread(
+            run_blocking_review,
+            response.audit,
+            cpu="claude",
+            channel=_channel_label_from_state_file(self._state_file),
+            response_content=response.content,
+            round_index=self._blocking_review_round,
+        )
+        audit = dict(response.audit or {})
+        audit["blocking_review"] = review
+        response.audit = audit
+        if review.get("status") != "needs_fix":
+            self._blocking_review_round = 0
+            return False
+        if self._blocking_review_round >= blocking_review_max_rounds():
+            response.content = unresolved_review_message(response.content, review)
+            self._blocking_review_round = 0
+            return False
+        self._blocking_review_round += 1
+        self._enqueue_internal_repair(build_repair_prompt(review))
+        return True
 
     @staticmethod
     def _response_from_messages(
@@ -1908,6 +2161,8 @@ class LiveSession(CC):
         max_output_tokens: int | None = None
         in_tok = out_tok = cache_r = cache_c = 0
 
+        is_error = False
+        err_subtype: str | None = None
         for msg in messages:
             if isinstance(msg, ResultMessage):
                 cost = getattr(msg, "total_cost_usd", 0.0) or 0.0
@@ -1915,6 +2170,8 @@ class LiveSession(CC):
                 result = getattr(msg, "result", None)
                 if result:
                     content = str(result).strip()
+                is_error = bool(getattr(msg, "is_error", False))
+                err_subtype = getattr(msg, "subtype", None)
                 mu = getattr(msg, "model_usage", None) or {}
                 if mu:
                     model = next(iter(mu.keys()))
@@ -1939,6 +2196,9 @@ class LiveSession(CC):
         if not content and tools_seen:
             content = "(done)"
 
+        if is_error and not content:
+            content = _result_error_text(err_subtype, None)
+
         return Response(
             content=content,
             session_id=sid,
@@ -1951,4 +2211,5 @@ class LiveSession(CC):
             output_tokens=out_tok,
             cache_read_tokens=cache_r,
             cache_creation_tokens=cache_c,
+            is_error=is_error,
         )

@@ -29,6 +29,38 @@ STATE_DIR = Path(os.environ.get(
 ))
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _state_child_dir(env_name: str, child: str, legacy: Path | None = None) -> Path:
+    """Resolve mutable data roots under STATE_DIR, with legacy fallback.
+
+    Explicit env wins. Otherwise new installs use STATE_DIR/<child>. Existing
+    legacy installs keep reading their old path until migration creates the new
+    target, which avoids a silent "no accounts/history" startup.
+    """
+    configured = os.environ.get(env_name, "").strip()
+    if configured:
+        path = Path(configured).expanduser()
+    else:
+        target = STATE_DIR / child
+        if legacy and legacy.exists() and not target.exists():
+            path = legacy.resolve() if legacy.is_symlink() else legacy
+        else:
+            path = target
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+SIDEBAR_DATA_DIR = _state_child_dir(
+    "BABATA_SIDEBAR_DATA_DIR",
+    "sidebar",
+    Path.home() / ".babata" / "sidebar",
+)
+WEIXIN_DATA_DIR = _state_child_dir(
+    "BABATA_WEIXIN_DIR",
+    "weixin",
+    Path.home() / ".babata" / "weixin",
+)
+
 # Per-instance namespace. Empty BABATA_INSTANCE (env name kept verbatim for
 # backward compat) → just PROJECT. Non-empty → PROJECT-<inst> so multiple
 # bots share one venv + code but isolated state/socket.
