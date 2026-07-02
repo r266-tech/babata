@@ -416,10 +416,9 @@ def _memory_inject_timeout() -> float:
 
 
 def _render_babata_memory_context_event(
-    source_prompt: str,
+    source: str,
     user_prompt: str | None = None,
 ) -> tuple[str, str | None]:
-    source = memory_source_from_prompt(source_prompt)
     return render_babata_memory_context_event(
         enabled=_cc_memory_inject_enabled(),
         source=source,
@@ -604,9 +603,11 @@ class CC:
         source_prompt: str,
         mcp_servers: dict[str, Any] | None = None,
         model: str | None = None,
+        memory_source: str | None = None,
     ) -> None:
         self._state_file = state_file
         self._source_prompt = source_prompt
+        self._memory_source = memory_source or memory_source_from_prompt(source_prompt)
         self._mcp_servers = mcp_servers or {}
         self._model = model
         self._session_id: str | None = self._load_state().get("session_id")
@@ -619,7 +620,7 @@ class CC:
         user_prompt: str | None = None,
     ) -> str:
         parts = [self._source_prompt]
-        memory_context, event_id = _render_babata_memory_context_event(self._source_prompt, user_prompt)
+        memory_context, event_id = _render_babata_memory_context_event(self._memory_source, user_prompt)
         self._memory_reflex_event_id = event_id
         if memory_context:
             parts.append(memory_context)
@@ -1369,7 +1370,7 @@ class CC:
             notify_skill_evolve_turn(
                 session_id=sid,
                 cpu="claude",
-                source=memory_source_from_prompt(self._source_prompt),
+                source=self._memory_source,
                 channel=_channel_label_from_state_file(self._state_file),
                 state_file=self._state_file,
                 metadata={"tools": tools_seen, "engine": "claude"},
@@ -1411,12 +1412,14 @@ class LiveSession(CC):
         source_prompt: str,
         mcp_servers: dict[str, Any] | None = None,
         model: str | None = None,
+        memory_source: str | None = None,
     ) -> None:
         super().__init__(
             state_file=state_file,
             source_prompt=source_prompt,
             mcp_servers=mcp_servers,
             model=model,
+            memory_source=memory_source,
         )
         self._client: ClaudeSDKClient | None = None
         self._inbox: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
@@ -1902,7 +1905,7 @@ class LiveSession(CC):
             notify_skill_evolve_turn(
                 session_id=sid,
                 cpu="claude",
-                source=memory_source_from_prompt(self._source_prompt),
+                source=self._memory_source,
                 channel=_channel_label_from_state_file(self._state_file),
                 state_file=self._state_file,
                 metadata={"tools": response.tools, "engine": "claude-live"},

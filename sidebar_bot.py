@@ -468,6 +468,7 @@ def _make_sidebar_engine(target: str | None = None):
     return make_engine(
         state_file=_SIDEBAR_SESSION_FILE,
         source_prompt=_SIDEBAR_SOURCE_PROMPT,
+        memory_source="sidebar",
         mcp_servers=_sidebar_mcp_servers(),
         engine=target,
     )
@@ -477,6 +478,7 @@ def _make_proactive_engine(target: str | None = None):
     return make_engine(
         state_file=_PROACTIVE_SESSION_FILE,
         source_prompt=_PROACTIVE_PROMPT,
+        memory_source="sidebar",
         mcp_servers=_sidebar_mcp_servers(),
         engine=target,
     )
@@ -490,6 +492,7 @@ proactive_cc = _make_proactive_engine()
 agent_view_cc = make_engine(
     state_file=STATE_DIR / f"{PROJECT}-sidebar-agent-view-session.json",
     source_prompt=_AGENT_VIEW_SOURCE_PROMPT,
+    memory_source="sidebar",
     engine="claude",
     model=_AVATAR_CLAUDE_MODEL,
 )
@@ -497,6 +500,7 @@ agent_view_cc = make_engine(
 clean_read_cc = make_engine(
     state_file=STATE_DIR / f"{PROJECT}-sidebar-clean-read-session.json",
     source_prompt=_CLEAN_READ_SOURCE_PROMPT,
+    memory_source="sidebar",
     engine="claude",
     model=_AVATAR_CLAUDE_MODEL,
 )

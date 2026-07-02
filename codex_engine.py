@@ -300,11 +300,13 @@ class CodexEngine(CC):
         state_file: Path,
         source_prompt: str,
         mcp_servers: dict[str, Any] | None = None,
+        memory_source: str | None = None,
     ) -> None:
         super().__init__(
             state_file=state_file,
             source_prompt=source_prompt,
             mcp_servers=mcp_servers,
+            memory_source=memory_source,
         )
         self._memory_reflex_event_id: str | None = None
 
@@ -324,7 +326,7 @@ class CodexEngine(CC):
             channel=self._channel_label(),
             prompt=prompt,
             session_id_before=self._session_id,
-            cwd=_codex_cwd(memory_source_from_prompt(self._source_prompt)),
+            cwd=_codex_cwd(self._memory_source),
             images_count=len(images or []),
         )
         try:
@@ -372,7 +374,7 @@ class CodexEngine(CC):
             channel=self._channel_label(),
             prompt=prompt,
             session_id_before=self._session_id,
-            cwd=_codex_cwd(memory_source_from_prompt(self._source_prompt)),
+            cwd=_codex_cwd(self._memory_source),
             images_count=0,
         )
         try:
@@ -427,7 +429,7 @@ class CodexEngine(CC):
                 notify_skill_evolve_turn(
                     session_id=sid,
                     cpu="codex",
-                    source=memory_source_from_prompt(self._source_prompt),
+                    source=self._memory_source,
                     channel=self._channel_label(),
                     state_file=self._state_file,
                     metadata={"tools": result["tools"], "engine": "codex"},
@@ -462,7 +464,7 @@ class CodexEngine(CC):
         last_file: Path,
     ) -> tuple[list[str], str, bool]:
         memory_context = ""
-        source = memory_source_from_prompt(self._source_prompt)
+        source = self._memory_source
         should_inject_memory = self._should_inject_codex_memory()
         if should_inject_memory:
             memory_context, event_id = _render_babata_memory_context_event(
@@ -846,11 +848,13 @@ class CodexLiveSession(CodexEngine):
         state_file: Path,
         source_prompt: str,
         mcp_servers: dict[str, Any] | None = None,
+        memory_source: str | None = None,
     ) -> None:
         super().__init__(
             state_file=state_file,
             source_prompt=source_prompt,
             mcp_servers=mcp_servers,
+            memory_source=memory_source,
         )
         self._events: asyncio.Queue[Event | None] = asyncio.Queue()
         self._turn_task: asyncio.Task[None] | None = None

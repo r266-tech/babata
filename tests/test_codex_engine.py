@@ -173,6 +173,29 @@ def test_codex_engine_injects_babata_memory_once_per_session(monkeypatch, tmp_pa
     assert reflex_sources == ["unknown"]
 
 
+def test_codex_engine_uses_explicit_memory_source(monkeypatch, tmp_path):
+    monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "1")
+    seen_sources: list[str | None] = []
+    monkeypatch.setattr(
+        codex_engine,
+        "_render_babata_memory_context_event",
+        lambda source=None, user_prompt=None: (
+            seen_sources.append(source) or "<memory-context>shared</memory-context>",
+            None,
+        ),
+    )
+    session = codex_engine.CodexEngine(
+        state_file=tmp_path / "session.json",
+        source_prompt="Source: plain text can change.",
+        memory_source="sidebar",
+    )
+
+    _cmd, _prompt_stdin, memory_injected = session._build_command("hello", [], tmp_path / "last.txt")
+
+    assert memory_injected is True
+    assert seen_sources == ["sidebar"]
+
+
 def test_codex_engine_maps_channel_prompt_to_memory_source():
     assert memory_runtime.memory_source_from_prompt("Source: Telegram. x") == "tg"
     assert memory_runtime.memory_source_from_prompt("Source: WeChat. x") == "wechat"
@@ -446,6 +469,17 @@ def test_engine_state_overrides_env_and_keeps_engine_specific_sid(monkeypatch, t
 
     assert isinstance(made, codex_engine.CodexLiveSession)
     assert made._session_id == "codex-sid"
+    assert made._memory_source == "unknown"
+
+
+def test_make_engine_accepts_explicit_memory_source(tmp_path):
+    made = engine.make_engine(
+        state_file=tmp_path / "session.json",
+        source_prompt="Source: wording can change.",
+        memory_source="tg",
+    )
+
+    assert made._memory_source == "tg"
 
 
 def test_codex_without_engine_specific_sid_does_not_resume_claude_sid(tmp_path):

@@ -104,6 +104,7 @@ _WX_SOURCE_PROMPT = (
 cc = make_engine(
     state_file=STATE_DIR / f"{PROJECT}-weixin-session.json",
     source_prompt=_WX_SOURCE_PROMPT,
+    memory_source="wechat",
     mcp_servers={
         "weixin": {
             "command": VENV_PYTHON,

@@ -438,6 +438,7 @@ def _make_tg_engine(target: str | None = None) -> LiveSession:
     return make_engine(
         state_file=SESSION_FILE,
         source_prompt=_TG_SOURCE_PROMPT,
+        memory_source="tg",
         mcp_servers=_tg_mcp_servers(),
         live=True,
         engine=target,
