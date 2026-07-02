@@ -321,6 +321,42 @@ def test_send_wx_bubble_reports_permanent_failure(monkeypatch):
     asyncio.run(run())
 
 
+def test_wx_stream_coalescer_sends_marked_bubbles_then_final_tail():
+    sent: list[str] = []
+
+    async def send_bubble(text):
+        sent.append(text)
+        return wb.WxBubbleSendResult(sent_any=bool(text), ok=True)
+
+    async def run():
+        coalescer = wb.WxStreamCoalescer(send_bubble)
+
+        await coalescer.on_stream(None, None, "first\n\n\nsecond partial", None)
+        assert sent == ["first"]
+        assert coalescer.sent_any is True
+        assert coalescer.had_send_failure is False
+
+        await coalescer.drain(allow_hard_cut=True)
+        assert sent == ["first", "second partial"]
+
+    asyncio.run(run())
+
+
+def test_wx_stream_coalescer_tracks_send_failure():
+    async def send_bubble(_text):
+        return wb.WxBubbleSendResult(sent_any=False, ok=False)
+
+    async def run():
+        coalescer = wb.WxStreamCoalescer(send_bubble)
+
+        await coalescer.on_stream(None, None, "broken\n\n\n", None)
+
+        assert coalescer.sent_any is False
+        assert coalescer.had_send_failure is True
+
+    asyncio.run(run())
+
+
 # ── strip_markdown: fenced code body must survive ───────────────────
 
 

@@ -361,6 +361,76 @@ def _safe_split_partial(text: str) -> tuple[str, str]:
     return "", text
 
 
+class WxStreamCoalescer:
+    def __init__(self, send_bubble: Any) -> None:
+        self._send_bubble = send_bubble
+        self._buf: list[str] = []
+        self._last_flush: float | None = None
+        self._flush_lock = asyncio.Lock()
+        self.sent_any = False
+        self.had_send_failure = False
+
+    def reset_for_replay(self) -> None:
+        self._buf.clear()
+        self._last_flush = None
+        self.sent_any = False
+        self.had_send_failure = False
+
+    async def send_bubble(self, text: str) -> bool:
+        result = await self._send_bubble(text)
+        self.sent_any = self.sent_any or result.sent_any
+        self.had_send_failure = self.had_send_failure or not result.ok
+        return result.ok
+
+    async def drain(self, allow_hard_cut: bool) -> None:
+        async with self._flush_lock:
+            while True:
+                if not self._buf:
+                    break
+                raw = "".join(self._buf)
+                self._buf.clear()
+                parts = re.split(r"\n{3,}", raw)
+                tail = parts.pop()
+                for part in parts:
+                    await self.send_bubble(part)
+                if not tail:
+                    break
+                head, hold = _safe_split_partial(tail)
+                if head:
+                    await self.send_bubble(head)
+                    if hold:
+                        self._buf.append(hold)
+                        if allow_hard_cut:
+                            continue
+                    break
+                if allow_hard_cut:
+                    await self.send_bubble(tail)
+                    break
+                self._buf.append(tail)
+                break
+            self._last_flush = time.monotonic()
+
+    async def on_stream(
+        self,
+        _tool_name: Any,
+        _tool_input: Any,
+        text_chunk: str | None,
+        _tool_result: Any,
+    ) -> None:
+        if not text_chunk:
+            return
+        if self._last_flush is None:
+            self._last_flush = time.monotonic()
+        self._buf.append(text_chunk)
+        raw = "".join(self._buf)
+        if "\n\n\n" in raw:
+            await self.drain(allow_hard_cut=False)
+        elif len(raw) >= _STREAM_HARD_MAX:
+            await self.drain(allow_hard_cut=True)
+        elif time.monotonic() - self._last_flush >= _STREAM_FLUSH_IDLE_S:
+            await self.drain(allow_hard_cut=False)
+
+
 # ── inbound media decode ─────────────────────────────────────────────
 
 _INBOUND_DIR = WEIXIN_DATA_DIR / "media" / "inbound"
@@ -775,92 +845,15 @@ async def _process_combined_msgs(
     # safety nets for when the LLM hangs mid-bubble or forgets to mark; they
     # split at safe boundaries (paragraph / line / sentence-end) rather than
     # mid-word, and only hard-cut at end-of-stream when nothing safe exists.
-    buf: list[str] = []
-    # last_flush is initialized lazily on the first chunk so cc.query startup
-    # latency (often >3s before the first token) doesn't trip idle immediately
-    # and ship the first chunk as a single-character bubble.
-    last_flush: float | None = None
-    flush_lock = asyncio.Lock()
-    sent_any = False
-    had_send_failure = False
+    async def send_bubble(text: str) -> WxBubbleSendResult:
+        return await _send_wx_bubble(client, from_user, ctx_token, text)
 
-    async def _send_bubble(text: str) -> bool:
-        """Strip markdown (env-gated) + 4000-char hard-cap chunk + send.
-        Retries once on transient failure; permanent failure flips
-        had_send_failure so turn-end can rebroadcast resp.content."""
-        nonlocal sent_any, had_send_failure
-        result = await _send_wx_bubble(client, from_user, ctx_token, text)
-        sent_any = sent_any or result.sent_any
-        had_send_failure = had_send_failure or not result.ok
-        return result.ok
-
-    async def _drain(allow_hard_cut: bool) -> None:
-        """Drain buf. Always ships any complete \\n\\n\\n-bounded bubbles.
-        For the trailing partial: split at the latest safe boundary
-        (paragraph > line > sentence). If no boundary exists, hold it
-        unless allow_hard_cut=True (used at hard-cap / end-of-stream when
-        holding indefinitely is worse than a clean cut).
-
-        allow_hard_cut=True iterates until buf is empty: a single boundary
-        split would otherwise hold the suffix back in buf and the suffix
-        is permanently lost (no further drain after end-of-stream). Inner
-        loop ships head, then re-feeds hold so it gets its own boundary
-        scan / hard-cut treatment.
-
-        last_flush is reset on every call regardless of ship outcome:
-        otherwise an idle drain that finds no safe boundary keeps holding
-        on every subsequent chunk (last_flush still stale → idle re-trips).
-        """
-        nonlocal last_flush
-        async with flush_lock:
-            while True:
-                if not buf:
-                    break
-                raw = "".join(buf)
-                buf.clear()
-                parts = re.split(r"\n{3,}", raw)
-                tail = parts.pop()
-                for p in parts:
-                    await _send_bubble(p)
-                if not tail:
-                    break
-                head, hold = _safe_split_partial(tail)
-                if head:
-                    await _send_bubble(head)
-                    if hold:
-                        buf.append(hold)
-                        if allow_hard_cut:
-                            continue  # re-drain the suffix
-                    break
-                if allow_hard_cut:
-                    await _send_bubble(tail)
-                    break
-                buf.append(tail)  # hold partial, no safe boundary yet
-                break
-            last_flush = time.monotonic()
-
-    async def _on_stream(tool_name, tool_input, text_chunk, tool_result) -> None:
-        nonlocal last_flush
-        if not text_chunk:
-            return
-        if last_flush is None:
-            last_flush = time.monotonic()
-        buf.append(text_chunk)
-        raw = "".join(buf)
-        if "\n\n\n" in raw:
-            await _drain(allow_hard_cut=False)
-        elif len(raw) >= _STREAM_HARD_MAX:
-            await _drain(allow_hard_cut=True)
-        elif time.monotonic() - last_flush >= _STREAM_FLUSH_IDLE_S:
-            await _drain(allow_hard_cut=False)
+    coalescer = WxStreamCoalescer(send_bubble)
 
     resp = None
     for attempt in range(_WX_MAX_TURN_RECOVERY_ATTEMPTS + 1):
         if attempt:
-            buf.clear()
-            last_flush = None
-            sent_any = False
-            had_send_failure = False
+            coalescer.reset_for_replay()
             log.warning(
                 "Replaying WeChat turn after CC query failure "
                 "(attempt %d/%d)",
@@ -869,7 +862,7 @@ async def _process_combined_msgs(
             )
         try:
             resp = await cc.query(
-                combined or "[图片]", images=images or None, on_stream=_on_stream,
+                combined or "[图片]", images=images or None, on_stream=coalescer.on_stream,
             )
             break
         except Exception as e:
@@ -884,7 +877,7 @@ async def _process_combined_msgs(
 
     # End-of-stream drain — allow_hard_cut=True ships everything still in
     # buf even if no safe boundary exists (rare: nothing more is coming).
-    await _drain(allow_hard_cut=True)
+    await coalescer.drain(allow_hard_cut=True)
 
     # Rebroadcast resp.content when:
     # - had_send_failure: chunks were permanently lost mid-stream; resending
@@ -892,13 +885,13 @@ async def _process_combined_msgs(
     #   already-shipped bubbles but visible > missing.
     # - not sent_any: streaming produced no chunks (CC output came only via
     #   resp.content, not deltas).
-    if had_send_failure or not sent_any:
+    if coalescer.had_send_failure or not coalescer.sent_any:
         final = resp.content or ""
         if final:
-            had_send_failure = False
+            coalescer.had_send_failure = False
             for part in re.split(r"\n{3,}", final):
-                await _send_bubble(part)
-        elif had_send_failure:
+                await coalescer.send_bubble(part)
+        elif coalescer.had_send_failure:
             return False
 
     if resp.resume_note:
@@ -915,7 +908,7 @@ async def _process_combined_msgs(
         except Exception:
             pass
 
-    return not had_send_failure
+    return not coalescer.had_send_failure
 
 
 def _coalesce_update_msgs(msgs: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
