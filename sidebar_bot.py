@@ -43,7 +43,7 @@ from engine import (
     normalize_engine,
     persist_engine,
 )
-from media import image_to_base64, understand_video  # noqa: F401  (image_to_base64 unused now; kept for parity)
+from media import understand_video
 import sidebar_events
 import sidebar_history
 from sidebar_bridge import bridge

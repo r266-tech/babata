@@ -13,7 +13,6 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from pathlib import Path
 import secrets
 from secrets import token_bytes
 from typing import Any

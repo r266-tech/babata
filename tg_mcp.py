@@ -9,7 +9,6 @@ import errno
 import json
 import logging
 import os
-import sys
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server

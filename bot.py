@@ -21,7 +21,7 @@ import urllib.error
 import urllib.request
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
@@ -62,7 +62,6 @@ from engine import (
     engine_choices,
     engine_label,
     engine_name,
-    is_codex_engine,
     make_engine,
     normalize_engine,
     persist_engine,
