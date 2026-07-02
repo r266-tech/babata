@@ -172,6 +172,38 @@ def test_declared_checks_skip_config_created_during_turn(monkeypatch, tmp_path):
     ]
 
 
+def test_declared_checks_report_item_errors_skips_and_failures(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    checks_dir = repo / ".babata"
+    checks_dir.mkdir()
+    fail_command = f"{sys.executable} -c 'import sys; print(\"bad\"); sys.exit(2)'"
+    (checks_dir / "checks.json").write_text(json.dumps({
+        "checks": [
+            "bad",
+            {"name": "missing-command"},
+            {"name": "docs-only", "command": "false", "when": ["docs"]},
+            {"name": "fail", "command": fail_command, "when": ["always"]},
+        ]
+    }))
+    monkeypatch.setenv("BABATA_DECLARED_CHECKS", "1")
+
+    results = turn_audit.run_declared_checks(
+        repo_root=repo,
+        changed_files=["script.py"],
+        guard_findings=[],
+    )
+
+    assert results[0] == {"status": "config_error", "index": 0, "error": "check must be an object"}
+    assert results[1] == {"name": "missing-command", "status": "config_error", "error": "command is required"}
+    assert results[2] == {"name": "docs-only", "status": "skipped", "reason": "when did not match"}
+    assert results[3]["name"] == "fail"
+    assert results[3]["status"] == "failed"
+    assert results[3]["exit_code"] == 2
+    assert "bad" in results[3]["output_tail"]
+
+
 def test_turn_audit_does_not_attribute_preexisting_dirty_files(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()

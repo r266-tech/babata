@@ -414,91 +414,118 @@ def run_declared_checks(
     baseline_config_fingerprint: str | None = None,
     require_baseline_config: bool = False,
 ) -> list[dict[str, Any]]:
+    checks, early_result = _declared_check_items(
+        repo_root=repo_root,
+        baseline_config_rel=baseline_config_rel,
+        baseline_config_fingerprint=baseline_config_fingerprint,
+        require_baseline_config=require_baseline_config,
+    )
+    if early_result is not None:
+        return early_result
+
+    context = _check_context(changed_files, guard_findings)
+    results = [
+        _run_declared_check_item(repo_root, item, idx, context)
+        for idx, item in enumerate(checks)
+    ]
+    return results or [{"status": "skipped", "reason": "no checks declared"}]
+
+
+def _declared_check_items(
+    *,
+    repo_root: Path | None,
+    baseline_config_rel: str | None,
+    baseline_config_fingerprint: str | None,
+    require_baseline_config: bool,
+) -> tuple[list[Any], list[dict[str, Any]] | None]:
     if not declared_checks_enabled():
-        return [{"status": "skipped", "reason": "BABATA_DECLARED_CHECKS=0"}]
+        return [], [{"status": "skipped", "reason": "BABATA_DECLARED_CHECKS=0"}]
     if repo_root is None:
-        return [{"status": "skipped", "reason": "not a git repo"}]
+        return [], [{"status": "skipped", "reason": "not a git repo"}]
 
     config_path = _checks_config_path(repo_root)
     if config_path is None:
-        return [{"status": "skipped", "reason": "no .babata/checks.json"}]
+        return [], [{"status": "skipped", "reason": "no .babata/checks.json"}]
     if require_baseline_config and (baseline_config_rel is None or baseline_config_fingerprint is None):
-        return [{"status": "skipped", "reason": "declared checks config changed during turn"}]
+        return [], [{"status": "skipped", "reason": "declared checks config changed during turn"}]
     if require_baseline_config or baseline_config_rel is not None or baseline_config_fingerprint is not None:
         current_rel = config_path.relative_to(repo_root).as_posix()
         current_fingerprint = _file_fingerprint(config_path)
         if baseline_config_rel != current_rel:
-            return [{"status": "skipped", "reason": "declared checks config changed during turn"}]
+            return [], [{"status": "skipped", "reason": "declared checks config changed during turn"}]
         if baseline_config_fingerprint != current_fingerprint:
-            return [{"status": "skipped", "reason": "declared checks config changed during turn"}]
+            return [], [{"status": "skipped", "reason": "declared checks config changed during turn"}]
 
     try:
         data = json.loads(config_path.read_text())
     except Exception as e:
-        return [{"status": "config_error", "path": str(config_path), "error": str(e)}]
+        return [], [{"status": "config_error", "path": str(config_path), "error": str(e)}]
 
     checks = data.get("checks") if isinstance(data, dict) else None
     if not isinstance(checks, list):
-        return [{"status": "config_error", "path": str(config_path), "error": "checks must be a list"}]
+        return [], [{"status": "config_error", "path": str(config_path), "error": "checks must be a list"}]
+    return checks, None
 
-    context = _check_context(changed_files, guard_findings)
-    results: list[dict[str, Any]] = []
-    for idx, item in enumerate(checks):
-        if not isinstance(item, dict):
-            results.append({"status": "config_error", "index": idx, "error": "check must be an object"})
-            continue
-        name = str(item.get("name") or f"check-{idx + 1}")
-        command = item.get("command")
-        if not isinstance(command, str) or not command.strip():
-            results.append({"name": name, "status": "config_error", "error": "command is required"})
-            continue
-        when = item.get("when")
-        if when is not None and not _check_matches(when, context):
-            results.append({"name": name, "status": "skipped", "reason": "when did not match"})
-            continue
-        timeout = _check_timeout(item.get("timeout_seconds"))
-        started = time.time()
-        try:
-            proc = subprocess.run(
-                command,
-                cwd=repo_root,
-                shell=True,
-                text=True,
-                capture_output=True,
-                timeout=timeout,
-            )
-            output = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
-            results.append({
-                "name": name,
-                "command": command,
-                "status": "passed" if proc.returncode == 0 else "failed",
-                "exit_code": proc.returncode,
-                "duration_ms": round((time.time() - started) * 1000),
-                "output_tail": _tail(output, _MAX_CHECK_OUTPUT),
-            })
-        except subprocess.TimeoutExpired as e:
-            output = "\n".join(
-                part.decode("utf-8", errors="replace") if isinstance(part, bytes) else str(part)
-                for part in (e.stdout, e.stderr)
-                if part
-            )
-            results.append({
-                "name": name,
-                "command": command,
-                "status": "timeout",
-                "duration_ms": round((time.time() - started) * 1000),
-                "timeout_seconds": timeout,
-                "output_tail": _tail(output, _MAX_CHECK_OUTPUT),
-            })
-        except Exception as e:
-            results.append({
-                "name": name,
-                "command": command,
-                "status": "error",
-                "duration_ms": round((time.time() - started) * 1000),
-                "error": str(e),
-            })
-    return results or [{"status": "skipped", "reason": "no checks declared"}]
+
+def _run_declared_check_item(
+    repo_root: Path,
+    item: Any,
+    idx: int,
+    context: set[str],
+) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {"status": "config_error", "index": idx, "error": "check must be an object"}
+
+    name = str(item.get("name") or f"check-{idx + 1}")
+    command = item.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return {"name": name, "status": "config_error", "error": "command is required"}
+    when = item.get("when")
+    if when is not None and not _check_matches(when, context):
+        return {"name": name, "status": "skipped", "reason": "when did not match"}
+
+    timeout = _check_timeout(item.get("timeout_seconds"))
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=repo_root,
+            shell=True,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+        output = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
+        return {
+            "name": name,
+            "command": command,
+            "status": "passed" if proc.returncode == 0 else "failed",
+            "exit_code": proc.returncode,
+            "duration_ms": round((time.time() - started) * 1000),
+            "output_tail": _tail(output, _MAX_CHECK_OUTPUT),
+        }
+    except subprocess.TimeoutExpired as e:
+        output = "\n".join(
+            part.decode("utf-8", errors="replace") if isinstance(part, bytes) else str(part)
+            for part in (e.stdout, e.stderr)
+            if part
+        )
+        return {
+            "name": name,
+            "command": command,
+            "status": "timeout",
+            "duration_ms": round((time.time() - started) * 1000),
+            "timeout_seconds": timeout,
+            "output_tail": _tail(output, _MAX_CHECK_OUTPUT),
+        }
+    except Exception as e:
+        return {
+            "name": name,
+            "command": command,
+            "status": "error",
+            "duration_ms": round((time.time() - started) * 1000),
+            "error": str(e),
+        }
 
 
 def enqueue_review_tasks(
