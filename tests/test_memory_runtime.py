@@ -61,7 +61,7 @@ def test_render_memory_context_event_logs_enforced_reflex(monkeypatch, tmp_path)
     monkeypatch.delenv("BABATA_MEMORY_PROFILE", raising=False)
     monkeypatch.setenv("BABATA_MEMORY_CPU", "stale-cpu")
     monkeypatch.setenv("BABATA_MEMORY_SOURCE", "stale-source")
-    monkeypatch.setenv("BABATA_MEMORY_INCLUDE_TOP", "skip")
+    monkeypatch.delenv("BABATA_MEMORY_INCLUDE_TOP", raising=False)
 
     context, event_id = memory_runtime.render_babata_memory_context_event(
         enabled=True,
@@ -79,7 +79,7 @@ def test_render_memory_context_event_logs_enforced_reflex(monkeypatch, tmp_path)
     assert "profile: deep" in context
     assert json.loads(inject_log.read_text()) == {
         "cpu": "codex",
-        "include_top": "force",
+        "include_top": "skip",
         "profile": "deep",
         "source": "sidebar",
     }

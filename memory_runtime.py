@@ -218,7 +218,7 @@ def render_babata_memory_context_event(
     env["BABATA_MEMORY_PROFILE"] = actual_profile
     env["BABATA_MEMORY_CPU"] = cpu
     env["BABATA_MEMORY_SOURCE"] = source
-    env["BABATA_MEMORY_INCLUDE_TOP"] = "force"
+    env["BABATA_MEMORY_INCLUDE_TOP"] = os.environ.get("BABATA_MEMORY_INCLUDE_TOP") or "skip"
     try:
         result = subprocess.run(
             [str(script)],
