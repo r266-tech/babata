@@ -765,6 +765,15 @@ def _format_page_memory(ctx: Any) -> str:
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._一-鿿-]+")
 
 
+@dataclass(frozen=True)
+class _DecodedAttachment:
+    kind: str
+    name: str
+    mime: str
+    blob: bytes
+    data_base64: str
+
+
 def _safe_basename(name: str, fallback_ext: str = "") -> str:
     name = (name or "").strip() or f"file{fallback_ext}"
     return _SAFE_NAME.sub("_", name)[:120]
@@ -773,6 +782,70 @@ def _safe_basename(name: str, fallback_ext: str = "") -> str:
 def _inbound_path(suffix: str) -> Path:
     _INBOUND_DIR.mkdir(parents=True, exist_ok=True)
     return _INBOUND_DIR / f"{int(time.time())}-{secrets.token_hex(6)}{suffix}"
+
+
+def _decode_sidebar_attachment(att: Any) -> _DecodedAttachment | str | None:
+    if not isinstance(att, dict):
+        return None
+    kind = (att.get("kind") or "").lower()
+    name = att.get("name") or "untitled"
+    mime = att.get("mime") or "application/octet-stream"
+    data_base64 = att.get("data_base64") or ""
+    if not data_base64:
+        return None
+    try:
+        blob = base64.b64decode(data_base64, validate=False)
+    except (binascii.Error, ValueError):
+        return f"[attachment {name}: base64 decode failed]"
+    return _DecodedAttachment(kind, name, mime, blob, data_base64)
+
+
+def _video_ext(mime: str) -> str:
+    if mime in ("video/mp4", "video/quicktime"):
+        return ".mp4"
+    return "." + mime.split("/")[-1] if mime.startswith("video/") else ".mp4"
+
+
+async def _process_video_attachment(
+    att: _DecodedAttachment,
+    cleanup: list[Path],
+) -> str:
+    path = _inbound_path(_video_ext(att.mime))
+    try:
+        path.write_bytes(att.blob)
+        cleanup.append(path)
+        desc = await understand_video(path)
+        if desc:
+            return f"[video {att.name}] {desc}"
+        return f"[video {att.name}] (无法理解内容)"
+    except Exception as e:
+        return f"[video {att.name}] decode error: {e}"
+
+
+def _file_ext_guess(mime: str) -> str:
+    return {
+        "application/pdf": ".pdf",
+        "application/json": ".json",
+        "text/plain": ".txt",
+        "text/markdown": ".md",
+        "text/csv": ".csv",
+    }.get(mime, "")
+
+
+def _process_file_attachment(att: _DecodedAttachment) -> str:
+    ext_match = re.search(r"\.[A-Za-z0-9]{1,8}$", att.name)
+    ext = ext_match.group(0) if ext_match else ""
+    safe = _safe_basename(att.name, ext)
+    path = _inbound_path(f"-{safe}")
+    if not ext:
+        ext_guess = _file_ext_guess(att.mime)
+        if ext_guess:
+            path = path.with_suffix(ext_guess)
+    try:
+        path.write_bytes(att.blob)
+        return f"[file: {path}]"
+    except Exception as e:
+        return f"[file {att.name}] write failed: {e}"
 
 
 async def _process_attachments(
@@ -796,64 +869,24 @@ async def _process_attachments(
         return images, lines, cleanup
 
     for att in raw:
-        if not isinstance(att, dict):
+        decoded = _decode_sidebar_attachment(att)
+        if decoded is None:
             continue
-        kind = (att.get("kind") or "").lower()
-        name = att.get("name") or "untitled"
-        mime = att.get("mime") or "application/octet-stream"
-        b64 = att.get("data_base64") or ""
-        if not b64:
-            continue
-        try:
-            blob = base64.b64decode(b64, validate=False)
-        except (binascii.Error, ValueError):
-            lines.append(f"[attachment {name}: base64 decode failed]")
+        if isinstance(decoded, str):
+            lines.append(decoded)
             continue
 
-        if kind == "image" and mime in _CC_IMAGE_MIME_TYPES:
-            images.append({"media_type": mime, "data": b64})
-            lines.append(f"[image attached: {name}]")
+        if decoded.kind == "image" and decoded.mime in _CC_IMAGE_MIME_TYPES:
+            images.append({"media_type": decoded.mime, "data": decoded.data_base64})
+            lines.append(f"[image attached: {decoded.name}]")
             continue
 
-        if kind == "video":
-            ext = ".mp4" if mime in ("video/mp4", "video/quicktime") else (
-                "." + mime.split("/")[-1] if mime.startswith("video/") else ".mp4"
-            )
-            path = _inbound_path(ext)
-            try:
-                path.write_bytes(blob)
-                cleanup.append(path)
-                desc = await understand_video(path)
-                if desc:
-                    lines.append(f"[video {name}] {desc}")
-                else:
-                    lines.append(f"[video {name}] (无法理解内容)")
-            except Exception as e:
-                lines.append(f"[video {name}] decode error: {e}")
+        if decoded.kind == "video":
+            lines.append(await _process_video_attachment(decoded, cleanup))
             continue
 
         # file (含 audio / pdf / text / 二进制) — 落地, CC Read 自取.
-        # name 里包含真实扩展名, 落到 inbound dir 用 safe name 防 path traversal.
-        ext_match = re.search(r"\.[A-Za-z0-9]{1,8}$", name)
-        ext = ext_match.group(0) if ext_match else ""
-        safe = _safe_basename(name, ext)
-        path = _inbound_path(f"-{safe}")
-        if not ext:
-            # 没扩展名 — 用 mime 简单推一个 (txt/json/pdf 多见)
-            ext_guess = {
-                "application/pdf": ".pdf",
-                "application/json": ".json",
-                "text/plain": ".txt",
-                "text/markdown": ".md",
-                "text/csv": ".csv",
-            }.get(mime, "")
-            if ext_guess:
-                path = path.with_suffix(ext_guess)
-        try:
-            path.write_bytes(blob)
-            lines.append(f"[file: {path}]")
-        except Exception as e:
-            lines.append(f"[file {name}] write failed: {e}")
+        lines.append(_process_file_attachment(decoded))
 
     return images, lines, cleanup
 

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 from pathlib import Path
@@ -267,6 +268,53 @@ def test_sidebar_chat_input_builds_prompt_boundary(monkeypatch, tmp_path):
     assert chat_input.chat_url == "https://x.test"
     assert chat_input.chat_title == "X"
     assert chat_input.has_attach is True
+
+
+def test_sidebar_process_attachments_routes_images_files_and_video(monkeypatch, tmp_path):
+    async def fake_understand_video(path):
+        assert path.read_bytes() == b"video bytes"
+        return "video summary"
+
+    def fake_inbound_path(suffix: str) -> Path:
+        return tmp_path / f"inbound{suffix}"
+
+    monkeypatch.setattr(sidebar_bot, "understand_video", fake_understand_video)
+    monkeypatch.setattr(sidebar_bot, "_inbound_path", fake_inbound_path)
+
+    raw = [
+        {
+            "kind": "image",
+            "name": "shot.png",
+            "mime": "image/png",
+            "data_base64": base64.b64encode(b"image bytes").decode(),
+        },
+        {
+            "kind": "file",
+            "name": "notes",
+            "mime": "text/plain",
+            "data_base64": base64.b64encode(b"note body").decode(),
+        },
+        {
+            "kind": "video",
+            "name": "clip.mov",
+            "mime": "video/quicktime",
+            "data_base64": base64.b64encode(b"video bytes").decode(),
+        },
+    ]
+
+    images, lines, cleanup = asyncio.run(sidebar_bot._process_attachments(raw))
+
+    assert images == [{
+        "media_type": "image/png",
+        "data": raw[0]["data_base64"],
+    }]
+    assert lines == [
+        "[image attached: shot.png]",
+        f"[file: {tmp_path / 'inbound-notes.txt'}]",
+        "[video clip.mov] video summary",
+    ]
+    assert (tmp_path / "inbound-notes.txt").read_bytes() == b"note body"
+    assert cleanup == [tmp_path / "inbound.mp4"]
 
 
 def test_sidebar_stream_trace_emits_sse_and_closes_running_tool(monkeypatch):
