@@ -16,16 +16,13 @@ def _write_executable(path: Path, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def test_memory_source_from_prompt_maps_channels(monkeypatch):
+def test_default_memory_source_uses_env_not_prompt(monkeypatch):
     monkeypatch.delenv("BABATA_MEMORY_SOURCE", raising=False)
 
-    assert memory_runtime.memory_source_from_prompt("Source: Telegram. x") == "tg"
-    assert memory_runtime.memory_source_from_prompt("Source: WeChat. x") == "wechat"
-    assert memory_runtime.memory_source_from_prompt("Source: Sidebar. x") == "sidebar"
-    assert memory_runtime.memory_source_from_prompt("Source: test. x") == "unknown"
+    assert memory_runtime.default_memory_source() == "unknown"
 
     monkeypatch.setenv("BABATA_MEMORY_SOURCE", "terminal")
-    assert memory_runtime.memory_source_from_prompt("Source: test. x") == "terminal"
+    assert memory_runtime.default_memory_source() == "terminal"
 
 
 def test_render_memory_context_event_logs_enforced_reflex(monkeypatch, tmp_path):

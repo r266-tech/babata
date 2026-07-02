@@ -64,8 +64,8 @@ from constants import (
     STATE_DIR as _STATE_DIR,
 )
 from memory_runtime import (
+    default_memory_source,
     log_memory_reflex_post_answer,
-    memory_source_from_prompt,
     render_babata_memory_context_event,
 )
 from skill_evolve_nudge import notify_skill_evolve_turn
@@ -607,7 +607,7 @@ class CC:
     ) -> None:
         self._state_file = state_file
         self._source_prompt = source_prompt
-        self._memory_source = memory_source or memory_source_from_prompt(source_prompt)
+        self._memory_source = memory_source or default_memory_source()
         self._mcp_servers = mcp_servers or {}
         self._model = model
         self._session_id: str | None = self._load_state().get("session_id")

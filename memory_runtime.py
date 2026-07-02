@@ -47,14 +47,7 @@ def memory_reflex_timeout() -> float:
         return 0.8
 
 
-def memory_source_from_prompt(source_prompt: str) -> str:
-    lower = source_prompt.lower()
-    if "source: telegram" in lower:
-        return "tg"
-    if "source: wechat" in lower:
-        return "wechat"
-    if "source: sidebar" in lower:
-        return "sidebar"
+def default_memory_source() -> str:
     return os.environ.get("BABATA_MEMORY_SOURCE") or "unknown"
 
 
