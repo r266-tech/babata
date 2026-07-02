@@ -646,6 +646,26 @@ def test_channel_worker_reply_anchor_prefers_active_payload(monkeypatch, tmp_pat
     assert anchor.chat is chat
 
 
+def test_channel_worker_send_completed_text_bubble_formats_and_tracks(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        worker = bot.ChannelWorker(FakeSession(), instance_label="test")
+        message = FakeMessage(1, "hello")
+
+        sent = await worker._send_completed_text_bubble(
+            message,
+            "**done**",
+            worker._anchor_generation,
+        )
+
+        assert sent == bot.TextBubbleSendResult(sent_ok=True, shipped_msgs=message.replies)
+        assert len(message.replies) == 1
+        assert message.replies[0].text == "<b>done</b>"
+        assert message.replies[0].parse_mode == "HTML"
+
+    asyncio.run(run())
+
+
 def test_channel_worker_single_turn_clean_reset(monkeypatch, tmp_path):
     """Baseline: one user msg → one turn → in_flight returns to 0."""
     async def run():

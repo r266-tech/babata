@@ -1564,6 +1564,12 @@ class ReplyAnchor:
     message: Any
 
 
+@dataclass(frozen=True)
+class TextBubbleSendResult:
+    sent_ok: bool
+    shipped_msgs: list[Any]
+
+
 def _format_coalesced_tg_prompt(payloads: list[Payload]) -> str:
     if len(payloads) <= 1:
         return payloads[0].text if payloads else ""
@@ -2116,6 +2122,94 @@ class ChannelWorker:
             return None
         return ReplyAnchor(self._anchor_generation, payload, chat, msg)
 
+    async def _send_completed_text_bubble(
+        self,
+        msg: Any,
+        prefix: str,
+        gen: int,
+    ) -> TextBubbleSendResult | None:
+        parts, parse_mode = _format_bubble_parts(prefix)
+        if not parts:
+            return None
+        first_part = parts[0]
+        rest = parts[1:]
+        sent_ok = False
+        shipped_msgs: list[Any] = []
+        if self._text_message is not None:
+            edit_ok = False
+            try:
+                await self._text_message.edit_text(
+                    first_part, **_parse_kwargs(parse_mode)
+                )
+                edit_ok = True
+            except Exception:
+                # HTML may be rejected; retry the whole bubble as plain.
+                try:
+                    raw_parts = _split(prefix) or [prefix[:_MAX_TG]]
+                    await self._text_message.edit_text(raw_parts[0])
+                    rest = raw_parts[1:]
+                    parse_mode = None
+                    edit_ok = True
+                except Exception as plain_e:
+                    if gen == self._anchor_generation:
+                        self._stale_text_messages.append(self._text_message)
+                        self._on_text_edit_failure(plain_e)
+            if edit_ok and gen == self._anchor_generation:
+                self._text_flood_strikes = 0
+                self._text_edit_interval = _TEXT_EDIT_INTERVAL_BASE
+                sent_ok = True
+                shipped_msgs.append(self._text_message)
+        else:
+            reply_ok = False
+            new_msg = None
+            try:
+                new_msg = await msg.reply_text(
+                    first_part, **_parse_kwargs(parse_mode)
+                )
+                reply_ok = True
+            except Exception:
+                try:
+                    raw_parts = _split(prefix) or [prefix[:_MAX_TG]]
+                    new_msg = await msg.reply_text(raw_parts[0])
+                    rest = raw_parts[1:]
+                    parse_mode = None
+                    reply_ok = True
+                except Exception as plain_e:
+                    if gen == self._anchor_generation:
+                        self._on_text_edit_failure(plain_e)
+            if reply_ok:
+                if gen != self._anchor_generation:
+                    self._spawn_orphan_cleanup([new_msg])
+                else:
+                    sent_ok = True
+                    shipped_msgs.append(new_msg)
+        if sent_ok and rest:
+            rest_failed = False
+            for part in rest:
+                reply = None
+                try:
+                    reply = await msg.reply_text(
+                        part, **_parse_kwargs(parse_mode)
+                    )
+                except Exception:
+                    if parse_mode:
+                        try:
+                            reply = await msg.reply_text(part)
+                        except Exception:
+                            rest_failed = True
+                            break
+                    else:
+                        rest_failed = True
+                        break
+                if reply is not None:
+                    shipped_msgs.append(reply)
+            if rest_failed:
+                # Whole-bubble rollback: stale-queue every shipped part
+                # so _deliver_response can resend the bubble cleanly.
+                self._stale_text_messages.extend(shipped_msgs)
+                sent_ok = False
+        return TextBubbleSendResult(sent_ok=sent_ok, shipped_msgs=shipped_msgs)
+
     async def _handle_text_delta(self, chunk: str) -> None:
         if not chunk:
             return
@@ -2155,85 +2249,12 @@ class ChannelWorker:
             if prefix:
                 if gen != self._anchor_generation:
                     return
-                parts, parse_mode = _format_bubble_parts(prefix)
-                if not parts:
+                sent = await self._send_completed_text_bubble(msg, prefix, gen)
+                if sent is None:
                     self._text_buffer = tail.lstrip("\n")
                     continue
-                first_part = parts[0]
-                rest = parts[1:]
-                if self._text_message is not None:
-                    edit_ok = False
-                    try:
-                        await self._text_message.edit_text(
-                            first_part, **_parse_kwargs(parse_mode)
-                        )
-                        edit_ok = True
-                    except Exception:
-                        # HTML may be rejected; retry the whole bubble as plain.
-                        try:
-                            raw_parts = _split(prefix) or [prefix[:_MAX_TG]]
-                            await self._text_message.edit_text(raw_parts[0])
-                            rest = raw_parts[1:]
-                            parse_mode = None
-                            edit_ok = True
-                        except Exception as plain_e:
-                            if gen == self._anchor_generation:
-                                self._stale_text_messages.append(self._text_message)
-                                self._on_text_edit_failure(plain_e)
-                    if edit_ok and gen == self._anchor_generation:
-                        self._text_flood_strikes = 0
-                        self._text_edit_interval = _TEXT_EDIT_INTERVAL_BASE
-                        sent_ok = True
-                        shipped_msgs.append(self._text_message)
-                else:
-                    reply_ok = False
-                    new_msg = None
-                    try:
-                        new_msg = await msg.reply_text(
-                            first_part, **_parse_kwargs(parse_mode)
-                        )
-                        reply_ok = True
-                    except Exception:
-                        try:
-                            raw_parts = _split(prefix) or [prefix[:_MAX_TG]]
-                            new_msg = await msg.reply_text(raw_parts[0])
-                            rest = raw_parts[1:]
-                            parse_mode = None
-                            reply_ok = True
-                        except Exception as plain_e:
-                            if gen == self._anchor_generation:
-                                self._on_text_edit_failure(plain_e)
-                    if reply_ok:
-                        if gen != self._anchor_generation:
-                            self._spawn_orphan_cleanup([new_msg])
-                        else:
-                            sent_ok = True
-                            shipped_msgs.append(new_msg)
-                if sent_ok and rest:
-                    rest_failed = False
-                    for p in rest:
-                        rp = None
-                        try:
-                            rp = await msg.reply_text(
-                                p, **_parse_kwargs(parse_mode)
-                            )
-                        except Exception:
-                            if parse_mode:
-                                try:
-                                    rp = await msg.reply_text(p)
-                                except Exception:
-                                    rest_failed = True
-                                    break
-                            else:
-                                rest_failed = True
-                                break
-                        if rp is not None:
-                            shipped_msgs.append(rp)
-                    if rest_failed:
-                        # Whole-bubble rollback: stale-queue every shipped part
-                        # so _deliver_response can resend the bubble cleanly.
-                        self._stale_text_messages.extend(shipped_msgs)
-                        sent_ok = False
+                sent_ok = sent.sent_ok
+                shipped_msgs = sent.shipped_msgs
             # P0 gen check: close-bubble state writes must not pollute new anchor.
             if gen != self._anchor_generation:
                 # shipped_msgs are now orphan replies under the old anchor.
