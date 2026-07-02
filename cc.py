@@ -432,6 +432,44 @@ def _first_real_user_and_entrypoint(fp: Path) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _session_listing_candidate(fp: Path, peer_map: dict[str, list[str]]) -> dict[str, Any] | None:
+    sid = fp.stem
+    first_user, entrypoint = _first_real_user_and_entrypoint(fp)
+    if not first_user:
+        return None
+    try:
+        mtime = fp.stat().st_mtime
+    except Exception:
+        mtime = 0.0
+
+    owners = peer_map.get(sid, [])
+    if owners:
+        channel = owners[0]
+    elif entrypoint == "sdk-cli":
+        # claude -p 一次性 (cron wrapper / 手敲 -p). 和 bb 交互拆开.
+        channel = "oneshot"
+    else:
+        # cli (bb / 原生 claude 交互) / claude-desktop / sdk-py orphan / 未知.
+        channel = "term"
+    return {
+        "sid": sid,
+        "first_user": first_user,
+        "mtime": mtime,
+        "owners": owners,
+        "channel": channel,
+    }
+
+
+def _session_preview(sid: str, first_user: str, mtime: float, summary_cache: dict) -> str:
+    # Summary cache: 按 jsonl mtime 失效. 命中用缓存, miss/过期后台生成
+    # + 本次 fallback first_user. 下次 /resume 就能看见总结.
+    cached = summary_cache.get(sid)
+    if cached and cached.get("source_mtime") == mtime:
+        return cached.get("summary") or first_user
+    _spawn_summary_generation(sid, mtime)
+    return first_user
+
+
 async def _always_allow(
     tool_name: str,
     tool_input: dict[str, Any],
@@ -1005,45 +1043,25 @@ class CC:
 
         out: list[dict] = []
         for fp in files:
-            sid = fp.stem
-            first_user, entrypoint = _first_real_user_and_entrypoint(fp)
-            if not first_user:
+            candidate = _session_listing_candidate(fp, peer_map)
+            if candidate is None:
                 continue
-            try:
-                mtime = fp.stat().st_mtime
-            except Exception:
-                mtime = 0.0
-
-            owners = peer_map.get(sid, [])
-            if owners:
-                channel_label = owners[0]
-            elif entrypoint == "sdk-cli":
-                # claude -p 一次性 (cron wrapper / 手敲 -p). 和 bb 交互拆开.
-                channel_label = "oneshot"
-            else:
-                # cli (bb / 原生 claude 交互) / claude-desktop / sdk-py orphan / 未知.
-                channel_label = "term"
-
             # channel_filter 白名单过滤. 'term'/'oneshot' 匹配 "无 owner" 的 orphan.
             # 在 summary spawn 之前过滤, 避免 scan_all_buckets 模式下给被丢弃的
             # session 起 haiku 总结 (Codex E-PERF).
+            channel_label = candidate["channel"]
             if channel_filter is not None and channel_label not in channel_filter:
                 continue
 
-            # Summary cache: 按 jsonl mtime 失效. 命中用缓存, miss/过期后台生成
-            # + 本次 fallback first_user. 下次 /resume 就能看见总结.
-            cached = summary_cache.get(sid)
-            if cached and cached.get("source_mtime") == mtime:
-                preview = cached.get("summary") or first_user
-            else:
-                preview = first_user
-                _spawn_summary_generation(sid, mtime)
-
+            sid = candidate["sid"]
+            first_user = candidate["first_user"]
+            mtime = candidate["mtime"]
+            owners = candidate["owners"]
             is_own = own_channel in owners
             out.append({
                 "sid": sid,
                 "first_user": first_user,
-                "preview": preview,      # summary (命中缓存) or first_user (fallback)
+                "preview": _session_preview(sid, first_user, mtime, summary_cache),
                 "mtime": mtime,
                 "is_current": sid == self._session_id,
                 "channel": channel_label,

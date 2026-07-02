@@ -73,6 +73,74 @@ def test_first_real_user_and_entrypoint_skips_synthetic_user_records(tmp_path):
     assert cc_module._first_real_user_and_entrypoint(session_file) == ("真实问题", "sdk-cli")
 
 
+def _write_session_jsonl(path: Path, text: str, *, entrypoint: str = "cli", mtime: int = 10):
+    path.write_text(
+        json.dumps({
+            "type": "user",
+            "entrypoint": entrypoint,
+            "message": {"content": text},
+        }) + "\n"
+    )
+    os.utime(path, (mtime, mtime))
+
+
+def test_list_recent_sessions_filters_before_summary_generation(monkeypatch, tmp_path):
+    owned = tmp_path / "owned.jsonl"
+    oneshot = tmp_path / "oneshot.jsonl"
+    term = tmp_path / "term.jsonl"
+    _write_session_jsonl(owned, "owned prompt", entrypoint="cli", mtime=30)
+    _write_session_jsonl(oneshot, "oneshot prompt", entrypoint="sdk-cli", mtime=20)
+    _write_session_jsonl(term, "term prompt", entrypoint="cli", mtime=10)
+    spawned: list[tuple[str, float]] = []
+
+    monkeypatch.setattr(cc_module, "_recent_session_files", lambda **_kw: [owned, oneshot, term])
+    monkeypatch.setattr(cc_module, "_scan_peer_sids", lambda: {"owned": ["巴巴塔"]})
+    monkeypatch.setattr(cc_module, "_load_summary_cache", lambda: {})
+    monkeypatch.setattr(cc_module, "_spawn_summary_generation", lambda sid, mtime: spawned.append((sid, mtime)))
+    monkeypatch.setattr(cc_module, "_channel_label_from_state_file", lambda _fp: "巴巴塔")
+
+    session = cc_module.CC(state_file=tmp_path / "babata-session.json", source_prompt="Source: test.")
+    rows = session.list_recent_sessions(limit=10, channel_filter=["term"])
+
+    assert [row["sid"] for row in rows] == ["term"]
+    assert rows[0]["preview"] == "term prompt"
+    assert spawned == [("term", term.stat().st_mtime)]
+
+
+def test_list_recent_sessions_uses_cached_preview_and_owner_flags(monkeypatch, tmp_path):
+    owned = tmp_path / "owned.jsonl"
+    oneshot = tmp_path / "oneshot.jsonl"
+    _write_session_jsonl(owned, "owned prompt", entrypoint="cli", mtime=30)
+    _write_session_jsonl(oneshot, "oneshot prompt", entrypoint="sdk-cli", mtime=20)
+    spawned: list[str] = []
+
+    monkeypatch.setattr(cc_module, "_recent_session_files", lambda **_kw: [owned, oneshot])
+    monkeypatch.setattr(cc_module, "_scan_peer_sids", lambda: {"owned": ["巴巴塔2", "巴巴塔"]})
+    monkeypatch.setattr(cc_module, "_load_summary_cache", lambda: {
+        "owned": {"summary": "cached summary", "source_mtime": owned.stat().st_mtime}
+    })
+    monkeypatch.setattr(cc_module, "_spawn_summary_generation", lambda sid, _mtime: spawned.append(sid))
+    monkeypatch.setattr(cc_module, "_channel_label_from_state_file", lambda _fp: "巴巴塔")
+
+    state_file = tmp_path / "babata-session.json"
+    state_file.write_text(json.dumps({"session_id": "owned"}))
+    session = cc_module.CC(state_file=state_file, source_prompt="Source: test.")
+    rows = session.list_recent_sessions(limit=10)
+
+    assert rows[0] == {
+        "sid": "owned",
+        "first_user": "owned prompt",
+        "preview": "cached summary",
+        "mtime": owned.stat().st_mtime,
+        "is_current": True,
+        "channel": "巴巴塔2",
+        "is_own_channel": True,
+    }
+    assert rows[1]["channel"] == "oneshot"
+    assert rows[1]["preview"] == "oneshot prompt"
+    assert spawned == ["oneshot"]
+
+
 def test_sidebar_cpu_status_reads_public_session_property(monkeypatch):
     class FakeLock:
         def __init__(self, locked: bool):
