@@ -118,10 +118,9 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="tg_send_text",
             description=(
-                "Send a plain text message to the user's Telegram. "
-                "When invoked from the TG bot channel, the assistant's final turn text "
-                "is already auto-delivered — this tool is additive, for mid-turn pushes, "
-                "long-running task progress, or proactive sends from terminal/scheduled callers."
+                "Send plain text to the user's Telegram. "
+                "Final-turn TG replies are auto-delivered; use this additive tool only for "
+                "mid-turn pushes, long-running progress, or proactive sends."
             ),
             inputSchema={
                 "type": "object",

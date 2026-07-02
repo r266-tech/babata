@@ -64,7 +64,14 @@ def test_tg_handler_registration_keeps_transcript_sources_centralized():
 
 def test_tg_mcp_tool_descriptions_stay_operational():
     tools = {tool.name: tool for tool in asyncio.run(tg_mcp.list_tools())}
+    text = tools["tg_send_text"]
     page = tools["tg_send_page"]
+
+    assert len(text.description) <= 180
+    for marker in ("Telegram", "auto-delivered", "mid-turn pushes", "long-running progress", "proactive sends"):
+        assert marker in text.description
+    for marker in ("TG bot channel", "terminal/scheduled callers", "final turn text is already"):
+        assert marker not in text.description
 
     assert len(page.description) <= 240
     for marker in ("Telegraph", "markdown", "long structured", "TG inline HTML", "returns the Telegraph URL"):
