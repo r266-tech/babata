@@ -185,6 +185,41 @@ def test_sidebar_engine_name_falls_back_without_engine_accessor(tmp_path):
     assert sidebar_bot._engine_name_for(NamelessEngine(), state_file) == "codex"
 
 
+def test_sidebar_chat_input_builds_prompt_boundary(monkeypatch, tmp_path):
+    remembered: list[dict] = []
+    cleanup_path = tmp_path / "video.mp4"
+
+    async def process_attachments(raw):
+        assert raw == ["attachment"]
+        return (
+            [{"media_type": "image/png", "data": "abc"}],
+            ["[image attached: a.png]"],
+            [cleanup_path],
+        )
+
+    monkeypatch.setattr(sidebar_bot, "_remember_page_context", remembered.append)
+    monkeypatch.setattr(sidebar_bot, "_format_page_context", lambda _ctx: "[page ctx]")
+    monkeypatch.setattr(sidebar_bot, "_format_page_memory", lambda _ctx: "[page memory]")
+    monkeypatch.setattr(sidebar_bot, "_page_context_bound_meta", lambda _ctx: ("https://x.test", "X"))
+    monkeypatch.setattr(sidebar_bot, "_process_attachments", process_attachments)
+
+    chat_input = asyncio.run(sidebar_bot._build_sidebar_chat_input(
+        {
+            "page_context": {"url": "https://x.test", "title": "X"},
+            "attachments": ["attachment"],
+        },
+        "hello",
+    ))
+
+    assert remembered == [{"url": "https://x.test", "title": "X"}]
+    assert chat_input.prompt == "[page ctx]\n\n[page memory]\n\n[image attached: a.png]\n\nhello"
+    assert chat_input.images == [{"media_type": "image/png", "data": "abc"}]
+    assert chat_input.cleanup_paths == [cleanup_path]
+    assert chat_input.chat_url == "https://x.test"
+    assert chat_input.chat_title == "X"
+    assert chat_input.has_attach is True
+
+
 def test_sidebar_prompt_tool_map_is_compact_and_complete():
     tool_lines = prompt_tool_lines()
 

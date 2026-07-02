@@ -27,6 +27,7 @@ import shutil
 import signal
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -1205,6 +1206,39 @@ async def _run_proactive(
             log.warning("proactive cc.query crashed: %s", e)
 
 
+@dataclass
+class SidebarChatInput:
+    prompt: str
+    images: list[dict[str, str]]
+    cleanup_paths: list[Path]
+    chat_url: str
+    chat_title: str
+    has_attach: bool
+
+
+async def _build_sidebar_chat_input(data: dict[str, Any], message: str) -> SidebarChatInput:
+    page_context = data.get("page_context")
+    _remember_page_context(page_context)
+    page_ctx_line = _format_page_context(page_context)
+    page_memory_line = _format_page_memory(page_context)
+    images, attach_lines, cleanup_paths = await _process_attachments(
+        data.get("attachments")
+    )
+    parts = [s for s in (page_ctx_line, page_memory_line, *attach_lines, message) if s]
+    chat_url = ""
+    chat_title = ""
+    if isinstance(page_context, dict):
+        chat_url, chat_title = _page_context_bound_meta(page_context)
+    return SidebarChatInput(
+        prompt="\n\n".join(parts),
+        images=images,
+        cleanup_paths=cleanup_paths,
+        chat_url=chat_url,
+        chat_title=chat_title,
+        has_attach=bool(attach_lines),
+    )
+
+
 async def handle_chat(request: web.Request) -> web.StreamResponse:
     rejected = _reject_untrusted_origin(request)
     if rejected:
@@ -1218,25 +1252,15 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
     if not message:
         return web.json_response({"error": "empty message"}, status=400, headers=_cors_headers(request))
 
-    page_context = data.get("page_context")
-    _remember_page_context(page_context)
-    page_ctx_line = _format_page_context(page_context)
-    page_memory_line = _format_page_memory(page_context)
-
-    images, attach_lines, cleanup_paths = await _process_attachments(
-        data.get("attachments")
-    )
-
-    parts = [s for s in (page_ctx_line, page_memory_line, *attach_lines, message) if s]
-    prompt = "\n\n".join(parts)
+    chat_input = await _build_sidebar_chat_input(data, message)
+    prompt = chat_input.prompt
+    images = chat_input.images
 
     # 写 chat_turn 事件 (page memory 累积).
-    chat_url = ""
-    chat_title = ""
-    if isinstance(page_context, dict):
-        chat_url, chat_title = _page_context_bound_meta(page_context)
-        if chat_url:
-            sidebar_events.append(chat_url, "chat_turn", message=message[:500])
+    chat_url = chat_input.chat_url
+    chat_title = chat_input.chat_title
+    if chat_url:
+        sidebar_events.append(chat_url, "chat_turn", message=message[:500])
 
     # /new = V 在 sidepanel 点新对话 — cc.py 内部识别 + 我们写一条 boundary
     # 让 sidebar UI mount 时只拉最近一个 boundary 之后的 turn.
@@ -1248,7 +1272,7 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
             "user", message,
             url=chat_url, title=chat_title,
             has_image=bool(images),
-            has_attach=bool(attach_lines),
+            has_attach=chat_input.has_attach,
         )
 
     resp = web.StreamResponse(
@@ -1368,7 +1392,7 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
                     tool_trace=tool_trace,
                 )
         # video tmp files cleanup. file 类不删 (CC 可能后续 turn 用).
-        for p in cleanup_paths:
+        for p in chat_input.cleanup_paths:
             try:
                 p.unlink(missing_ok=True)
             except Exception:
