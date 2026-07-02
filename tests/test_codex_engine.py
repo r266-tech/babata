@@ -131,6 +131,28 @@ def test_codex_engine_query_parses_json_and_persists(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
+def test_codex_record_turn_reuses_clean_session_metadata(tmp_path):
+    state_file = tmp_path / "session.json"
+    state_file.write_text(json.dumps({
+        "recent_sids": ["old", 42, "", "sid-1"],
+        "engine_session_ids": {"claude": "claude-sid"},
+    }))
+    session = codex_engine.CodexEngine(
+        state_file=state_file,
+        source_prompt="Source: test.",
+    )
+    setattr(session, "_babata_engine_name", "codex")
+
+    session._record_codex_turn("sid-1", "hello", "OK")
+
+    state = json.loads(state_file.read_text())
+    assert state["session_id"] == "sid-1"
+    assert state["engine_session_ids"] == {"claude": "claude-sid", "codex": "sid-1"}
+    assert state["recent_sids"] == ["sid-1", "old"]
+    assert "last_activity_at" in state
+    assert state["codex_sessions"]["sid-1"]["turns"] == [["user", "hello"], ["assistant", "OK"]]
+
+
 def test_codex_engine_injects_babata_memory_once_per_session(monkeypatch, tmp_path):
     monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "1")
     seen_sources: list[str | None] = []

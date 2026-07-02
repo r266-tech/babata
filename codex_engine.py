@@ -26,7 +26,7 @@ from blocking_review import (
     unresolved_review_message,
 )
 from constants import HOOKS_DIR as _HOOKS_DIR
-from cc import CC, Event, Response, StreamCB
+from cc import CC, Event, Response, StreamCB, _record_session_metadata
 from memory_runtime import (
     log_memory_reflex_post_answer,
     log_memory_reflex_preflight,
@@ -751,12 +751,8 @@ class CodexEngine(CC):
         })
         sessions[sid] = rec
         state[_CODEX_SESSIONS_KEY] = sessions
-        state["session_id"] = sid
         self._remember_engine_sid(state, sid)
-        state["last_activity_at"] = now
-        hist = [s for s in state.get("recent_sids", []) if s != sid]
-        hist.insert(0, sid)
-        state["recent_sids"] = hist[:_CODEX_RECENT_LIMIT]
+        _record_session_metadata(state, sid, now=now, recent_limit=_CODEX_RECENT_LIMIT)
         self._save_state(state)
 
     def list_recent_sessions(

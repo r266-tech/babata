@@ -401,6 +401,22 @@ _RESUME_INJECT_CHARS = 300      # per-turn char cap (3 pairs × 300 × 2 ≈ 1.8
 _IDLE_RESET_MINUTES_DEFAULT = 1440  # 24h, parity with hermes session_reset.idle_minutes (gateway/config.py:114)
 
 
+def _record_session_metadata(
+    state: dict,
+    sid: str | None,
+    *,
+    now: float,
+    recent_limit: int = _MAX_RECENT_SIDS,
+) -> None:
+    state["session_id"] = sid
+    state["last_activity_at"] = now
+    if not sid:
+        return
+    hist = [s for s in state.get("recent_sids", []) if isinstance(s, str) and s and s != sid]
+    hist.insert(0, sid)
+    state["recent_sids"] = hist[:recent_limit]
+
+
 def _cc_memory_inject_enabled() -> bool:
     if os.environ.get("BABATA_CRON_AGENT") == "1":
         return False
@@ -661,15 +677,8 @@ class CC:
 
     def _record_sid(self, sid: str | None) -> None:
         state = self._load_state()
-        state["session_id"] = sid
         self._remember_engine_sid(state, sid)
-        # Touch activity timestamp on every sid write — _run() calls this after
-        # each successful turn, so it doubles as the idle-reset clock.
-        state["last_activity_at"] = time.time()
-        if sid:
-            hist = [s for s in state.get("recent_sids", []) if isinstance(s, str) and s and s != sid]
-            hist.insert(0, sid)
-            state["recent_sids"] = hist[:_MAX_RECENT_SIDS]
+        _record_session_metadata(state, sid, now=time.time())
         self._save_state(state)
 
     @property
