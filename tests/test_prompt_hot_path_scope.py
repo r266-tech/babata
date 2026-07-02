@@ -43,9 +43,9 @@ PROMPT_CASES = [
     (
         "sidebar-proactive",
         lambda: sidebar_bot._PROACTIVE_PROMPT,
-        420,
-        ("默认静默", "mascot_speak", "suggest_prompts", "tab_id/window_id", "不编造观察"),
-        (),
+        360,
+        ("Source: babata sidebar proactive", "默认静默", "mascot_speak", "suggest_prompts", "tab_id/window_id", "不编造观察"),
+        ("你是 babata", "轻量旁观通道", "共同进化", "哲学", "身份认同"),
     ),
     (
         "sidebar-agent-view",

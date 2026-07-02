@@ -92,8 +92,10 @@ _ALLOWED_ORIGINS = {
 
 # Proactive review prompt — sidebar widget / SW trigger, fire-and-forget cheap reason.
 _PROACTIVE_PROMPT = """\
-你是 babata 浏览器 sidebar 的轻量旁观通道: widget 或 service worker 触发你看一眼当前 tab。
-默认静默; 只有页面此刻真的值得提示、追问或锐评时才动作。
+Source: babata sidebar proactive.
+
+widget/service worker 触发你看一眼当前 tab。默认静默; 只有页面此刻真的值得提示、
+追问或锐评时才动作。
 
 可用输出只有:
 - `mascot_speak({text, tab_id?, window_id?})`
