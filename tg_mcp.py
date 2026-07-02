@@ -9,6 +9,9 @@ import errno
 import json
 import logging
 import os
+import sys
+
+sys.dont_write_bytecode = True
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server

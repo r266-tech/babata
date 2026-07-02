@@ -119,7 +119,10 @@ def test_codex_engine_query_parses_json_and_persists(monkeypatch, tmp_path):
         assert resp.cache_read_tokens == 4
         assert resp.output_tokens == 2
         assert streamed == [("/bin/zsh", None), (None, "OK")]
-        assert "mcp_servers.tg" in " ".join(captured["cmd"])
+        cmd_text = " ".join(captured["cmd"])
+        assert "mcp_servers.tg" in cmd_text
+        assert 'S = "x"' in cmd_text
+        assert 'PYTHONDONTWRITEBYTECODE = "1"' in cmd_text
         assert captured["cmd"][-1] == "-"
         assert captured["kwargs"]["stdin"] is codex_engine.asyncio.subprocess.PIPE
         assert captured["kwargs"]["limit"] == codex_engine._CODEX_STREAM_LIMIT

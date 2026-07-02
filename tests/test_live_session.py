@@ -108,6 +108,7 @@ def test_live_session_connect_submit_interrupt_close(monkeypatch, tmp_path):
         assert client.options.include_partial_messages is True
         assert client.options.max_turns == 200
         assert client.options.mcp_servers["tg"]["args"] == ["tg_mcp.py"]
+        assert client.options.mcp_servers["tg"]["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
 
         session.submit(
             "look",
@@ -126,6 +127,25 @@ def test_live_session_connect_submit_interrupt_close(monkeypatch, tmp_path):
         assert client.disconnected
 
     asyncio.run(run())
+
+
+def test_mcp_server_env_forces_no_repo_bytecode(tmp_path):
+    original = {
+        "tg": {
+            "command": "python",
+            "args": ["tg_mcp.py"],
+            "env": {"PYTHONDONTWRITEBYTECODE": "0", "KEEP": "x"},
+        }
+    }
+    session = cc.CC(
+        state_file=tmp_path / "session.json",
+        source_prompt="Source: test.",
+        mcp_servers=original,
+    )
+
+    assert session._mcp_servers["tg"]["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert session._mcp_servers["tg"]["env"]["KEEP"] == "x"
+    assert original["tg"]["env"]["PYTHONDONTWRITEBYTECODE"] == "0"
 
 
 def test_live_session_events_turn_end_persists_sid(monkeypatch, tmp_path):

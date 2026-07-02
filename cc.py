@@ -80,6 +80,19 @@ from turn_audit import (
 VENV_PYTHON = str(Path(__file__).parent / ".venv" / "bin" / "python")
 
 _CC_PROJECTS = Path.home() / ".claude" / "projects" / str(Path.home()).replace("/", "-")
+_NO_BYTECODE_ENV = "PYTHONDONTWRITEBYTECODE"
+
+
+def mcp_servers_without_repo_bytecode(mcp_servers: dict[str, Any] | None) -> dict[str, Any]:
+    """Ensure local MCP subprocesses do not write __pycache__ into the repo."""
+    cleaned = copy.deepcopy(mcp_servers or {})
+    for cfg in cleaned.values():
+        if not isinstance(cfg, dict):
+            continue
+        env = cfg.setdefault("env", {})
+        if isinstance(env, dict):
+            env[_NO_BYTECODE_ENV] = "1"
+    return cleaned
 
 
 def _find_jsonl_any_bucket(sid: str) -> Path | None:
@@ -624,7 +637,7 @@ class CC:
         self._state_file = state_file
         self._source_prompt = source_prompt
         self._memory_source = memory_source or default_memory_source()
-        self._mcp_servers = mcp_servers or {}
+        self._mcp_servers = mcp_servers_without_repo_bytecode(mcp_servers)
         self._model = model
         self._session_id: str | None = self._load_state().get("session_id")
         self._memory_reflex_event_id: str | None = None

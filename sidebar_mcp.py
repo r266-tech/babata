@@ -17,6 +17,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import sys
+
+sys.dont_write_bytecode = True
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server

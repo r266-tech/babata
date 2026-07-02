@@ -27,6 +27,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+sys.dont_write_bytecode = True
+
 from dotenv import load_dotenv
 
 # override=False: plist-injected env (per-instance TELEGRAM_BOT_TOKEN /

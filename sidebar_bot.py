@@ -25,9 +25,12 @@ import re
 import secrets
 import shutil
 import signal
+import sys
 import time
 from pathlib import Path
 from typing import Any
+
+sys.dont_write_bytecode = True
 
 from aiohttp import WSMsgType, web
 from dotenv import load_dotenv
