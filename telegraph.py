@@ -127,6 +127,57 @@ def _is_block_start(line: str) -> bool:
     )
 
 
+def _consume_fenced_code(lines: list[str], i: int) -> tuple[dict, int]:
+    lang = lines[i].strip()[3:].strip()
+    buf: list[str] = []
+    i += 1
+    while i < len(lines) and not lines[i].strip().startswith("```"):
+        buf.append(lines[i])
+        i += 1
+    if i < len(lines):
+        i += 1  # skip closing fence
+    code = "\n".join(buf)
+    if lang:
+        return {
+            "tag": "pre",
+            "children": [
+                {"tag": "code", "attrs": {"class": f"language-{lang}"}, "children": [code]}
+            ],
+        }, i
+    return {"tag": "pre", "children": [code]}, i
+
+
+def _consume_blockquote(lines: list[str], i: int) -> tuple[dict, int]:
+    qlines: list[str] = []
+    while i < len(lines) and lines[i].strip().startswith(">"):
+        qlines.append(re.sub(r"^\s*>\s?", "", lines[i]))
+        i += 1
+    quote_text = "\n".join(qlines).strip()
+    return {"tag": "blockquote", "children": _parse_inline(quote_text)}, i
+
+
+def _consume_list(lines: list[str], i: int, *, ordered: bool) -> tuple[dict, int]:
+    pattern = r"^\s*\d+\.\s+" if ordered else r"^\s*[-*]\s+"
+    items = []
+    while i < len(lines) and re.match(pattern, lines[i]):
+        item = re.sub(pattern, "", lines[i])
+        items.append({"tag": "li", "children": _parse_inline(item)})
+        i += 1
+    return {"tag": "ol" if ordered else "ul", "children": items}, i
+
+
+def _consume_paragraph(lines: list[str], i: int) -> tuple[dict | None, int]:
+    pbuf = [lines[i].rstrip()]
+    i += 1
+    while i < len(lines) and lines[i].strip() and not _is_block_start(lines[i]):
+        pbuf.append(lines[i].rstrip())
+        i += 1
+    para = " ".join(b.strip() for b in pbuf if b.strip())
+    if not para:
+        return None, i
+    return {"tag": "p", "children": _parse_inline(para)}, i
+
+
 def md_to_nodes(md: str) -> list:
     """Parse markdown to Telegraph node list. Safe fallback: always valid."""
     lines = md.split("\n")
@@ -159,65 +210,32 @@ def md_to_nodes(md: str) -> list:
 
         # Fenced code block
         if stripped.startswith("```"):
-            lang = stripped[3:].strip()
-            buf: list[str] = []
-            i += 1
-            while i < n and not lines[i].strip().startswith("```"):
-                buf.append(lines[i])
-                i += 1
-            if i < n:
-                i += 1  # skip closing fence
-            code = "\n".join(buf)
-            if lang:
-                nodes.append({
-                    "tag": "pre",
-                    "children": [
-                        {"tag": "code", "attrs": {"class": f"language-{lang}"}, "children": [code]}
-                    ],
-                })
-            else:
-                nodes.append({"tag": "pre", "children": [code]})
+            node, i = _consume_fenced_code(lines, i)
+            nodes.append(node)
             continue
 
         # Blockquote (consecutive `>` lines)
         if stripped.startswith(">"):
-            qlines = []
-            while i < n and lines[i].strip().startswith(">"):
-                qlines.append(re.sub(r"^\s*>\s?", "", lines[i]))
-                i += 1
-            quote_text = "\n".join(qlines).strip()
-            nodes.append({"tag": "blockquote", "children": _parse_inline(quote_text)})
+            node, i = _consume_blockquote(lines, i)
+            nodes.append(node)
             continue
 
         # Unordered list
         if re.match(r"^\s*[-*]\s+", line):
-            items = []
-            while i < n and re.match(r"^\s*[-*]\s+", lines[i]):
-                item = re.sub(r"^\s*[-*]\s+", "", lines[i])
-                items.append({"tag": "li", "children": _parse_inline(item)})
-                i += 1
-            nodes.append({"tag": "ul", "children": items})
+            node, i = _consume_list(lines, i, ordered=False)
+            nodes.append(node)
             continue
 
         # Ordered list
         if re.match(r"^\s*\d+\.\s+", line):
-            items = []
-            while i < n and re.match(r"^\s*\d+\.\s+", lines[i]):
-                item = re.sub(r"^\s*\d+\.\s+", "", lines[i])
-                items.append({"tag": "li", "children": _parse_inline(item)})
-                i += 1
-            nodes.append({"tag": "ol", "children": items})
+            node, i = _consume_list(lines, i, ordered=True)
+            nodes.append(node)
             continue
 
         # Paragraph — accumulate consecutive non-block lines
-        pbuf = [line.rstrip()]
-        i += 1
-        while i < n and lines[i].strip() and not _is_block_start(lines[i]):
-            pbuf.append(lines[i].rstrip())
-            i += 1
-        para = " ".join(b.strip() for b in pbuf if b.strip())
-        if para:
-            nodes.append({"tag": "p", "children": _parse_inline(para)})
+        node, i = _consume_paragraph(lines, i)
+        if node:
+            nodes.append(node)
 
     return nodes
 
