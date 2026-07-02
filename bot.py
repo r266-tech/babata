@@ -3787,7 +3787,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if _current_cpu_name() == "codex":
-        snap = _codex_status_snapshot(cc._session_id)
+        sid = cc.session_id
+        snap = _codex_status_snapshot(sid)
         fresh_limits = await _fetch_codex_app_rate_limits()
         if fresh_limits:
             snap["rate_limits"] = fresh_limits
@@ -3801,7 +3802,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         effort = snap.get("effort") or "—"
         used = int(snap.get("context_used") or 0)
         win = int(snap.get("context_window") or 0)
-        fallback_used = _last_used_tokens if _last_session_id == cc._session_id else 0
+        fallback_used = _last_used_tokens if _last_session_id == sid else 0
         if not used:
             used = fallback_used
         pct_ctx = (used / win * 100) if (win and used > 0) else 0.0
@@ -3823,7 +3824,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         week_line = _fmt_codex_limit(limits, "secondary", "weekly limit", 10_080)
         plan_type = (limits or {}).get("plan_type") if isinstance(limits, dict) else None
         sids = cc._load_state().get("recent_sids") or []
-        sid_now = cc._session_id if cc._session_id else "(new)"
+        sid_now = sid if sid else "(new)"
         labels = {0: "hidden", 1: "flash", 2: "keep"}
         lines = [
             "<b>📊 Status</b>",
@@ -3877,8 +3878,9 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Otherwise idle-reset (4am daily restart spawns a fresh sid) leaks the
     # previous session's inflated model_usage aggregate into the new session's
     # bar — observed as "317% of 1M" before JSONL flushed the first turn.
-    fallback_used = _last_used_tokens if _last_session_id == cc._session_id else 0
-    used = _last_prompt_tokens(cc._session_id) or fallback_used
+    sid = cc.session_id
+    fallback_used = _last_used_tokens if _last_session_id == sid else 0
+    used = _last_prompt_tokens(sid) or fallback_used
     pct_ctx = (used / win * 100) if (win and used > 0) else 0.0
     bar = _progress_bar(pct_ctx)
     model_short = _short_model(actual)
@@ -3966,7 +3968,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     today_line = f"{today_str} today (ccusage) · {provider_label}"
 
     sids = cc._load_state().get("recent_sids") or []
-    sid_now = cc._session_id if cc._session_id else "(new)"
+    sid_now = sid if sid else "(new)"
 
     labels = {0: "hidden", 1: "flash", 2: "keep"}
 
@@ -4122,9 +4124,8 @@ async def _switch_cpu(target: str) -> str:
     # Older state files only have one top-level session_id. Snapshot the
     # current CPU's sid into the per-engine slot before the top-level value can
     # be replaced by the target CPU.
-    if hasattr(cc, "_record_sid"):
-        with suppress(Exception):
-            cc._record_sid(getattr(cc, "_session_id", None))
+    with suppress(Exception):
+        cc.persist_current_session()
 
     new_cc = _make_tg_engine(target_name)
     new_worker = ChannelWorker(new_cc, instance_label=_CURRENT_LABEL)
@@ -4943,7 +4944,7 @@ def _render_resume_channel_picker() -> tuple[str, "InlineKeyboardMarkup"]:
         [InlineKeyboardButton(name, callback_data=f"resume-ch:{cat}")]
         for cat, name, _, _ in categories
     ]
-    cur = cc._session_id
+    cur = cc.session_id
     header = f"当前: {cur[:8]}\n选一个渠道:" if cur else "当前: (无)\n选一个渠道:"
     return header, InlineKeyboardMarkup(buttons)
 
@@ -5085,9 +5086,9 @@ async def on_resume_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     _save_state()
 
     # Cross-bucket fork: 跨 cwd-bucket 选的 sid, cc 已 import 成新 uuid 写到
-    # babata bucket (见 cc._import_jsonl_to_bucket). 这里用 cc._session_id 反映
+    # babata bucket (见 cc._import_jsonl_to_bucket). 这里用公开 session_id 反映
     # 真实激活的 sid, 让 V 知道发生了 fork.
-    active_sid = cc._session_id or sid
+    active_sid = cc.session_id or sid
     forked = active_sid != sid
 
     # 读 turn 用 *原* sid — 源文件还在原 bucket 完整可读, fork 后的副本内容跟原
@@ -5257,7 +5258,7 @@ async def _post_init(app: Application) -> None:
     # 硬崩 绕过 graceful 时, CC CLI 被强杀来不及写完 assistant turn, jsonl 里会
     # 留一条 user 没回复. 检测到就附警告让 V 决定 /resume (看片段) 或 /new.
     if ALLOWED_USER:
-        sid = cc._session_id
+        sid = cc.session_id
         sid_display = sid if sid else "(new)"
         lines = [f"[{_CURRENT_LABEL}] 上线 · session: {sid_display}"]
         # Startup alert must always carry a reason. Graceful shutdown only peeks

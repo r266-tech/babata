@@ -224,18 +224,22 @@ class FakeCpuSession:
         except Exception:
             return {}
 
-    def _record_sid(self, sid: str | None):
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    def persist_current_session(self):
         if self._state_file is None:
             return
         try:
             state = json.loads(self._state_file.read_text())
         except Exception:
             state = {}
-        state["session_id"] = sid
+        state["session_id"] = self._session_id
         engine_sids = state.get("engine_session_ids")
         if not isinstance(engine_sids, dict):
             engine_sids = {}
-        engine_sids[self._babata_engine_name] = sid or ""
+        engine_sids[self._babata_engine_name] = self._session_id or ""
         state["engine_session_ids"] = engine_sids
         self._state_file.write_text(json.dumps(state))
 
@@ -289,6 +293,14 @@ def test_switch_cpu_rebuilds_worker_and_persists_choice(monkeypatch, tmp_path):
         assert state["engine_session_ids"]["claude"] == "claude-old"
 
     asyncio.run(run())
+
+
+def test_bot_channel_does_not_reach_into_engine_private_session_state():
+    source = Path(bot.__file__).read_text()
+
+    assert "cc._session_id" not in source
+    assert "cc._record_sid" not in source
+    assert 'getattr(cc, "_session_id"' not in source
 
 
 def test_bot_commands_are_filtered_by_cpu():
