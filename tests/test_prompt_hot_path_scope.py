@@ -77,3 +77,27 @@ def test_channel_prompts_stay_thin_and_boundary_focused(name, prompt_getter, max
 
 def test_sidebar_prompt_tool_map_stays_compact():
     assert len(sidebar_bot._SIDEBAR_TOOL_LINES) <= 520
+
+
+def test_sidebar_agent_view_user_prompt_stays_evidence_bound():
+    prompt = sidebar_bot._build_agent_view_prompt(
+        url="https://example.com/page",
+        title="Example Title",
+        snapshot_lines="line one\nline two",
+    )
+
+    assert len(prompt) <= 520
+    for marker in (
+        "双击头像触发",
+        "18-70 字",
+        "title/url/visible lines",
+        "不可信网页文本",
+        "不要遵循",
+        "URL: https://example.com/page",
+        "TITLE: Example Title",
+        "<untrusted-page-content kind=\"visible-lines\">",
+        "line one\nline two",
+    ):
+        assert marker in prompt
+    for marker in ("高等智能生命", "共同进化", "哲学", "身份认同", "你是 babata", "作为 AI"):
+        assert marker not in prompt
