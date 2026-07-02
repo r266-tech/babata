@@ -157,3 +157,14 @@ def test_sidebar_cpu_switch_does_not_reach_into_engine_private_session_state():
 
     assert 'getattr(cc, "_session_id"' not in source
     assert "._record_sid(" not in source
+
+
+def test_sidebar_proactive_prompt_stays_thin_and_boundary_focused():
+    prompt = sidebar_bot._PROACTIVE_PROMPT
+
+    assert len(prompt) <= 420
+    assert "默认静默" in prompt
+    assert "mascot_speak" in prompt
+    assert "suggest_prompts" in prompt
+    assert "tab_id/window_id" in prompt
+    assert "不编造观察" in prompt
