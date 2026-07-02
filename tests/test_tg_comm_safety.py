@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import json
 import os
@@ -16,6 +17,48 @@ os.environ.setdefault("ALLOWED_USER_ID", "0")
 
 import bot
 import bridge as tg_bridge
+
+
+def test_tg_handler_registration_keeps_transcript_sources_centralized():
+    tree = ast.parse(Path(bot.__file__).read_text(encoding="utf-8"))
+    main_func = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+    calls = [node for node in ast.walk(main_func) if isinstance(node, ast.Call)]
+    sources = []
+    for node in calls:
+        if isinstance(node.func, ast.Name) and node.func.id in {"add_cmd", "add_cb", "add_msg"}:
+            index = 1 if node.func.id != "add_cb" else 0
+            arg = node.args[index]
+            assert isinstance(arg, ast.Constant)
+            sources.append(arg.value)
+
+    assert sources == [
+        "cmd_status",
+        "cmd_context",
+        "cmd_verbose",
+        "cmd_cpu",
+        "cmd_resume",
+        "cmd_stop",
+        "cmd_restart",
+        "cmd_provider",
+        "cmd_new",
+        "cb_verbose",
+        "cb_cpu",
+        "cb_provider",
+        "cb_codex",
+        "cb_codex_add",
+        "cb_codex_del",
+        "cb_resume_channel",
+        "cb_resume_back",
+        "cb_resume",
+        "cb_mcp",
+        "text",
+        "voice",
+        "photo",
+        "video",
+        "document",
+    ]
+
+    assert sum(1 for node in calls if isinstance(node.func, ast.Name) and node.func.id == "_with_transcript") == 3
 
 
 def test_tg_source_prompt_stays_thin_and_boundary_focused():
