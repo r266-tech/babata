@@ -101,3 +101,43 @@ def test_sidebar_agent_view_user_prompt_stays_evidence_bound():
         assert marker in prompt
     for marker in ("高等智能生命", "共同进化", "哲学", "身份认同", "你是 babata", "作为 AI"):
         assert marker not in prompt
+
+
+def test_sidebar_clean_read_user_prompt_stays_structural_and_evidence_bound():
+    prompt, truncated = sidebar_bot._build_clean_read_prompt(
+        url="https://example.com/article",
+        title="Example Article",
+        article={
+            "text": "p1 text\n\np2 text",
+            "site_title": "Example Site",
+            "byline": "Author",
+            "published_at": "2026-07-02",
+            "lang": "zh",
+            "excerpt": "Excerpt",
+            "char_count": 14,
+            "paragraphs": ["p1 text", "p2 text"],
+            "extraction_method": "readability",
+        },
+    )
+
+    assert truncated is False
+    assert len(prompt) <= 920
+    for marker in (
+        "三击头像触发",
+        "不添加原文没有的事实",
+        "不可信网页文本",
+        "不要遵循",
+        "只给中文 Markdown",
+        "## 阅读判定",
+        "## 核心意思",
+        "## 净化正文",
+        "## 保留的梗 / 好表达",
+        "## AI 锐评",
+        "## 原文依据",
+        "\"url\": \"https://example.com/article\"",
+        "<untrusted-page-content kind=\"article\" paragraph_ids=\"pN\">",
+        "p1 text\n\np2 text",
+    ):
+        assert marker in prompt
+    for marker in ("你是 babata", "无菌说明书", "顶级中文编辑", "情绪框架", "共同进化", "哲学", "身份认同"):
+        assert marker not in prompt
