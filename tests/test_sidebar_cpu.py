@@ -220,6 +220,74 @@ def test_sidebar_chat_input_builds_prompt_boundary(monkeypatch, tmp_path):
     assert chat_input.has_attach is True
 
 
+def test_sidebar_stream_trace_emits_sse_and_closes_running_tool(monkeypatch):
+    events: list[dict] = []
+
+    async def fake_sse_write(_resp, payload):
+        events.append(payload)
+
+    async def run():
+        monkeypatch.setattr(sidebar_bot, "_sse_write", fake_sse_write)
+        trace = sidebar_bot.SidebarStreamTrace(object())
+
+        await trace.on_stream(None, None, "hello", None)
+        await trace.on_stream("dom_click", {"selector": "#go"}, None, None)
+        await trace.close_running_tools()
+
+        assert trace.assistant_text() == "hello"
+        assert len(trace.tool_trace) == 1
+        assert trace.tool_trace[0]["name"] == "dom_click"
+        assert trace.tool_trace[0]["status"] == "done"
+        assert trace.tool_trace[0]["is_error"] is False
+        assert trace.tool_trace[0]["result"] == ""
+
+    asyncio.run(run())
+
+    assert events == [
+        {"type": "text_delta", "text": "hello"},
+        {
+            "type": "tool_use",
+            "trace_id": "tool-1",
+            "name": "dom_click",
+            "input": {"selector": "#go"},
+        },
+        {
+            "type": "tool_result",
+            "trace_id": "tool-1",
+            "is_error": False,
+            "text": "",
+        },
+    ]
+
+
+def test_sidebar_stream_trace_records_explicit_tool_result(monkeypatch):
+    events: list[dict] = []
+
+    async def fake_sse_write(_resp, payload):
+        events.append(payload)
+
+    async def run():
+        monkeypatch.setattr(sidebar_bot, "_sse_write", fake_sse_write)
+        trace = sidebar_bot.SidebarStreamTrace(object())
+
+        await trace.on_stream("dom_read", {"selector": "main"}, None, None)
+        await trace.on_stream(None, None, None, {"text": "missing", "is_error": True})
+
+        assert len(trace.tool_trace) == 1
+        assert trace.tool_trace[0]["status"] == "error"
+        assert trace.tool_trace[0]["is_error"] is True
+        assert trace.tool_trace[0]["result"] == "missing"
+
+    asyncio.run(run())
+
+    assert events[-1] == {
+        "type": "tool_result",
+        "trace_id": "tool-1",
+        "is_error": True,
+        "text": "missing",
+    }
+
+
 def test_sidebar_prompt_tool_map_is_compact_and_complete():
     tool_lines = prompt_tool_lines()
 

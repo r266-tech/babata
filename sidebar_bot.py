@@ -27,7 +27,7 @@ import shutil
 import signal
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -1216,6 +1216,92 @@ class SidebarChatInput:
     has_attach: bool
 
 
+@dataclass
+class SidebarStreamTrace:
+    resp: web.StreamResponse
+    assistant_text_parts: list[str] = field(default_factory=list)
+    tool_trace: list[dict[str, Any]] = field(default_factory=list)
+
+    def assistant_text(self) -> str:
+        return "".join(self.assistant_text_parts).strip()
+
+    def _running_tool_entry(self) -> dict[str, Any] | None:
+        return next(
+            (item for item in reversed(self.tool_trace) if item.get("status") == "running"),
+            None,
+        )
+
+    async def _finish_tool_entry(
+        self,
+        entry: dict[str, Any],
+        *,
+        is_error: bool,
+        text: str,
+    ) -> None:
+        ended_at = time.time()
+        entry["status"] = "error" if is_error else "done"
+        entry["is_error"] = is_error
+        entry["result"] = text
+        entry["ended_at"] = ended_at
+        if isinstance(entry.get("started_at"), (int, float)):
+            entry["duration_ms"] = int((ended_at - float(entry["started_at"])) * 1000)
+        await _sse_write(self.resp, {
+            "type": "tool_result",
+            "trace_id": entry["id"],
+            "is_error": is_error,
+            "text": text,
+        })
+
+    async def on_stream(
+        self,
+        tool_name: str | None,
+        tool_input: dict | None,
+        text_chunk: str | None,
+        tool_result: dict | None,
+    ) -> None:
+        if text_chunk:
+            self.assistant_text_parts.append(text_chunk)
+            await _sse_write(self.resp, {"type": "text_delta", "text": text_chunk})
+            return
+        if tool_name:
+            entry = {
+                "id": f"tool-{len(self.tool_trace) + 1}",
+                "name": tool_name,
+                "input": _preview_jsonish(tool_input or {}, _TOOL_INPUT_MAX_CHARS),
+                "status": "running",
+                "started_at": time.time(),
+            }
+            self.tool_trace.append(entry)
+            await _sse_write(self.resp, {
+                "type": "tool_use",
+                "trace_id": entry["id"],
+                "name": tool_name,
+                "input": entry["input"],
+            })
+            return
+        if tool_result is None:
+            return
+        entry = self._running_tool_entry()
+        if entry is None:
+            entry = {
+                "id": f"tool-{len(self.tool_trace) + 1}",
+                "name": "tool_result",
+                "input": {},
+                "started_at": time.time(),
+            }
+            self.tool_trace.append(entry)
+        await self._finish_tool_entry(
+            entry,
+            is_error=bool(tool_result.get("is_error")),
+            text=_preview_text(tool_result.get("text"), _TOOL_RESULT_MAX_CHARS),
+        )
+
+    async def close_running_tools(self) -> None:
+        for entry in self.tool_trace:
+            if entry.get("status") == "running":
+                await self._finish_tool_entry(entry, is_error=False, text="")
+
+
 async def _build_sidebar_chat_input(data: dict[str, Any], message: str) -> SidebarChatInput:
     page_context = data.get("page_context")
     _remember_page_context(page_context)
@@ -1288,61 +1374,7 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
     )
     await resp.prepare(request)
 
-    assistant_text_parts: list[str] = []
-    tool_trace: list[dict[str, Any]] = []
-
-    async def on_stream(
-        tool_name: str | None,
-        tool_input: dict | None,
-        text_chunk: str | None,
-        tool_result: dict | None,
-    ) -> None:
-        if text_chunk:
-            assistant_text_parts.append(text_chunk)
-            await _sse_write(resp, {"type": "text_delta", "text": text_chunk})
-        elif tool_name:
-            entry = {
-                "id": f"tool-{len(tool_trace) + 1}",
-                "name": tool_name,
-                "input": _preview_jsonish(tool_input or {}, _TOOL_INPUT_MAX_CHARS),
-                "status": "running",
-                "started_at": time.time(),
-            }
-            tool_trace.append(entry)
-            await _sse_write(resp, {
-                "type": "tool_use",
-                "trace_id": entry["id"],
-                "name": tool_name,
-                "input": entry["input"],
-            })
-        elif tool_result is not None:
-            text = _preview_text(tool_result.get("text"), _TOOL_RESULT_MAX_CHARS)
-            is_error = bool(tool_result.get("is_error"))
-            entry = next(
-                (item for item in reversed(tool_trace) if item.get("status") == "running"),
-                None,
-            )
-            if entry is None:
-                entry = {
-                    "id": f"tool-{len(tool_trace) + 1}",
-                    "name": "tool_result",
-                    "input": {},
-                    "started_at": time.time(),
-                }
-                tool_trace.append(entry)
-            ended_at = time.time()
-            entry["status"] = "error" if is_error else "done"
-            entry["is_error"] = is_error
-            entry["result"] = text
-            entry["ended_at"] = ended_at
-            if isinstance(entry.get("started_at"), (int, float)):
-                entry["duration_ms"] = int((ended_at - float(entry["started_at"])) * 1000)
-            await _sse_write(resp, {
-                "type": "tool_result",
-                "trace_id": entry["id"],
-                "is_error": is_error,
-                "text": text,
-            })
+    stream_trace = SidebarStreamTrace(resp)
 
     done_ok = False
     try:
@@ -1350,23 +1382,9 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
             response = await cc.query(
                 prompt,
                 images=images or None,
-                on_stream=on_stream,
+                on_stream=stream_trace.on_stream,
             )
-        for entry in tool_trace:
-            if entry.get("status") != "running":
-                continue
-            ended_at = time.time()
-            entry["status"] = "done"
-            entry["is_error"] = False
-            entry["ended_at"] = ended_at
-            if isinstance(entry.get("started_at"), (int, float)):
-                entry["duration_ms"] = int((ended_at - float(entry["started_at"])) * 1000)
-            await _sse_write(resp, {
-                "type": "tool_result",
-                "trace_id": entry["id"],
-                "is_error": False,
-                "text": "",
-            })
+        await stream_trace.close_running_tools()
         await _sse_write(resp, {"type": "session", "session_id": response.session_id or ""})
         await _sse_write(resp, {"type": "done"})
         done_ok = True
@@ -1383,13 +1401,13 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
         # 只在 SSE done 正常发出时写完整 turn; cancel/crash 不写, 防 reload 后
         # 把截断答案当完整答案展示 (V 看到的错误流已由 SSE error event 反馈).
         if message.strip() != "/new" and done_ok:
-            assistant_text = "".join(assistant_text_parts).strip()
-            if assistant_text or tool_trace:
+            assistant_text = stream_trace.assistant_text()
+            if assistant_text or stream_trace.tool_trace:
                 sidebar_history.append(
                     "assistant",
                     assistant_text,
                     url=chat_url,
-                    tool_trace=tool_trace,
+                    tool_trace=stream_trace.tool_trace,
                 )
         # video tmp files cleanup. file 类不删 (CC 可能后续 turn 用).
         for p in chat_input.cleanup_paths:
