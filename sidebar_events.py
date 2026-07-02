@@ -3,7 +3,8 @@
 三线 (translate / chat / proactive / attention) 都 append. chat 进 prompt 时
 grep 当前 url 最近事件摘要塞 page_context (= page memory).
 
-哲学: 事实层 > 规则层. 三线不直接互通, 都基于同一事实流自决.
+Fact stream only: lines do not directly call each other; consumers decide from
+the same append-only event log.
 
 Schema (松散, 每条带 ts/url/kind, 余字段按 kind 自由):
   translate_hit       — L1/L2 cache 命中, 不调 LLM

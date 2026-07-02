@@ -5,7 +5,7 @@ server per cc.query session), relays tool calls to sidebar_bot through Unix
 socket bridge (/tmp/babata-sidebar-bridge.sock), which fans out to the
 connected browser extension SW over WebSocket.
 
-V0 哲学: 给 LLM raw primitive 不给 workflow.
+Expose raw primitives, not workflow macros.
 - Browser-side: raw DOM/page primitive (tab_metadata / dom_query / dom_inject
   / dom_set / dom_click / page_snapshot / page_click_ref + tab_navigate).
   LLM compose 它们做任意页面读写 — 抓正文 / 表单填写 / 点击 / 显式注释.

@@ -5,7 +5,7 @@ tree and relays tool calls here; this dispatcher fans them out to the
 connected browser extension SW (single live WebSocket maintained by
 sidebar_bot) and waits for the SW reply.
 
-V0 哲学: bridge 不知道 action 名字含义, 只做 IPC 路由. ping (本地存活) 和
+Boundary: bridge does not interpret action names; it only routes IPC. ping (本地存活) 和
 notify_sw (server → SW 单向) 是 bridge 自带; 其他 action 一律走 SW round-
 trip — SW 决定怎么 dispatch (raw DOM primitive). LLM 在 server 端 reason 出
 具体 action 名字, bridge 透传.

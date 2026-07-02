@@ -336,8 +336,8 @@ def _spawn_summary_generation(sid: str, source_mtime: float) -> None:
                 + text
             )
             cli = os.environ.get("CLAUDE_CLI_PATH") or "claude"
-            # Model 不写死, 跟随 ~/.claude/settings.json 全局默认 (babata 哲学:
-            # 模型会随 CC 升级, 代码里写死 'haiku' 将来可能指向弃用 tier).
+            # Model 不写死, 跟随 ~/.claude/settings.json 全局默认:
+            # CC 模型会升级, 代码里写死 'haiku' 将来可能指向弃用 tier.
             # 若 V 觉得总结任务用 opus 太慢, 改 settings.json 或加 env override.
             #
             # CWD 用 _SUMMARY_SANDBOX 而不是 $HOME, 避免 subprocess session jsonl
