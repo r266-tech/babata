@@ -28,9 +28,8 @@ from blocking_review import (
 from constants import HOOKS_DIR as _HOOKS_DIR
 from cc import CC, Event, Response, StreamCB, _record_session_metadata
 from memory_runtime import (
+    log_memory_reflex_preflight_only,
     log_memory_reflex_post_answer,
-    log_memory_reflex_preflight,
-    memory_reflex_for_prompt,
     memory_reflex_mode,
     render_babata_memory_context_event,
 )
@@ -118,30 +117,6 @@ def _memory_inject_timeout() -> float:
         return max(0.1, float(raw))
     except ValueError:
         return 5.0
-
-
-def _log_memory_reflex_preflight_only(source: str | None, user_prompt: str | None) -> str | None:
-    if os.environ.get("BABATA_CRON_AGENT") == "1":
-        return None
-    source_name = source or "unknown"
-    reflex = memory_reflex_for_prompt(
-        source=source_name,
-        user_prompt=user_prompt,
-        cpu="codex",
-        cwd=_codex_cwd(source_name),
-    )
-    mode = memory_reflex_mode()
-    actual_profile = os.environ.get("BABATA_MEMORY_PROFILE") or "lite"
-    return log_memory_reflex_preflight(
-        reflex=reflex,
-        user_prompt=user_prompt,
-        source=source_name,
-        cpu="codex",
-        mode=mode,
-        actual_profile=actual_profile,
-        memory_injected=False,
-        hint_injected=False,
-    )
 
 
 def _render_babata_memory_context_event(
@@ -472,7 +447,13 @@ class CodexEngine(CC):
             )
             self._memory_reflex_event_id = event_id
         else:
-            self._memory_reflex_event_id = _log_memory_reflex_preflight_only(source, prompt)
+            source_name = source or "unknown"
+            self._memory_reflex_event_id = log_memory_reflex_preflight_only(
+                source=source_name,
+                user_prompt=prompt,
+                cpu="codex",
+                cwd=_codex_cwd(source_name),
+            )
         full_prompt = self._build_full_prompt(prompt, memory_context)
         memory_injected = bool(memory_context)
         base = [

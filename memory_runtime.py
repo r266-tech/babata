@@ -165,6 +165,33 @@ def log_memory_reflex_preflight(
     return event_id
 
 
+def log_memory_reflex_preflight_only(
+    *,
+    source: str,
+    user_prompt: str | None,
+    cpu: str,
+    cwd: str,
+) -> str | None:
+    if os.environ.get("BABATA_CRON_AGENT") == "1":
+        return None
+    reflex = memory_reflex_for_prompt(
+        source=source,
+        user_prompt=user_prompt,
+        cpu=cpu,
+        cwd=cwd,
+    )
+    return log_memory_reflex_preflight(
+        reflex=reflex,
+        user_prompt=user_prompt,
+        source=source,
+        cpu=cpu,
+        mode=memory_reflex_mode(),
+        actual_profile=os.environ.get("BABATA_MEMORY_PROFILE") or "lite",
+        memory_injected=False,
+        hint_injected=False,
+    )
+
+
 def _answer_memory_observation(content: str) -> dict[str, Any]:
     markers = ("不记得", "没记住", "没有记忆", "没有记录", "查不到", "没查到", "无法确认", "没有找到")
     return {

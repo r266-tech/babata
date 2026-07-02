@@ -167,8 +167,8 @@ def test_codex_engine_injects_babata_memory_once_per_session(monkeypatch, tmp_pa
     reflex_sources: list[str | None] = []
     monkeypatch.setattr(
         codex_engine,
-        "_log_memory_reflex_preflight_only",
-        lambda source=None, user_prompt=None: reflex_sources.append(source) or "event-1",
+        "log_memory_reflex_preflight_only",
+        lambda source, user_prompt, cpu, cwd: reflex_sources.append((source, cpu, cwd)) or "event-1",
     )
     session = codex_engine.CodexEngine(
         state_file=tmp_path / "session.json",
@@ -191,7 +191,7 @@ def test_codex_engine_injects_babata_memory_once_per_session(monkeypatch, tmp_pa
     assert resumed_injected is False
     assert "<memory-context>shared</memory-context>" not in resumed_prompt
     assert resumed_prompt.endswith("again")
-    assert reflex_sources == ["unknown"]
+    assert reflex_sources == [("unknown", "codex", codex_engine._codex_cwd("unknown"))]
 
 
 def test_codex_engine_uses_explicit_memory_source(monkeypatch, tmp_path):

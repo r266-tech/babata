@@ -109,6 +109,51 @@ def test_render_memory_context_event_logs_enforced_reflex(monkeypatch, tmp_path)
     assert events[1]["observation"]["memory_miss_marker"] is True
 
 
+def test_log_memory_reflex_preflight_only_records_router_without_inject(monkeypatch, tmp_path):
+    reflex_script = tmp_path / "reflex.py"
+    reflex_log = tmp_path / "events.jsonl"
+    _write_executable(
+        reflex_script,
+        "\n".join([
+            "#!/bin/sh",
+            "printf '%s\\n' '{\"routes\":[\"recent\"],\"profile\":\"recent\",\"reasons\":[\"history\"]}'",
+        ]),
+    )
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_SCRIPT", str(reflex_script))
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_LOG", str(reflex_log))
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX", "1")
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_MODE", "dry-run")
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_TIMEOUT", "2")
+    monkeypatch.delenv("BABATA_MEMORY_PROFILE", raising=False)
+
+    event_id = memory_runtime.log_memory_reflex_preflight_only(
+        source="sidebar",
+        user_prompt="look up yesterday",
+        cpu="codex",
+        cwd=str(tmp_path),
+    )
+
+    assert event_id
+    events = [json.loads(line) for line in reflex_log.read_text().splitlines()]
+    assert events == [
+        {
+            "actual_profile": "lite",
+            "event": "preflight",
+            "hint_injected": False,
+            "id": event_id,
+            "memory_injected": False,
+            "message_sha256": events[0]["message_sha256"],
+            "message_summary": "look up yesterday",
+            "mode": "dry-run",
+            "post_answer_observation": "pending",
+            "router": {"profile": "recent", "reasons": ["history"], "routes": ["recent"]},
+            "source": "sidebar",
+            "cpu": "codex",
+            "ts": events[0]["ts"],
+        }
+    ]
+
+
 def test_memory_runtime_owns_shared_reflex_helpers():
     cc_source = Path(cc.__file__).read_text(encoding="utf-8")
     codex_source = Path(codex_engine.__file__).read_text(encoding="utf-8")
@@ -125,6 +170,7 @@ def test_memory_runtime_owns_shared_reflex_helpers():
         "def _memory_reflex_log_path",
         "def _message_summary",
         "def _append_memory_reflex_event",
+        "def _log_memory_reflex_preflight_only",
         "def _answer_memory_observation",
     )
     for source in (cc_source, codex_source):
