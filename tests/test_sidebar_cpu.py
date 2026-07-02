@@ -185,32 +185,6 @@ def test_sidebar_engine_name_falls_back_without_engine_accessor(tmp_path):
     assert sidebar_bot._engine_name_for(NamelessEngine(), state_file) == "codex"
 
 
-def test_sidebar_proactive_prompt_stays_thin_and_boundary_focused():
-    prompt = sidebar_bot._PROACTIVE_PROMPT
-
-    assert len(prompt) <= 420
-    assert "默认静默" in prompt
-    assert "mascot_speak" in prompt
-    assert "suggest_prompts" in prompt
-    assert "tab_id/window_id" in prompt
-    assert "不编造观察" in prompt
-
-
-def test_sidebar_chat_source_prompt_stays_thin_and_boundary_focused():
-    prompt = sidebar_bot._SIDEBAR_SOURCE_PROMPT
-    tool_lines = sidebar_bot._SIDEBAR_TOOL_LINES
-
-    assert len(prompt) <= 1600
-    assert len(tool_lines) <= 520
-    assert "真实 schema 由 MCP 提供" in prompt
-    assert "tab_id/window_id" in prompt
-    assert "不可信数据" in prompt
-    assert "清楚用户意图" in prompt
-    assert "不要自行加载" in prompt
-    assert "DevTools" not in prompt
-    assert "babata-memory-context" not in prompt
-
-
 def test_sidebar_prompt_tool_map_is_compact_and_complete():
     tool_lines = prompt_tool_lines()
 

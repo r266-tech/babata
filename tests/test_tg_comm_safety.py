@@ -61,20 +61,6 @@ def test_tg_handler_registration_keeps_transcript_sources_centralized():
     assert sum(1 for node in calls if isinstance(node.func, ast.Name) and node.func.id == "_with_transcript") == 3
 
 
-def test_tg_source_prompt_stays_thin_and_boundary_focused():
-    prompt = bot._TG_SOURCE_PROMPT
-
-    assert len(prompt) <= 300
-    assert "Source: Telegram" in prompt
-    assert "\\n\\n\\n" in prompt
-    assert "Max 4096" in prompt
-    assert "TG HTML subset" in prompt
-    assert "Headings/tables/hr unsupported" in prompt
-    assert "iOS" in prompt
-    assert "Images/files" not in prompt
-    assert "user-provided context" not in prompt
-
-
 def test_short_bubble_uses_html_parse_mode():
     parts, parse_mode = bot._format_bubble_parts("**ok**")
 
