@@ -153,6 +153,28 @@ def test_short_bubble_uses_html_parse_mode():
     assert parse_mode == "HTML"
 
 
+def test_to_html_preserves_tg_supported_blocks_and_escapes_content():
+    text = "\n".join([
+        "# Title <unsafe>",
+        "> quote <x>",
+        "[docs <label>](https://example.com/?q=<x>)",
+        "`**literal**`",
+        "<b>raw safe</b>",
+        "```py",
+        "print('<x>')",
+        "```",
+    ])
+
+    rendered = bot._to_html(text)
+
+    assert "<b>Title &lt;unsafe&gt;</b>" in rendered
+    assert "<blockquote>quote &lt;x&gt;</blockquote>" in rendered
+    assert '<a href="https://example.com/?q=&lt;x&gt;">docs &lt;label&gt;</a>' in rendered
+    assert "<code>**literal**</code>" in rendered
+    assert "<b>raw safe</b>" in rendered
+    assert '<pre><code class="language-py">print(&#x27;&lt;x&gt;&#x27;)\n</code></pre>' in rendered
+
+
 def test_long_bubble_falls_back_to_plain_chunks():
     text = "<b>" + ("x" * 5000) + "</b>"
 

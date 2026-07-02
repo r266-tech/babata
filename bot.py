@@ -25,7 +25,7 @@ from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 sys.dont_write_bytecode = True
 
@@ -1245,6 +1245,90 @@ def _fmt_tool(name: str, inp: dict) -> str:
     return _tool_line(emoji, display, detail)
 
 
+_RAW_TG_HTML_TAGS = (
+    "tg-spoiler", "strong", "strike", "code", "ins", "del",
+    "em", "b", "i", "s", "u",
+)
+
+
+def _park_html_fragment(blocks: list[str], html_fragment: str) -> str:
+    blocks.append(html_fragment)
+    return f"\x00BLK{len(blocks) - 1}\x00"
+
+
+def _park_regex(
+    text: str,
+    blocks: list[str],
+    pattern: str,
+    render_html: Callable[[re.Match], str],
+    *,
+    flags: int = 0,
+) -> str:
+    def _save(m: re.Match) -> str:
+        return _park_html_fragment(blocks, render_html(m))
+    return re.sub(pattern, _save, text, flags=flags)
+
+
+def _park_fenced_code_blocks(text: str, blocks: list[str]) -> str:
+    def _render(m: re.Match) -> str:
+        lang = m.group(1) or ""
+        code = html.escape(m.group(2))
+        return (
+            f'<pre><code class="language-{lang}">{code}</code></pre>' if lang
+            else f"<pre>{code}</pre>"
+        )
+    return _park_regex(text, blocks, r"```(\w*)\n(.*?)```", _render, flags=re.DOTALL)
+
+
+def _park_raw_tg_html_tags(text: str, blocks: list[str]) -> str:
+    for raw_tag in _RAW_TG_HTML_TAGS:
+        text = _park_regex(
+            text,
+            blocks,
+            rf"<{raw_tag}>([^<]*)</{raw_tag}>",
+            lambda m, tag=raw_tag: f"<{tag}>{html.escape(m.group(1))}</{tag}>",
+        )
+    return text
+
+
+def _park_inline_code(text: str, blocks: list[str]) -> str:
+    return _park_regex(
+        text,
+        blocks,
+        r"`([^`\n]+)`",
+        lambda m: f"<code>{html.escape(m.group(1))}</code>",
+    )
+
+
+def _blockquote_html(m: re.Match) -> str:
+    raw = m.group(0)
+    lines = [re.sub(r"^\s*>\s?", "", line) for line in raw.split("\n")]
+    inner = html.escape("\n".join(lines).strip())
+    return f"<blockquote>{inner}</blockquote>"
+
+
+def _park_markdown_blocks_and_links(text: str, blocks: list[str]) -> str:
+    text = _park_regex(
+        text,
+        blocks,
+        r"(?m)^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$",
+        lambda m: f"<b>{html.escape(m.group(2).strip())}</b>",
+    )
+    text = _park_regex(text, blocks, r"(?m)(^[ \t]*>.*(?:\n[ \t]*>.*)*)", _blockquote_html)
+    return _park_regex(
+        text,
+        blocks,
+        r"\[([^\]\n]+)\]\(([^)\n]+)\)",
+        lambda m: f'<a href="{html.escape(m.group(2), quote=True)}">{html.escape(m.group(1))}</a>',
+    )
+
+
+def _restore_html_fragments(text: str, blocks: list[str]) -> str:
+    for i, block in enumerate(blocks):
+        text = text.replace(f"\x00BLK{i}\x00", block)
+    return text
+
+
 def _to_html(md: str) -> str:
     """Best-effort markdown → TG HTML (the tags TG actually accepts).
 
@@ -1265,19 +1349,7 @@ def _to_html(md: str) -> str:
 
     blocks: list[str] = []
 
-    def _park(html_fragment: str) -> str:
-        blocks.append(html_fragment)
-        return f"\x00BLK{len(blocks) - 1}\x00"
-
-    # 1a. Fenced code blocks (first — highest precedence, opaque)
-    def _save_code(m: re.Match) -> str:
-        lang = m.group(1) or ""
-        code = html.escape(m.group(2))
-        return _park(
-            f'<pre><code class="language-{lang}">{code}</code></pre>' if lang
-            else f"<pre>{code}</pre>"
-        )
-    text = re.sub(r"```(\w*)\n(.*?)```", _save_code, md, flags=re.DOTALL)
+    text = _park_fenced_code_blocks(md, blocks)
 
     # 1b. Pre-existing TG-compatible HTML inline tags. CC may write them
     # directly (e.g. `<b>核心</b>` instead of `**核心**`); we park them so
@@ -1289,53 +1361,21 @@ def _to_html(md: str) -> str:
     # Keep `u/ins/tg-spoiler` (no markdown equivalent) + add `b/strong/
     # i/em/s/strike/del/code` (have markdown equivalent but model may
     # emit raw HTML directly).
-    _RAW_TAGS = (
-        "tg-spoiler", "strong", "strike", "code", "ins", "del",
-        "em", "b", "i", "s", "u",
-    )
-    for _raw_tag in _RAW_TAGS:
-        def _make_raw_saver(t: str):
-            def _save(m: re.Match) -> str:
-                return _park(f"<{t}>{html.escape(m.group(1))}</{t}>")
-            return _save
-        text = re.sub(
-            rf"<{_raw_tag}>([^<]*)</{_raw_tag}>",
-            _make_raw_saver(_raw_tag),
-            text,
-        )
+    text = _park_raw_tg_html_tags(text, blocks)
 
     # 1c. Inline backtick code — PARK (not just replace) so later bold/italic
     # regexes can't reach the `**` or `*` inside. Without this, `\`**粗**\``
     # gets turned into <code>**粗**</code>, then bold regex chews through the
     # <code> tag and produces <code><b>粗</b></code> which breaks TG parsing
     # entirely and falls back to plain text.
-    def _save_inline_code(m: re.Match) -> str:
-        inner = html.escape(m.group(1))
-        return _park(f"<code>{inner}</code>")
-    text = re.sub(r"`([^`\n]+)`", _save_inline_code, text)
+    text = _park_inline_code(text, blocks)
 
     # 1c. Markdown headings `# / ## / ###...` — TG has no heading tag, degrade
     # to <b> on its own line. Single-line form: `^#+ whatever` until EOL.
-    def _save_heading(m: re.Match) -> str:
-        inner = html.escape(m.group(2).strip())
-        return _park(f"<b>{inner}</b>")
-    text = re.sub(r"(?m)^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$", _save_heading, text)
-
     # 1d. Blockquote: consecutive `> line` merged into one <blockquote>
-    def _save_bq(m: re.Match) -> str:
-        raw = m.group(0)
-        lines = [re.sub(r"^\s*>\s?", "", l) for l in raw.split("\n")]
-        inner = html.escape("\n".join(lines).strip())
-        return _park(f"<blockquote>{inner}</blockquote>")
-    text = re.sub(r"(?m)(^[ \t]*>.*(?:\n[ \t]*>.*)*)", _save_bq, text)
-
     # 1e. Markdown links [text](url). Escape both pieces so user-provided `<`
     # can't break the HTML. href gets quote-escape too for the attribute.
-    def _save_link(m: re.Match) -> str:
-        label = html.escape(m.group(1))
-        href = html.escape(m.group(2), quote=True)
-        return _park(f'<a href="{href}">{label}</a>')
-    text = re.sub(r"\[([^\]\n]+)\]\(([^)\n]+)\)", _save_link, text)
+    text = _park_markdown_blocks_and_links(text, blocks)
 
     # 2. Escape everything else
     text = html.escape(text)
@@ -1347,9 +1387,7 @@ def _to_html(md: str) -> str:
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
 
     # 4. Restore placeholders (NUL + 'BLK' + digits survives html.escape intact)
-    for i, blk in enumerate(blocks):
-        text = text.replace(f"\x00BLK{i}\x00", blk)
-    return text.strip()
+    return _restore_html_fragments(text, blocks).strip()
 
 
 def _utf16_len(s: str) -> int:
