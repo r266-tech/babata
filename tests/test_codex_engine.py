@@ -84,6 +84,63 @@ def _json_line(payload: dict) -> str:
     return json.dumps(payload) + "\n"
 
 
+def test_codex_command_accumulator_tracks_tool_result_and_usage():
+    streamed = []
+
+    async def on_stream(tool_name, tool_input, text_chunk, tool_result):
+        streamed.append((tool_name, tool_input, text_chunk, tool_result))
+
+    async def run():
+        events = codex_engine.CodexCommandAccumulator(on_stream)
+        await events.handle_event({"type": "thread.started", "thread_id": "sid-1"}, "")
+        await events.handle_event({
+            "type": "item.started",
+            "item": {
+                "id": "call_0",
+                "type": "function_call",
+                "name": "browser_tab_list",
+                "arguments": {"active": True},
+            },
+        }, "")
+        await events.handle_event({
+            "type": "item.completed",
+            "item": {
+                "call_id": "call_0",
+                "type": "function_call_output",
+                "output": [{"title": "Home"}],
+            },
+        }, "")
+        await events.handle_event({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "done"},
+        }, "")
+        await events.handle_event({
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 3,
+                "cached_input_tokens": 2,
+                "output_tokens": 1,
+            },
+        }, "")
+
+        assert events.result() == {
+            "sid": "sid-1",
+            "content": "done",
+            "tools": ["browser_tab_list"],
+            "tool_uses": [{"name": "browser_tab_list"}],
+            "usage": {
+                "input_tokens": 3,
+                "cached_input_tokens": 2,
+                "output_tokens": 1,
+            },
+        }
+
+    asyncio.run(run())
+
+    assert streamed[0][0] == "browser_tab_list"
+    assert streamed[1][3] == {"is_error": False, "text": '[{"title": "Home"}]'}
+
+
 def test_codex_engine_query_parses_json_and_persists(monkeypatch, tmp_path):
     captured = {}
     lines = [

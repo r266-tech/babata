@@ -293,6 +293,100 @@ def _codex_tool_summary(name: str, item: dict[str, Any]) -> dict[str, Any]:
     return summarize_tool_use(name, tool_input)
 
 
+class CodexCommandAccumulator:
+    def __init__(self, on_stream: StreamCB | None) -> None:
+        self.on_stream = on_stream
+        self.sid: str | None = None
+        self.content = ""
+        self.tools: list[str] = []
+        self.tool_uses: list[dict[str, Any]] = []
+        self.running_tools: dict[str, str] = {}
+        self.usage: dict[str, int] = {}
+        self.failure_message: str | None = None
+
+    def _remember_tool(self, name: str) -> None:
+        if name not in self.tools:
+            self.tools.append(name)
+
+    def _remember_tool_use(self, name: str, item: dict[str, Any]) -> None:
+        if not name:
+            return
+        summary = _codex_tool_summary(name, item)
+        if summary not in self.tool_uses:
+            self.tool_uses.append(summary)
+
+    async def handle_event(self, event: dict[str, Any], line: str) -> None:
+        etype = event.get("type")
+        if etype == "thread.started":
+            self.sid = event.get("thread_id") or self.sid
+            return
+        if etype == "turn.failed":
+            err = event.get("error") or {}
+            if isinstance(err, dict) and err.get("message"):
+                self.failure_message = str(err.get("message"))
+            else:
+                self.failure_message = json.dumps(event, ensure_ascii=False)
+            return
+        if etype == "error":
+            self.failure_message = str(event.get("message") or line)
+            return
+        if etype == "item.started":
+            item = event.get("item") or {}
+            name = _extract_tool_name(item)
+            if name:
+                self._remember_tool(name)
+                self._remember_tool_use(name, item)
+                item_id = _extract_tool_id(item)
+                if item_id:
+                    self.running_tools[item_id] = name
+                if self.on_stream:
+                    await self.on_stream(name, item, None, None)
+            return
+        if etype == "item.completed":
+            item = event.get("item") or {}
+            if item.get("type") == "agent_message":
+                text = str(item.get("text") or "").strip()
+                if text:
+                    self.content = text
+                return
+            item_id = _extract_tool_id(item)
+            name = _extract_tool_name(item)
+            if not name and item_id:
+                name = self.running_tools.get(item_id)
+            if name:
+                self._remember_tool(name)
+                if item_id:
+                    self.running_tools.pop(item_id, None)
+                if self.on_stream:
+                    await self.on_stream(None, None, None, _extract_tool_result(item))
+            return
+        if etype == "turn.completed":
+            raw_usage = event.get("usage") or {}
+            self.usage = {
+                "input_tokens": int(raw_usage.get("input_tokens") or 0),
+                "cached_input_tokens": int(raw_usage.get("cached_input_tokens") or 0),
+                "output_tokens": int(raw_usage.get("output_tokens") or 0),
+            }
+
+    def result(self) -> dict[str, Any]:
+        return {
+            "sid": self.sid,
+            "content": self.content,
+            "tools": self.tools,
+            "tool_uses": self.tool_uses,
+            "usage": self.usage,
+        }
+
+    def split_error_result(self) -> dict[str, Any]:
+        return _split_error_result(
+            sid=self.sid,
+            content=self.content,
+            tools=self.tools,
+            tool_uses=self.tool_uses,
+            usage=self.usage,
+        )
+
+
 class CodexEngine(CC):
     """One-shot Codex CLI backend with babata-compatible state."""
 
@@ -593,24 +687,7 @@ class CodexEngine(CC):
                 with suppress(Exception):
                     await wait_closed()
         stderr_task = asyncio.create_task(proc.stderr.read())
-        sid: str | None = None
-        content = ""
-        tools: list[str] = []
-        tool_uses: list[dict[str, Any]] = []
-        running_tools: dict[str, str] = {}
-        usage: dict[str, int] = {}
-        failure_message: str | None = None
-
-        def remember_tool(name: str) -> None:
-            if name not in tools:
-                tools.append(name)
-
-        def remember_tool_use(name: str, item: dict[str, Any]) -> None:
-            if not name:
-                return
-            summary = _codex_tool_summary(name, item)
-            if summary not in tool_uses:
-                tool_uses.append(summary)
+        events = CodexCommandAccumulator(on_stream)
 
         try:
             stall_timeout = _codex_stall_timeout()
@@ -638,57 +715,7 @@ class CodexEngine(CC):
                 except json.JSONDecodeError:
                     log.debug("codex non-json stdout: %s", line[:500])
                     continue
-                etype = event.get("type")
-                if etype == "thread.started":
-                    sid = event.get("thread_id") or sid
-                    continue
-                if etype == "turn.failed":
-                    err = event.get("error") or {}
-                    if isinstance(err, dict) and err.get("message"):
-                        failure_message = str(err.get("message"))
-                    else:
-                        failure_message = json.dumps(event, ensure_ascii=False)
-                    continue
-                if etype == "error":
-                    failure_message = str(event.get("message") or line)
-                    continue
-                if etype == "item.started":
-                    item = event.get("item") or {}
-                    name = _extract_tool_name(item)
-                    if name:
-                        remember_tool(name)
-                        remember_tool_use(name, item)
-                        item_id = _extract_tool_id(item)
-                        if item_id:
-                            running_tools[item_id] = name
-                        if on_stream:
-                            await on_stream(name, item, None, None)
-                    continue
-                if etype == "item.completed":
-                    item = event.get("item") or {}
-                    if item.get("type") == "agent_message":
-                        text = str(item.get("text") or "").strip()
-                        if text:
-                            content = text
-                    else:
-                        item_id = _extract_tool_id(item)
-                        name = _extract_tool_name(item)
-                        if not name and item_id:
-                            name = running_tools.get(item_id)
-                        if name:
-                            remember_tool(name)
-                            if item_id:
-                                running_tools.pop(item_id, None)
-                            if on_stream:
-                                await on_stream(None, None, None, _extract_tool_result(item))
-                    continue
-                if etype == "turn.completed":
-                    raw_usage = event.get("usage") or {}
-                    usage = {
-                        "input_tokens": int(raw_usage.get("input_tokens") or 0),
-                        "cached_input_tokens": int(raw_usage.get("cached_input_tokens") or 0),
-                        "output_tokens": int(raw_usage.get("output_tokens") or 0),
-                    }
+                await events.handle_event(event, line)
             rc = await proc.wait()
         except asyncio.CancelledError:
             await _terminate_process(proc, timeout=2)
@@ -699,35 +726,17 @@ class CodexEngine(CC):
             await _cancel_task(stderr_task)
             if _is_codex_split_error(str(e)):
                 log.warning("codex stdout split failure: %s", str(e)[:300])
-                return _split_error_result(
-                    sid=sid,
-                    content=content,
-                    tools=tools,
-                    tool_uses=tool_uses,
-                    usage=usage,
-                )
+                return events.split_error_result()
             raise
 
         stderr = (await stderr_task).decode("utf-8", errors="replace").strip()
-        error_text = "\n".join(part for part in (failure_message, stderr) if part)
-        if rc != 0 or failure_message:
+        error_text = "\n".join(part for part in (events.failure_message, stderr) if part)
+        if rc != 0 or events.failure_message:
             if _is_codex_split_error(error_text):
                 log.warning("codex output split failure: %s", error_text[:300])
-                return _split_error_result(
-                    sid=sid,
-                    content=content,
-                    tools=tools,
-                    tool_uses=tool_uses,
-                    usage=usage,
-                )
+                return events.split_error_result()
             raise RuntimeError(error_text or f"codex exited {rc}")
-        return {
-            "sid": sid,
-            "content": content,
-            "tools": tools,
-            "tool_uses": tool_uses,
-            "usage": usage,
-        }
+        return events.result()
 
     def _record_codex_turn(self, sid: str, prompt: str, content: str) -> None:
         state = self._load_state()
