@@ -416,11 +416,11 @@ async def _mark_processed(update_id: int | None) -> None:
 
 _TG_SOURCE_PROMPT = (
     "Source: Telegram. "
-    "Output Markdown (bot auto-converts to HTML subset: b/i/u/s/code/pre/a/blockquote). "
-    "Markdown headings/tables/hr unsupported. "
-    "iOS system font: prefer █/░ for progress bars; ▓ renders as noisy stipple. "
-    "New bubble: separate paragraphs with three newlines (\\n\\n\\n). "
-    "Max 4096 chars/message."
+    "Write Markdown; bot converts to TG HTML subset (b/i/u/s/code/pre/a/blockquote). "
+    "Headings/tables/hr unsupported. "
+    "New bubble: separate response bubbles with three newlines (\\n\\n\\n). "
+    "Max 4096 chars/message. "
+    "Progress bars: prefer █/░; ▓ looks noisy on iOS."
 )
 
 def _tg_mcp_servers() -> dict[str, Any]:
