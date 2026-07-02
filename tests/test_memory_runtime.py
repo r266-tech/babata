@@ -10,6 +10,8 @@ import cc
 import codex_engine
 import memory_runtime
 
+_TEST_REFLEX_TIMEOUT_S = "5"
+
 
 def _write_executable(path: Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
@@ -57,7 +59,7 @@ def test_render_memory_context_event_logs_enforced_reflex(monkeypatch, tmp_path)
     monkeypatch.setenv("BABATA_MEMORY_REFLEX_LOG", str(reflex_log))
     monkeypatch.setenv("BABATA_MEMORY_REFLEX", "1")
     monkeypatch.setenv("BABATA_MEMORY_REFLEX_MODE", "enforce")
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_TIMEOUT", "2")
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_TIMEOUT", _TEST_REFLEX_TIMEOUT_S)
     monkeypatch.delenv("BABATA_MEMORY_PROFILE", raising=False)
     monkeypatch.setenv("BABATA_MEMORY_CPU", "stale-cpu")
     monkeypatch.setenv("BABATA_MEMORY_SOURCE", "stale-source")
@@ -69,7 +71,7 @@ def test_render_memory_context_event_logs_enforced_reflex(monkeypatch, tmp_path)
         user_prompt="hello memory",
         cpu="codex",
         cwd=str(tmp_path),
-        timeout=2.0,
+        timeout=float(_TEST_REFLEX_TIMEOUT_S),
     )
 
     assert event_id
@@ -123,7 +125,7 @@ def test_log_memory_reflex_preflight_only_records_router_without_inject(monkeypa
     monkeypatch.setenv("BABATA_MEMORY_REFLEX_LOG", str(reflex_log))
     monkeypatch.setenv("BABATA_MEMORY_REFLEX", "1")
     monkeypatch.setenv("BABATA_MEMORY_REFLEX_MODE", "dry-run")
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_TIMEOUT", "2")
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_TIMEOUT", _TEST_REFLEX_TIMEOUT_S)
     monkeypatch.delenv("BABATA_MEMORY_PROFILE", raising=False)
 
     event_id = memory_runtime.log_memory_reflex_preflight_only(
