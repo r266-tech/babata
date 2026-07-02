@@ -20,3 +20,9 @@ def test_wx_text_tool_description_stays_operational():
         assert marker in text
     for marker in ("Markdown natively", "bold/italic", "lists/tables", "Bare URLs", "[text](url)"):
         assert marker not in text
+
+
+def test_wx_voice_tool_stays_absent_from_model_visible_schema():
+    tools = {tool.name: tool for tool in asyncio.run(weixin_mcp.list_tools())}
+
+    assert "wx_send_voice" not in tools
