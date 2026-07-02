@@ -51,9 +51,8 @@ def test_render_memory_context_event_logs_enforced_reflex(monkeypatch, tmp_path)
     _write_executable(
         reflex_script,
         "\n".join([
-            "#!/usr/bin/env python3",
-            "import json",
-            "print(json.dumps({'routes': ['deep'], 'profile': 'deep', 'reasons': ['need detail']}))",
+            "#!/bin/sh",
+            "printf '%s\\n' '{\"routes\":[\"deep\"],\"profile\":\"deep\",\"reasons\":[\"need detail\"]}'",
         ]),
     )
     monkeypatch.setenv("BABATA_MEMORY_INJECT_SCRIPT", str(inject_script))
@@ -63,9 +62,9 @@ def test_render_memory_context_event_logs_enforced_reflex(monkeypatch, tmp_path)
     monkeypatch.setenv("BABATA_MEMORY_REFLEX_MODE", "enforce")
     monkeypatch.setenv("BABATA_MEMORY_REFLEX_TIMEOUT", "2")
     monkeypatch.delenv("BABATA_MEMORY_PROFILE", raising=False)
-    monkeypatch.delenv("BABATA_MEMORY_CPU", raising=False)
-    monkeypatch.delenv("BABATA_MEMORY_SOURCE", raising=False)
-    monkeypatch.delenv("BABATA_MEMORY_INCLUDE_TOP", raising=False)
+    monkeypatch.setenv("BABATA_MEMORY_CPU", "stale-cpu")
+    monkeypatch.setenv("BABATA_MEMORY_SOURCE", "stale-source")
+    monkeypatch.setenv("BABATA_MEMORY_INCLUDE_TOP", "skip")
 
     context, event_id = memory_runtime.render_babata_memory_context_event(
         enabled=True,
