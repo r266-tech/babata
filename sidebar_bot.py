@@ -603,7 +603,7 @@ def _cpu_status_payload() -> dict[str, Any]:
         "label": engine_label(current),
         "proactive_cpu": proactive,
         "proactive_label": engine_label(proactive),
-        "busy": chat_busy or proactive_busy,
+        "busy": chat_busy,
         "chat_busy": chat_busy,
         "proactive_busy": proactive_busy,
         "choices": [
@@ -631,7 +631,7 @@ async def _switch_sidebar_cpu(target: str) -> dict[str, Any]:
         payload["message"] = f"CPU 已经是 {engine_label(target_name)}"
         return payload
 
-    if _cc_lock.locked() or _proactive_lock.locked():
+    if _cc_lock.locked():
         raise RuntimeError("当前还有 sidebar turn 在跑，等结束后再切 CPU")
 
     # Preserve each current engine's sid in the per-engine slot before replacing

@@ -49,7 +49,7 @@ def test_sidebar_cpu_status_reads_public_session_property(monkeypatch):
     payload = sidebar_bot._cpu_status_payload()
 
     assert payload["session_id"] == "sid-visible"
-    assert payload["busy"] is True
+    assert payload["busy"] is False
     assert payload["chat_busy"] is False
     assert payload["proactive_busy"] is True
 
@@ -105,7 +105,7 @@ def test_sidebar_cpu_switch_persists_sessions_with_public_api(monkeypatch, tmp_p
     assert [engine.persisted for engine in made] == [1, 1]
 
 
-def test_sidebar_cpu_switch_waits_for_chat_or_proactive_turn(monkeypatch):
+def test_sidebar_cpu_switch_only_waits_for_chat_turn(monkeypatch, tmp_path):
     class FakeLock:
         def __init__(self, locked: bool):
             self._locked = locked
@@ -114,10 +114,14 @@ def test_sidebar_cpu_switch_waits_for_chat_or_proactive_turn(monkeypatch):
             return self._locked
 
     class FakeEngine:
-        _name = "claude"
+        def __init__(self, name: str = "claude"):
+            self._name = name
 
         @property
         def session_id(self):
+            return None
+
+        def persist_current_session(self):
             return None
 
     def engine_name_for(obj, _state_file: Path) -> str:
@@ -126,16 +130,26 @@ def test_sidebar_cpu_switch_waits_for_chat_or_proactive_turn(monkeypatch):
     monkeypatch.setattr(sidebar_bot, "_engine_name_for", engine_name_for)
     monkeypatch.setattr(sidebar_bot, "cc", FakeEngine())
     monkeypatch.setattr(sidebar_bot, "proactive_cc", FakeEngine())
+    monkeypatch.setattr(sidebar_bot, "_SIDEBAR_SESSION_FILE", tmp_path / "sidebar.json")
+    monkeypatch.setattr(sidebar_bot, "_PROACTIVE_SESSION_FILE", tmp_path / "proactive.json")
+    monkeypatch.setattr(sidebar_bot, "_make_sidebar_engine", lambda target: FakeEngine(target))
+    monkeypatch.setattr(sidebar_bot, "_make_proactive_engine", lambda target: FakeEngine(target))
 
-    for chat_locked, proactive_locked in [(True, False), (False, True)]:
-        monkeypatch.setattr(sidebar_bot, "_cc_lock", FakeLock(chat_locked))
-        monkeypatch.setattr(sidebar_bot, "_proactive_lock", FakeLock(proactive_locked))
-        try:
-            asyncio.run(sidebar_bot._switch_sidebar_cpu("codex"))
-        except RuntimeError as exc:
-            assert "sidebar turn" in str(exc)
-        else:
-            raise AssertionError("CPU switch should wait for active sidebar turns")
+    monkeypatch.setattr(sidebar_bot, "_cc_lock", FakeLock(False))
+    monkeypatch.setattr(sidebar_bot, "_proactive_lock", FakeLock(True))
+    payload = asyncio.run(sidebar_bot._switch_sidebar_cpu("codex"))
+    assert payload["changed"] is True
+
+    monkeypatch.setattr(sidebar_bot, "cc", FakeEngine("claude"))
+    monkeypatch.setattr(sidebar_bot, "proactive_cc", FakeEngine("claude"))
+    monkeypatch.setattr(sidebar_bot, "_cc_lock", FakeLock(True))
+    monkeypatch.setattr(sidebar_bot, "_proactive_lock", FakeLock(False))
+    try:
+        asyncio.run(sidebar_bot._switch_sidebar_cpu("codex"))
+    except RuntimeError as exc:
+        assert "sidebar turn" in str(exc)
+    else:
+        raise AssertionError("CPU switch should wait for active chat turns")
 
 
 def test_sidebar_cpu_switch_does_not_reach_into_engine_private_session_state():
