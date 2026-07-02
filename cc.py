@@ -891,6 +891,10 @@ class CC:
             state["recent_sids"] = hist[:_MAX_RECENT_SIDS]
         self._save_state(state)
 
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
     def _check_idle_reset(self) -> bool:
         """Silently reset session if idle exceeds threshold. Returns True if reset.
 
@@ -1634,10 +1638,6 @@ class LiveSession(CC):
         self._started_with_resume = False
         self._pending_audits: list[TurnAudit | None] = []
         self._blocking_review_round = 0
-
-    @property
-    def session_id(self) -> str | None:
-        return self._session_id
 
     @property
     def is_connected(self) -> bool:
