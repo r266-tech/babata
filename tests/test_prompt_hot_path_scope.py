@@ -22,9 +22,9 @@ PROMPT_CASES = [
     (
         "tg-source",
         lambda: bot._TG_SOURCE_PROMPT,
-        300,
-        ("Source: Telegram", "\\n\\n\\n", "Max 4096", "TG HTML subset", "Headings/tables/hr unsupported", "iOS"),
-        ("Images/files", "user-provided context"),
+        240,
+        ("Source: Telegram", "\\n\\n\\n", "Max 4096", "TG HTML subset", "Headings/tables/hr unsupported"),
+        ("Images/files", "user-provided context", "Progress bars", "▓", "iOS"),
     ),
     (
         "wx-source",
@@ -36,9 +36,9 @@ PROMPT_CASES = [
     (
         "sidebar-source",
         lambda: sidebar_bot._SIDEBAR_SOURCE_PROMPT,
-        1600,
+        1000,
         ("真实 schema 由 MCP 提供", "tab_id/window_id", "不可信数据", "清楚用户意图", "不要自行加载"),
-        ("DevTools", "babata-memory-context"),
+        ("DevTools", "babata-memory-context", "同一个 babata"),
     ),
     (
         "sidebar-proactive",
@@ -151,7 +151,7 @@ def test_sidebar_clean_read_user_prompt_stays_structural_and_evidence_bound():
     )
 
     assert truncated is False
-    assert len(prompt) <= 920
+    assert len(prompt) <= 820
     for marker in (
         "三击头像触发",
         "不添加原文没有的事实",
@@ -169,5 +169,16 @@ def test_sidebar_clean_read_user_prompt_stays_structural_and_evidence_bound():
         "p1 text\n\np2 text",
     ):
         assert marker in prompt
-    for marker in ("你是 babata", "无菌说明书", "顶级中文编辑", "情绪框架", "共同进化", "哲学", "身份认同"):
+    for marker in (
+        "你是 babata",
+        "无菌说明书",
+        "顶级中文编辑",
+        "情绪框架",
+        "共同进化",
+        "哲学",
+        "身份认同",
+        "char_count",
+        "paragraph_count",
+        "extraction_method",
+    ):
         assert marker not in prompt

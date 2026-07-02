@@ -558,7 +558,10 @@ def test_weixin_poll_batch_coalesces_same_sender_messages(monkeypatch, tmp_path)
         task = asyncio.create_task(wb._run_account("acc"))
         await asyncio.wait_for(_wait_until(lambda: saved == ["new-buf"]), timeout=1)
         assert len(prompts) == 1
-        assert "WeChat messages" in prompts[0]
+        assert "Multiple WeChat messages, oldest to newest" in prompts[0]
+        assert "clarify or supersede" in prompts[0]
+        assert "previous turn" not in prompts[0]
+        assert "poll checkpoint" not in prompts[0]
         assert "<user_message n=1>" in prompts[0]
         assert "first" in prompts[0]
         assert "<user_message n=2>" in prompts[0]

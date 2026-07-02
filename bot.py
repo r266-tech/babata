@@ -420,8 +420,7 @@ _TG_SOURCE_PROMPT = (
     "Write Markdown; bot converts to TG HTML subset (b/i/u/s/code/pre/a/blockquote). "
     "Headings/tables/hr unsupported. "
     "New bubble: separate response bubbles with three newlines (\\n\\n\\n). "
-    "Max 4096 chars/message. "
-    "Progress bars: prefer █/░; ▓ looks noisy on iOS."
+    "Max 4096 chars/message."
 )
 
 def _tg_mcp_servers() -> dict[str, Any]:
@@ -1562,10 +1561,8 @@ def _format_coalesced_tg_prompt(payloads: list[Payload]) -> str:
         return payloads[0].text if payloads else ""
 
     blocks = [
-        "The user sent these follow-up Telegram messages while the previous "
-        "turn was running.",
-        "Treat them as one user turn, ordered oldest to newest. Later messages "
-        "may clarify or supersede earlier messages.",
+        "Multiple Telegram messages, oldest to newest; later messages may "
+        "clarify or supersede earlier ones.",
         "",
     ]
     for idx, payload in enumerate(payloads, start=1):

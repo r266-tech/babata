@@ -33,10 +33,9 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="wx_send_text",
             description=(
-                "Send a text message to the user's WeChat. "
-                "Inbound WeChat final-turn text is already auto-delivered; "
-                "use this additive tool only for mid-turn pushes, long-running progress, "
-                "or proactive sends."
+                "Send text to WeChat. Final-turn WeChat replies are auto-delivered; "
+                "use this additive tool only for mid-turn pushes, long-running "
+                "progress, or proactive sends."
             ),
             inputSchema={
                 "type": "object",
@@ -90,11 +89,7 @@ async def list_tools() -> list[Tool]:
         # wx_send_voice stays absent: iLink filters bot→user voice; bridge returns the verdict if called directly.
         Tool(
             name="wx_send_typing",
-            description=(
-                "Show or hide the 'typing…' indicator in WeChat. "
-                "Use status=1 before a long task, status=2 to cancel early. "
-                "WeChat auto-cancels typing after a short delay so repeated calls are OK."
-            ),
+            description="Show/cancel WeChat typing indicator.",
             inputSchema={
                 "type": "object",
                 "properties": {

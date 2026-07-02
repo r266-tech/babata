@@ -797,7 +797,9 @@ def test_channel_worker_codex_coalesces_pending_cut_ins(monkeypatch, tmp_path):
         await wait_for(lambda: len(session.submitted) == 2)
         prompt, images = session.submitted[1]
         assert images is None
-        assert "follow-up Telegram messages" in prompt
+        assert "Multiple Telegram messages, oldest to newest" in prompt
+        assert "clarify or supersede" in prompt
+        assert "previous turn" not in prompt
         assert "<user_message n=1 update_id=102 message_id=2>" in prompt
         assert "second" in prompt
         assert "<user_message n=2 update_id=103 message_id=3>" in prompt

@@ -66,6 +66,7 @@ def test_tg_mcp_tool_descriptions_stay_operational():
     tools = {tool.name: tool for tool in asyncio.run(tg_mcp.list_tools())}
     text = tools["tg_send_text"]
     page = tools["tg_send_page"]
+    voice = tools["tg_send_voice"]
 
     assert len(text.description) <= 180
     for marker in ("Telegram", "auto-delivered", "mid-turn pushes", "long-running progress", "proactive sends"):
@@ -78,6 +79,23 @@ def test_tg_mcp_tool_descriptions_stay_operational():
         assert marker in page.description
     for marker in ("Instant View card", "syntax-highlighted", "<ul>/<ol>", "h3/h4", "unsupported elements"):
         assert marker not in page.description
+    title_description = page.inputSchema["properties"]["title"]["description"]
+    assert title_description == "Page title"
+    for marker in ("Instant View", "preview snippet"):
+        assert marker not in title_description
+
+    assert len(voice.description) <= 150
+    for marker in ("voice message",):
+        assert marker in voice.description
+    for marker in (
+        "arbitrary natural-language",
+        "free combinations",
+        "（笑）",
+        "（咳嗽）",
+        "（叹气）",
+        "（停顿）",
+    ):
+        assert marker not in voice.description
 
 
 def test_tg_instance_schema_stays_compact_without_losing_route_values():

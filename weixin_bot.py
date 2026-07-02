@@ -692,10 +692,8 @@ async def _process_combined_msgs(
     combined = "\n".join(message_bodies).strip()
     if len(message_bodies) > 1:
         blocks = [
-            "The user sent these WeChat messages while the previous turn was "
-            "running or before the current poll checkpoint advanced.",
-            "Treat them as one user turn, ordered oldest to newest. Later "
-            "messages may clarify or supersede earlier messages.",
+            "Multiple WeChat messages, oldest to newest; later messages may "
+            "clarify or supersede earlier ones.",
             "",
         ]
         for idx, body in enumerate(message_bodies, start=1):

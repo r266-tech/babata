@@ -22,6 +22,18 @@ def test_wx_text_tool_description_stays_operational():
         assert marker not in text
 
 
+def test_wx_tool_descriptions_stay_compact_and_schema_owned():
+    tools = {tool.name: tool for tool in asyncio.run(weixin_mcp.list_tools())}
+    descriptions = [tool.description for tool in tools.values()]
+
+    assert max(len(description) for description in descriptions) <= 180
+    typing = tools["wx_send_typing"]
+    assert typing.description == "Show/cancel WeChat typing indicator."
+    assert typing.inputSchema["properties"]["status"]["description"] == "1 = typing on, 2 = typing off"
+    for marker in ("auto-cancels", "repeated calls are OK", "before a long task"):
+        assert marker not in typing.description
+
+
 def test_wx_voice_tool_stays_absent_from_model_visible_schema():
     tools = {tool.name: tool for tool in asyncio.run(weixin_mcp.list_tools())}
 

@@ -59,19 +59,13 @@ server = Server("tg")
 
 def _voice_description() -> str:
     """Facts about the actual TTS backend so CC can decide how to use markup."""
-    base = (
-        "Synthesize text to speech and send as a TG voice message. "
-        "text may include backend-specific expressive markup."
-    )
+    base = "Synthesize text to speech and send as a TG voice message."
     backend = os.environ.get("TTS_BACKEND", "openai").lower()
     has_custom_url = bool(os.environ.get("TTS_URL"))
 
     if backend == "mimo" and has_custom_url:
         return (
-            f"{base} Current backend (mimo-v2-tts) recognizes "
-            "<style>arbitrary natural-language description</style> prefix "
-            "(emotion/dialect/role/singing/free combinations), and full-width "
-            "paren inline cues like （笑）/（咳嗽）/（叹气）/（停顿） for sound events."
+            f"{base} Current Mimo backend supports <style> prefix and full-width paren cues."
         )
     if has_custom_url:
         return f"{base} Current backend is OpenAI-compatible /audio/speech (plain text, no markup)."
@@ -217,7 +211,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "title": {
                         "type": "string",
-                        "description": "Page title — shown as h1 in the Instant View card and in TG's preview snippet",
+                        "description": "Page title",
                     },
                     "content_md": {
                         "type": "string",
