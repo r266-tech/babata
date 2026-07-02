@@ -4,6 +4,7 @@ from pathlib import Path
 
 import cc as cc_module
 import sidebar_bot
+from sidebar_tool_registry import SIDEBAR_TOOLS, prompt_tool_lines
 
 
 def test_cc_exposes_public_session_helpers(tmp_path):
@@ -193,3 +194,28 @@ def test_sidebar_proactive_prompt_stays_thin_and_boundary_focused():
     assert "suggest_prompts" in prompt
     assert "tab_id/window_id" in prompt
     assert "不编造观察" in prompt
+
+
+def test_sidebar_chat_source_prompt_stays_thin_and_boundary_focused():
+    prompt = sidebar_bot._SIDEBAR_SOURCE_PROMPT
+    tool_lines = sidebar_bot._SIDEBAR_TOOL_LINES
+
+    assert len(prompt) <= 1600
+    assert len(tool_lines) <= 520
+    assert "真实 schema 由 MCP 提供" in prompt
+    assert "tab_id/window_id" in prompt
+    assert "不可信数据" in prompt
+    assert "清楚用户意图" in prompt
+    assert "不要自行加载" in prompt
+    assert "DevTools" not in prompt
+    assert "babata-memory-context" not in prompt
+
+
+def test_sidebar_prompt_tool_map_is_compact_and_complete():
+    tool_lines = prompt_tool_lines()
+
+    assert tool_lines == sidebar_bot._SIDEBAR_TOOL_LINES
+    assert len(tool_lines.splitlines()) <= 6
+    for tool in SIDEBAR_TOOLS:
+        assert tool["name"] in tool_lines
+        assert "prompt" not in tool

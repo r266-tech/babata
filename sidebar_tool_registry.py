@@ -1,4 +1,4 @@
-"""Single source of truth for sidebar MCP tool schemas and prompt summaries."""
+"""Sidebar MCP tool schemas and compact prompt map."""
 
 from __future__ import annotations
 
@@ -34,7 +34,6 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
             "page_context to avoid racing V's active tab."
         ),
         "inputSchema": {"type": "object", "properties": _target_props()},
-        "prompt": "tab_metadata(tab_id?, window_id?) — url / title / selection / scrollY / docHeight / lang",
     },
     {
         "name": "dom_query",
@@ -61,7 +60,6 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
                 },
             }),
         },
-        "prompt": "dom_query(selector, root?, limit?, props?, tab_id?, window_id?) — querySelectorAll → 元素属性 array",
     },
     {
         "name": "dom_inject",
@@ -85,7 +83,6 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
             }),
             "required": ["selector", "html"],
         },
-        "prompt": "dom_inject(selector, html, position?, tab_id?, window_id?) — insertAdjacentHTML 显式注入",
     },
     {
         "name": "dom_set",
@@ -106,7 +103,6 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
             }),
             "required": ["selector", "prop", "value"],
         },
-        "prompt": "dom_set(selector, prop, value, tab_id?, window_id?) — 设 value/textContent/attribute",
     },
     {
         "name": "dom_click",
@@ -122,7 +118,6 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
             "properties": _target_props({"selector": {"type": "string"}}),
             "required": ["selector"],
         },
-        "prompt": "dom_click(selector, tab_id?, window_id?) — 合成 click; 失败要说明 synthetic 限制",
     },
     {
         "name": "page_snapshot",
@@ -140,7 +135,6 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
                 "limit": {"type": "integer", "description": "Max visible elements, default 120"},
             }),
         },
-        "prompt": "page_snapshot(tab_id?, window_id?, limit?) — 可见页面地图: ref / role / name / selector / rect / is_new",
     },
     {
         "name": "article_extract",
@@ -153,7 +147,6 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
             "do not use shell/curl to read the current tab."
         ),
         "inputSchema": {"type": "object", "properties": _target_props()},
-        "prompt": "article_extract(tab_id?, window_id?) — 抽取当前页正文: metadata / paragraphs / [pN] text / markdown",
     },
     {
         "name": "page_click_ref",
@@ -172,7 +165,6 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
             }),
             "required": ["snapshot_id", "ref"],
         },
-        "prompt": "page_click_ref(snapshot_id, ref, tab_id?, window_id?) — 按 page_snapshot ref 点击",
     },
     {
         "name": "tab_navigate",
@@ -183,7 +175,6 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
             "properties": _target_props({"url": {"type": "string"}}),
             "required": ["url"],
         },
-        "prompt": "tab_navigate(url, tab_id?, window_id?) — 导航目标 tab",
     },
     {
         "name": "translate",
@@ -202,7 +193,6 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
             },
             "required": ["text"],
         },
-        "prompt": "translate(text, target_lang?) — server LLM 纯文本翻译, 默认 zh, 不读写页面",
     },
     {
         "name": "suggest_prompts",
@@ -225,7 +215,6 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
             },
             "required": ["prompts"],
         },
-        "prompt": "suggest_prompts(prompts) — 推 1-2 个高杠杆 follow-up chip 到 sidepanel UI",
     },
     {
         "name": "mascot_speak",
@@ -246,7 +235,6 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
             }),
             "required": ["text"],
         },
-        "prompt": "mascot_speak(text, tab_id?, window_id?) — 当前页面桌宠气泡, 主动提醒/邀请用",
     },
     {
         "name": "bookmarks_search",
@@ -263,7 +251,6 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
             },
             "required": ["query"],
         },
-        "prompt": "bookmarks_search(query, max_results?) — 搜索书签 title/url",
     },
     {
         "name": "bookmarks_tree",
@@ -273,7 +260,6 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
             "Use to find an appropriate parent_id before bookmarks_create."
         ),
         "inputSchema": {"type": "object", "properties": {}},
-        "prompt": "bookmarks_tree() — 返回书签文件夹树",
     },
     {
         "name": "bookmarks_create",
@@ -291,7 +277,6 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
             },
             "required": ["title", "url"],
         },
-        "prompt": "bookmarks_create(title, url, parent_id?) — 创建书签",
     },
     {
         "name": "tabs_query",
@@ -312,7 +297,6 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
                 "url": {"type": "string"},
             },
         },
-        "prompt": "tabs_query(active?, audible?, pinned?, current_window?, url?) — 查询打开的 tabs",
     },
     {
         "name": "tabs_close",
@@ -331,7 +315,6 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
             },
             "required": ["tab_ids"],
         },
-        "prompt": "tabs_close(tab_ids) — 关闭 tabs; 破坏性操作必须有清楚用户意图",
     },
     {
         "name": "tabs_group",
@@ -353,7 +336,6 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
             },
             "required": ["tab_ids"],
         },
-        "prompt": "tabs_group(tab_ids, group_title?, color?) — tab 分组",
     },
     {
         "name": "history_search",
@@ -373,9 +355,16 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
             },
             "required": ["text"],
         },
-        "prompt": "history_search(text, start_ms?, end_ms?, max_results?) — 搜索浏览历史",
     },
 ]
+
+_PROMPT_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("page read", ("tab_metadata", "page_snapshot", "article_extract", "dom_query")),
+    ("page act", ("page_click_ref", "dom_click", "dom_set", "dom_inject", "tab_navigate")),
+    ("ui notify", ("suggest_prompts", "mascot_speak")),
+    ("text", ("translate",)),
+    ("browser data", ("bookmarks_search", "bookmarks_tree", "bookmarks_create", "tabs_query", "tabs_group", "tabs_close", "history_search")),
+)
 
 
 BRIDGE_TOOL_NAMES = frozenset(t["name"] for t in SIDEBAR_TOOLS if t["dispatch"] == "bridge")
@@ -393,4 +382,10 @@ def tool_specs() -> list[dict[str, Any]]:
 
 
 def prompt_tool_lines() -> str:
-    return "\n".join(f"- {tool['prompt']}" for tool in SIDEBAR_TOOLS)
+    available = {tool["name"] for tool in SIDEBAR_TOOLS}
+    lines = []
+    for label, names in _PROMPT_GROUPS:
+        present = [name for name in names if name in available]
+        if present:
+            lines.append(f"- {label}: {', '.join(present)}")
+    return "\n".join(lines)
