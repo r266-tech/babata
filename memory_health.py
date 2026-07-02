@@ -126,6 +126,27 @@ def fix_orphans(root: Path, orphans: list[dict[str, Any]]) -> list[dict[str, Any
     ]
 
 
+def _empty_issue_buckets() -> dict[str, list[dict[str, Any]]]:
+    # NOTE: missing_frontmatter intentionally absent — V's vault has meta docs
+    # (e.g. babata_philosophy.md) that begin with `# title` and skip YAML
+    # frontmatter on purpose. The retrieval signal that matters is the
+    # MEMORY.md hook (covered by orphan / broken_link checks), not the file's
+    # own frontmatter. Other frontmatter-derived checks (missing_field /
+    # invalid_type / empty_body) still run, but only for files that DO have
+    # frontmatter — the absence itself isn't a signal worth reporting.
+    return {
+        "broken_link": [],
+        "orphan": [],
+        "duplicate_index": [],
+        "count_mismatch": [],
+        "cross_dir_link": [],
+        "missing_field": [],
+        "invalid_type": [],
+        "empty_body": [],
+        "too_long": [],
+    }
+
+
 def _scan_root_memory_files(
     root: Path,
     indexed: set[str],
@@ -247,98 +268,77 @@ def _scan_category_indexes(
             )
 
 
-def run(root: Path, *, json_mode: bool, fix_mode: bool, strict_mode: bool) -> int:
-    # NOTE: missing_frontmatter intentionally absent — V's vault has meta docs
-    # (e.g. babata_philosophy.md) that begin with `# title` and skip YAML
-    # frontmatter on purpose. The retrieval signal that matters is the
-    # MEMORY.md hook (covered by orphan / broken_link checks), not the file's
-    # own frontmatter. Other frontmatter-derived checks (missing_field /
-    # invalid_type / empty_body) still run, but only for files that DO have
-    # frontmatter — the absence itself isn't a signal worth reporting.
-    issues: dict[str, list[dict[str, Any]]] = {
-        "broken_link": [],
-        "orphan": [],
-        "duplicate_index": [],
-        "count_mismatch": [],
-        "cross_dir_link": [],
-        "missing_field": [],
-        "invalid_type": [],
-        "empty_body": [],
-        "too_long": [],
-    }
-
-    # ---- Parse MEMORY.md as L0 router ----
+def _scan_memory_router(
+    root: Path,
+    issues: dict[str, list[dict[str, Any]]],
+) -> tuple[set[str], dict[str, tuple[int, int]]]:
     memory_md = root / "MEMORY.md"
     indexed: set[str] = set()
     seen_files: dict[str, int] = {}
     declared_index_counts: dict[str, tuple[int, int]] = {}
 
-    if memory_md.exists():
-        for line_no, raw in enumerate(memory_md.read_text().splitlines(), 1):
-            m = INDEX_COUNT_PATTERN.search(raw)
-            if m:
-                declared_index_counts[m.group(1)] = (int(m.group(2)), line_no)
-
-        for line_no, target in iter_markdown_links(memory_md):
-            resolved = resolve_memory_link(root, memory_md, target)
-            if resolved is None:
-                issues["cross_dir_link"].append(
-                    {"file": "MEMORY.md", "line": line_no, "detail": f"points outside memory root: '{target}'"}
-                )
-                continue
-            rel, fpath = resolved
-
-            if not fpath.exists():
-                issues["broken_link"].append(
-                    {"file": "MEMORY.md", "line": line_no, "detail": f"points to missing '{target}'"}
-                )
-                continue
-
-            # L0 may link to root hot facts, indexes/*.md category routers, and
-            # local L0 files for memory sublayers.
-            if not (is_root_memory_file(rel) or is_index_file(rel) or is_memory_local_l0(rel)):
-                issues["cross_dir_link"].append(
-                    {"file": "MEMORY.md", "line": line_no, "detail": f"unexpected L0 target '{target}'"}
-                )
-                continue
-
-            if is_root_memory_file(rel):
-                if rel.name in seen_files:
-                    issues["duplicate_index"].append(
-                        {"file": "MEMORY.md", "line": line_no, "detail": f"duplicate of line {seen_files[rel.name]} for '{rel.name}'"}
-                    )
-                else:
-                    seen_files[rel.name] = line_no
-                indexed.add(rel.name)
-    else:
+    if not memory_md.exists():
         issues["broken_link"].append(
             {"file": "MEMORY.md", "line": 0, "detail": "MEMORY.md does not exist"}
         )
+        return indexed, declared_index_counts
 
-    # ---- Parse category indexes ----
+    for line_no, raw in enumerate(memory_md.read_text().splitlines(), 1):
+        m = INDEX_COUNT_PATTERN.search(raw)
+        if m:
+            declared_index_counts[m.group(1)] = (int(m.group(2)), line_no)
+
+    for line_no, target in iter_markdown_links(memory_md):
+        resolved = resolve_memory_link(root, memory_md, target)
+        if resolved is None:
+            issues["cross_dir_link"].append(
+                {"file": "MEMORY.md", "line": line_no, "detail": f"points outside memory root: '{target}'"}
+            )
+            continue
+        rel, fpath = resolved
+
+        if not fpath.exists():
+            issues["broken_link"].append(
+                {"file": "MEMORY.md", "line": line_no, "detail": f"points to missing '{target}'"}
+            )
+            continue
+
+        # L0 may link to root hot facts, indexes/*.md category routers, and
+        # local L0 files for memory sublayers.
+        if not (is_root_memory_file(rel) or is_index_file(rel) or is_memory_local_l0(rel)):
+            issues["cross_dir_link"].append(
+                {"file": "MEMORY.md", "line": line_no, "detail": f"unexpected L0 target '{target}'"}
+            )
+            continue
+
+        if is_root_memory_file(rel):
+            if rel.name in seen_files:
+                issues["duplicate_index"].append(
+                    {"file": "MEMORY.md", "line": line_no, "detail": f"duplicate of line {seen_files[rel.name]} for '{rel.name}'"}
+                )
+            else:
+                seen_files[rel.name] = line_no
+            indexed.add(rel.name)
+
+    return indexed, declared_index_counts
+
+
+def run(root: Path, *, json_mode: bool, fix_mode: bool, strict_mode: bool) -> int:
+    issues = _empty_issue_buckets()
+    indexed, declared_index_counts = _scan_memory_router(root, issues)
     _scan_category_indexes(root, declared_index_counts, indexed, issues)
-
-    # ---- Scan root-level memory files ----
-    # Checks orphaned root facts, optional frontmatter quality, empty bodies,
-    # and universal length budget.
     orphans = _scan_root_memory_files(root, indexed, issues)
 
-    # ---- Fix mode ----
     if fix_mode and orphans:
-        new_issues = fix_orphans(root, orphans)
-        for ni in new_issues:
-            issues.setdefault("fix_failure", []).append(ni)
+        issues.setdefault("fix_failure", []).extend(fix_orphans(root, orphans))
 
-    # ---- Output ----
     if json_mode:
         # Strip empty groups for brevity
-        json_issues = {k: v for k, v in issues.items() if v}
-        json_report(json_issues)
+        json_report({k: v for k, v in issues.items() if v})
     else:
         human_report(issues)
 
-    total = sum(len(v) for v in issues.values())
-    if strict_mode and total > 0:
+    if strict_mode and sum(len(v) for v in issues.values()) > 0:
         return 1
     return 0
 
