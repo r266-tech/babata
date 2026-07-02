@@ -121,24 +121,16 @@ def _memory_inject_timeout() -> float:
         return 5.0
 
 
-def _memory_source_from_prompt(source_prompt: str) -> str:
-    return memory_source_from_prompt(source_prompt)
-
-
-def _memory_reflex_for_prompt(source: str, user_prompt: str | None) -> dict[str, Any]:
-    return memory_reflex_for_prompt(
-        source=source,
-        user_prompt=user_prompt,
-        cpu="codex",
-        cwd=_codex_cwd(source),
-    )
-
-
 def _log_memory_reflex_preflight_only(source: str | None, user_prompt: str | None) -> str | None:
     if os.environ.get("BABATA_CRON_AGENT") == "1":
         return None
     source_name = source or "unknown"
-    reflex = _memory_reflex_for_prompt(source_name, user_prompt)
+    reflex = memory_reflex_for_prompt(
+        source=source_name,
+        user_prompt=user_prompt,
+        cpu="codex",
+        cwd=_codex_cwd(source_name),
+    )
     mode = memory_reflex_mode()
     actual_profile = os.environ.get("BABATA_MEMORY_PROFILE") or "lite"
     return log_memory_reflex_preflight(
@@ -166,10 +158,6 @@ def _render_babata_memory_context_event(
         cwd=_codex_cwd(source_name),
         timeout=_memory_inject_timeout(),
     )
-
-
-def _render_babata_memory_context(source: str | None = None, user_prompt: str | None = None) -> str:
-    return _render_babata_memory_context_event(source, user_prompt)[0]
 
 
 def _toml_key(key: str) -> str:
@@ -336,7 +324,7 @@ class CodexEngine(CC):
             channel=self._channel_label(),
             prompt=prompt,
             session_id_before=self._session_id,
-            cwd=_codex_cwd(_memory_source_from_prompt(self._source_prompt)),
+            cwd=_codex_cwd(memory_source_from_prompt(self._source_prompt)),
             images_count=len(images or []),
         )
         try:
@@ -384,7 +372,7 @@ class CodexEngine(CC):
             channel=self._channel_label(),
             prompt=prompt,
             session_id_before=self._session_id,
-            cwd=_codex_cwd(_memory_source_from_prompt(self._source_prompt)),
+            cwd=_codex_cwd(memory_source_from_prompt(self._source_prompt)),
             images_count=0,
         )
         try:
@@ -439,7 +427,7 @@ class CodexEngine(CC):
                 notify_skill_evolve_turn(
                     session_id=sid,
                     cpu="codex",
-                    source=_memory_source_from_prompt(self._source_prompt),
+                    source=memory_source_from_prompt(self._source_prompt),
                     channel=self._channel_label(),
                     state_file=self._state_file,
                     metadata={"tools": result["tools"], "engine": "codex"},
@@ -474,7 +462,7 @@ class CodexEngine(CC):
         last_file: Path,
     ) -> tuple[list[str], str, bool]:
         memory_context = ""
-        source = _memory_source_from_prompt(self._source_prompt)
+        source = memory_source_from_prompt(self._source_prompt)
         should_inject_memory = self._should_inject_codex_memory()
         if should_inject_memory:
             memory_context, event_id = _render_babata_memory_context_event(

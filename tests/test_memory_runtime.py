@@ -118,11 +118,14 @@ def test_memory_runtime_owns_shared_reflex_helpers():
     codex_source = Path(codex_engine.__file__).read_text(encoding="utf-8")
     forbidden = (
         "_DEFAULT_MEMORY_REFLEX_LOG",
+        "def _memory_source_from_prompt",
+        "def _memory_reflex_for_prompt",
         "def _memory_reflex_enabled",
         "def _memory_reflex_mode",
         "def _memory_reflex_script",
         "def _memory_reflex_timeout",
         "def _format_memory_reflex_hint",
+        "def _render_babata_memory_context(",
         "def _memory_reflex_log_path",
         "def _message_summary",
         "def _append_memory_reflex_event",

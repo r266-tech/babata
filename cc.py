@@ -65,7 +65,6 @@ from constants import (
 )
 from memory_runtime import (
     log_memory_reflex_post_answer,
-    memory_reflex_for_prompt,
     memory_source_from_prompt,
     render_babata_memory_context_event,
 )
@@ -416,25 +415,11 @@ def _memory_inject_timeout() -> float:
         return 5.0
 
 
-def _memory_source_from_prompt(source_prompt: str) -> str:
-    return memory_source_from_prompt(source_prompt)
-
-
-def _memory_reflex_for_prompt(source_prompt: str, user_prompt: str | None) -> dict[str, Any]:
-    source = _memory_source_from_prompt(source_prompt)
-    return memory_reflex_for_prompt(
-        source=source,
-        user_prompt=user_prompt,
-        cpu="claude",
-        cwd=_DEFAULT_CWD,
-    )
-
-
 def _render_babata_memory_context_event(
     source_prompt: str,
     user_prompt: str | None = None,
 ) -> tuple[str, str | None]:
-    source = _memory_source_from_prompt(source_prompt)
+    source = memory_source_from_prompt(source_prompt)
     return render_babata_memory_context_event(
         enabled=_cc_memory_inject_enabled(),
         source=source,
@@ -443,10 +428,6 @@ def _render_babata_memory_context_event(
         cwd=_DEFAULT_CWD,
         timeout=_memory_inject_timeout(),
     )
-
-
-def _render_babata_memory_context(source_prompt: str, user_prompt: str | None = None) -> str:
-    return _render_babata_memory_context_event(source_prompt, user_prompt)[0]
 
 
 def _idle_reset_seconds() -> int:
@@ -1388,7 +1369,7 @@ class CC:
             notify_skill_evolve_turn(
                 session_id=sid,
                 cpu="claude",
-                source=_memory_source_from_prompt(self._source_prompt),
+                source=memory_source_from_prompt(self._source_prompt),
                 channel=_channel_label_from_state_file(self._state_file),
                 state_file=self._state_file,
                 metadata={"tools": tools_seen, "engine": "claude"},
@@ -1921,7 +1902,7 @@ class LiveSession(CC):
             notify_skill_evolve_turn(
                 session_id=sid,
                 cpu="claude",
-                source=_memory_source_from_prompt(self._source_prompt),
+                source=memory_source_from_prompt(self._source_prompt),
                 channel=_channel_label_from_state_file(self._state_file),
                 state_file=self._state_file,
                 metadata={"tools": response.tools, "engine": "claude-live"},

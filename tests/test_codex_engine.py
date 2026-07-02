@@ -8,6 +8,7 @@ sys.path.insert(0, str(_REPO))
 
 import codex_engine
 import engine
+import memory_runtime
 
 
 class FakeStream:
@@ -173,10 +174,10 @@ def test_codex_engine_injects_babata_memory_once_per_session(monkeypatch, tmp_pa
 
 
 def test_codex_engine_maps_channel_prompt_to_memory_source():
-    assert codex_engine._memory_source_from_prompt("Source: Telegram. x") == "tg"
-    assert codex_engine._memory_source_from_prompt("Source: WeChat. x") == "wechat"
-    assert codex_engine._memory_source_from_prompt("Source: Sidebar. x") == "sidebar"
-    assert codex_engine._memory_source_from_prompt("Source: test. x") == "unknown"
+    assert memory_runtime.memory_source_from_prompt("Source: Telegram. x") == "tg"
+    assert memory_runtime.memory_source_from_prompt("Source: WeChat. x") == "wechat"
+    assert memory_runtime.memory_source_from_prompt("Source: Sidebar. x") == "sidebar"
+    assert memory_runtime.memory_source_from_prompt("Source: test. x") == "unknown"
 
 
 def test_codex_engine_streams_tool_results(monkeypatch, tmp_path):
