@@ -466,6 +466,42 @@ def test_weixin_process_retries_same_turn_before_failure_reply(monkeypatch):
     asyncio.run(run())
 
 
+def test_weixin_process_sends_final_content_when_stream_has_no_delta(monkeypatch):
+    class FakeCC:
+        async def query(self, prompt, *, images=None, on_stream=None):
+            assert prompt == "hello"
+            assert images is None
+            return Response(content="final only", session_id="sid-1", cost=0.0)
+
+    class FakeClient:
+        def __init__(self):
+            self.sent: list[str] = []
+
+        async def get_config(self, *_args, **_kwargs):
+            return {}
+
+        async def send_message(self, _to_user, items, **_kwargs):
+            self.sent.extend((item.get("text_item") or {}).get("text", "") for item in items)
+
+    async def run():
+        client = FakeClient()
+        monkeypatch.setattr(wb, "cc", FakeCC())
+        msg = {
+            "from_user_id": "u1",
+            "context_token": "ctx",
+            "item_list": [
+                {"type": wb.ITEM_TEXT, "text_item": {"text": "hello"}},
+            ],
+        }
+
+        consumed = await wb._process_combined_msgs(client, [msg], "acc")
+
+        assert consumed is True
+        assert client.sent == ["final only"]
+
+    asyncio.run(run())
+
+
 def test_collect_wx_turn_inputs_preserves_prompt_contract():
     class FakeClient:
         pass

@@ -814,6 +814,62 @@ async def _collect_wx_turn_inputs(
     return from_user, ctx_token, _format_wx_message_bodies(message_bodies), images
 
 
+async def _set_wx_typing(
+    client: WeixinClient,
+    from_user: str,
+    ticket: str | None,
+    state: int,
+) -> None:
+    if not ticket:
+        return
+    try:
+        await client.send_typing(from_user, ticket, state)
+    except Exception as e:
+        if state == 1:
+            log.debug("typing on failed: %s", e)
+
+
+async def _query_wx_turn_with_recovery(
+    prompt: str,
+    images: list[dict[str, str]],
+    coalescer: WxStreamCoalescer,
+) -> Any | None:
+    for attempt in range(_WX_MAX_TURN_RECOVERY_ATTEMPTS + 1):
+        if attempt:
+            coalescer.reset_for_replay()
+            log.warning(
+                "Replaying WeChat turn after CC query failure "
+                "(attempt %d/%d)",
+                attempt,
+                _WX_MAX_TURN_RECOVERY_ATTEMPTS,
+            )
+        try:
+            return await cc.query(
+                prompt,
+                images=images or None,
+                on_stream=coalescer.on_stream,
+            )
+        except Exception as e:
+            log.exception("CC query failed")
+            if attempt < _WX_MAX_TURN_RECOVERY_ATTEMPTS:
+                await asyncio.sleep(0)
+                continue
+            log.error("WeChat turn remains unconsumed after retries: %s", e)
+            return None
+    return None
+
+
+async def _replay_wx_final_if_needed(coalescer: WxStreamCoalescer, final: str) -> bool:
+    if not coalescer.had_send_failure and coalescer.sent_any:
+        return True
+    if final:
+        coalescer.had_send_failure = False
+        for part in re.split(r"\n{3,}", final):
+            await coalescer.send_bubble(part)
+        return True
+    return not coalescer.had_send_failure
+
+
 async def _process_combined_msgs(
     client: WeixinClient, msgs: list[dict[str, Any]], account_id: str
 ) -> bool:
@@ -832,11 +888,7 @@ async def _process_combined_msgs(
 
     # Typing on (best-effort; ticket cached across inbounds, 24h TTL)
     ticket = await _get_typing_ticket(client, from_user, ctx_token)
-    if ticket:
-        try:
-            await client.send_typing(from_user, ticket, 1)
-        except Exception as e:
-            log.debug("typing on failed: %s", e)
+    await _set_wx_typing(client, from_user, ticket, 1)
 
     # Stream coalescer — wx protocol has no edit-message, so each bubble is
     # final once sent. LLM marks bubble boundaries with \n\n\n in its output
@@ -850,28 +902,7 @@ async def _process_combined_msgs(
 
     coalescer = WxStreamCoalescer(send_bubble)
 
-    resp = None
-    for attempt in range(_WX_MAX_TURN_RECOVERY_ATTEMPTS + 1):
-        if attempt:
-            coalescer.reset_for_replay()
-            log.warning(
-                "Replaying WeChat turn after CC query failure "
-                "(attempt %d/%d)",
-                attempt,
-                _WX_MAX_TURN_RECOVERY_ATTEMPTS,
-            )
-        try:
-            resp = await cc.query(
-                combined or "[图片]", images=images or None, on_stream=coalescer.on_stream,
-            )
-            break
-        except Exception as e:
-            log.exception("CC query failed")
-            if attempt < _WX_MAX_TURN_RECOVERY_ATTEMPTS:
-                await asyncio.sleep(0)
-                continue
-            log.error("WeChat turn remains unconsumed after retries: %s", e)
-            return False
+    resp = await _query_wx_turn_with_recovery(combined or "[图片]", images, coalescer)
     if resp is None:
         return False
 
@@ -885,14 +916,8 @@ async def _process_combined_msgs(
     #   already-shipped bubbles but visible > missing.
     # - not sent_any: streaming produced no chunks (CC output came only via
     #   resp.content, not deltas).
-    if coalescer.had_send_failure or not coalescer.sent_any:
-        final = resp.content or ""
-        if final:
-            coalescer.had_send_failure = False
-            for part in re.split(r"\n{3,}", final):
-                await coalescer.send_bubble(part)
-        elif coalescer.had_send_failure:
-            return False
+    if not await _replay_wx_final_if_needed(coalescer, resp.content or ""):
+        return False
 
     if resp.resume_note:
         try:
@@ -902,11 +927,7 @@ async def _process_combined_msgs(
         except Exception:
             pass
 
-    if ticket:
-        try:
-            await client.send_typing(from_user, ticket, 2)
-        except Exception:
-            pass
+    await _set_wx_typing(client, from_user, ticket, 2)
 
     return not coalescer.had_send_failure
 
