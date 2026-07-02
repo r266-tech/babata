@@ -138,19 +138,18 @@ def _normalize_proactive_intent(value: Any) -> str:
 def _proactive_intent_instruction(intent: str) -> str:
     if intent == "prompt_suggestions":
         return (
-            "这次是用户单击头像打开对话框后的触发. 目标不是回答, 而是在输入框上方"
-            "预判下一步的高杠杆 prompt chips. 优先调用 suggest_prompts, "
-            "给 1-2 个最具杠杆力的短 prompt: 可总结全文、调研页面主题/实体、验证事实、比较观点、"
-            "提炼行动项、帮用户填表/写邮件/写回复. prompt 要具体、有下一步价值, "
-            "不要泛泛写“继续了解”. 不要 mascot_speak; 若这页没值得建议的下一步, "
+            "单击头像打开对话框: 只预判输入框上方的下一步建议. "
+            "优先调用 suggest_prompts, 给 1-2 个具体短 prompt; "
+            "建议必须基于当前页且能直接行动. 不要回答, 不要 mascot_speak; "
+            "若这页没值得建议的下一步, "
             "调用 suggest_prompts({prompts: []})."
         )
     if intent == "agent_view":
         return (
-            "这次是用户双击头像唤醒你. 目标是一句像高等智能在身后看同一页后的锐评/"
-            "学习建议, 放到桌宠气泡. 只调用 mascot_speak, 不要 suggest_prompts. "
-            "如果仅凭 title/url 不足以判断, 先 page_snapshot. 评价页面质量、信息密度、"
-            "观点是否过时、是否值得深读、看总结是否足够, 可以尖锐但必须基于页面内容."
+            "双击头像: 给一句中文锐评/学习建议, 放到桌宠气泡. "
+            "只调用 mascot_speak, 不要 suggest_prompts. "
+            "title/url 不足时先 page_snapshot; 判断质量、密度、时效和是否值得深读, "
+            "必须基于页面内容."
         )
     return "看一眼这页, 按 SOURCE prompt 4 类场景自决 (翻译 / mascot_speak / suggest_prompts / 静默)."
 

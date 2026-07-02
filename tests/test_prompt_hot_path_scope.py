@@ -79,6 +79,36 @@ def test_sidebar_prompt_tool_map_stays_compact():
     assert len(sidebar_bot._SIDEBAR_TOOL_LINES) <= 520
 
 
+@pytest.mark.parametrize(
+    "intent,max_chars,required",
+    [
+        (
+            "auto",
+            90,
+            ("SOURCE prompt", "翻译", "mascot_speak", "suggest_prompts", "静默"),
+        ),
+        (
+            "prompt_suggestions",
+            170,
+            ("单击头像", "suggest_prompts", "1-2", "具体短 prompt", "不要回答", "prompts: []"),
+        ),
+        (
+            "agent_view",
+            140,
+            ("双击头像", "一句中文锐评/学习建议", "mascot_speak", "page_snapshot", "页面内容"),
+        ),
+    ],
+)
+def test_sidebar_proactive_intent_instructions_stay_operational(intent, max_chars, required):
+    instruction = sidebar_bot._proactive_intent_instruction(intent)
+
+    assert len(instruction) <= max_chars
+    for marker in required:
+        assert marker in instruction
+    for marker in ("高等智能", "高杠杆", "杠杆力", "prompt chips", "共同进化", "哲学", "身份认同"):
+        assert marker not in instruction
+
+
 def test_sidebar_agent_view_user_prompt_stays_evidence_bound():
     prompt = sidebar_bot._build_agent_view_prompt(
         url="https://example.com/page",
