@@ -750,6 +750,8 @@ _last_session_id: str | None = _state.get("last_session_id")
 # 4000 not 4096: leaves headroom for HTML entity expansion (`&` → `&amp;`)
 # and the (1/N) chunk indicator suffix added by `_split`.
 _MAX_TG = 4000
+_TG_INDICATOR_RESERVE = 10  # " (XX/XX)"
+_TG_FENCE_CLOSE = "\n```"
 
 # Stream edit throttle bases (seconds). adaptive backoff in `_handle_text_delta`
 # / `_handle_tool_event` doubles the interval on every flood-control failure
@@ -1415,24 +1417,101 @@ def _utf16_to_cp(s: str, budget: int) -> int:
     return lo
 
 
+def _tg_split_headroom(prefix: str) -> int:
+    headroom = (
+        _MAX_TG
+        - _TG_INDICATOR_RESERVE
+        - _utf16_len(prefix)
+        - _utf16_len(_TG_FENCE_CLOSE)
+    )
+    return headroom if headroom >= 1 else _MAX_TG // 2
+
+
+def _tg_initial_split_at(remaining: str, cp_limit: int) -> int:
+    region = remaining[:cp_limit]
+    split_at = region.rfind("\n")
+    if split_at < cp_limit // 2:
+        split_at = region.rfind(" ")
+    return split_at if split_at >= 1 else cp_limit
+
+
+def _tg_avoid_open_html_tag(remaining: str, split_at: int) -> int:
+    last_lt = remaining.rfind("<", 0, split_at)
+    last_gt = remaining.rfind(">", 0, split_at)
+    if last_lt > last_gt and last_lt >= 1:
+        return last_lt
+    return split_at
+
+
+def _tg_avoid_unpaired_inline_backtick(
+    remaining: str,
+    split_at: int,
+    cp_limit: int,
+) -> int:
+    candidate = remaining[:split_at]
+    bt_count = candidate.count("`") - candidate.count("\\`")
+    if bt_count % 2 == 0:
+        return split_at
+
+    last_bt = candidate.rfind("`")
+    while last_bt > 0 and candidate[last_bt - 1] == "\\":
+        last_bt = candidate.rfind("`", 0, last_bt)
+    if last_bt <= 0:
+        return split_at
+
+    safe_split = max(
+        candidate.rfind(" ", 0, last_bt),
+        candidate.rfind("\n", 0, last_bt),
+    )
+    return safe_split if safe_split > cp_limit // 4 else split_at
+
+
+def _tg_avoid_unclosed_html_pair(
+    remaining: str,
+    split_at: int,
+    cp_limit: int,
+) -> int:
+    candidate = remaining[:split_at]
+    # `<code` covers both `<code>` and `<code class="language-x">`.
+    for open_pattern, close_tag in (("<pre>", "</pre>"), ("<code", "</code>")):
+        if candidate.count(open_pattern) <= candidate.count(close_tag):
+            continue
+        pos = candidate.rfind(open_pattern)
+        if pos >= 1:
+            safe = max(candidate.rfind("\n", 0, pos), candidate.rfind(" ", 0, pos))
+            split_at = safe if safe > cp_limit // 4 else pos
+            candidate = remaining[:split_at]
+    return split_at
+
+
+def _tg_safe_split_at(remaining: str, cp_limit: int) -> int:
+    split_at = _tg_initial_split_at(remaining, cp_limit)
+    split_at = _tg_avoid_open_html_tag(remaining, split_at)
+    split_at = _tg_avoid_unpaired_inline_backtick(remaining, split_at, cp_limit)
+    return _tg_avoid_unclosed_html_pair(remaining, split_at, cp_limit)
+
+
+def _tg_next_carry_lang(chunk_body: str, carry_lang: str | None) -> str | None:
+    in_code = carry_lang is not None
+    lang = carry_lang or ""
+    for line in chunk_body.split("\n"):
+        stripped = line.strip()
+        if not stripped.startswith("```"):
+            continue
+        if in_code:
+            in_code = False
+            lang = ""
+        else:
+            in_code = True
+            tag = stripped[3:].strip()
+            lang = tag.split()[0] if tag else ""
+    return lang if in_code else None
+
+
 def _split(text: str) -> list[str]:
-    """Split long message at safe boundaries, UTF-16 aware.
-
-    Borrows hermes pattern (`gateway/platforms/base.py:truncate_message`):
-      - Measures length in UTF-16 (TG's wire unit, not codepoints)
-      - Closes/reopens ``` code blocks across chunks (`carry_lang`)
-      - Avoids splitting inside inline backtick spans (parity check)
-      - Appends `(1/N)` indicators when split
-
-    Single message ≤ 4096 wire units returns unchanged. The HTML produced by
-    `_to_html` survives this (block placeholders are already restored before
-    `_split` runs, so no html-aware logic needed here — only markdown fences).
-    """
+    """Split long plain TG messages at UTF-16-safe boundaries."""
     if _utf16_len(text) <= _MAX_TG:
         return [text]
-
-    INDICATOR_RESERVE = 10  # " (XX/XX)"
-    FENCE_CLOSE = "\n```"
 
     parts: list[str] = []
     remaining = text
@@ -1440,11 +1519,9 @@ def _split(text: str) -> list[str]:
 
     while remaining:
         prefix = f"```{carry_lang}\n" if carry_lang is not None else ""
-        headroom = _MAX_TG - INDICATOR_RESERVE - _utf16_len(prefix) - _utf16_len(FENCE_CLOSE)
-        if headroom < 1:
-            headroom = _MAX_TG // 2
+        headroom = _tg_split_headroom(prefix)
 
-        if _utf16_len(prefix) + _utf16_len(remaining) <= _MAX_TG - INDICATOR_RESERVE:
+        if _utf16_len(prefix) + _utf16_len(remaining) <= _MAX_TG - _TG_INDICATOR_RESERVE:
             parts.append(prefix + remaining)
             break
 
@@ -1456,86 +1533,15 @@ def _split(text: str) -> list[str]:
         # 4096 limit has slack vs our 4000 _MAX_TG). Codex round-1 caught.
         if cp_limit < 1:
             cp_limit = 1
-        region = remaining[:cp_limit]
-        split_at = region.rfind("\n")
-        if split_at < cp_limit // 2:
-            split_at = region.rfind(" ")
-        if split_at < 1:
-            split_at = cp_limit
-
-        # HTML attribute-space protection (round-2 follow-up): _to_html emits
-        # `<code class="language-python">` with spaces *inside* the opening
-        # tag. The space-rfind above can land at the space between `<code`
-        # and `class=`, producing a 5-char fragment '<code' followed by a
-        # malformed continuation. If split_at falls inside an unclosed
-        # `<...>` (last `<` after last `>` before split_at), back off to
-        # before that `<`.
-        last_lt = remaining.rfind("<", 0, split_at)
-        last_gt = remaining.rfind(">", 0, split_at)
-        if last_lt > last_gt and last_lt >= 1:
-            split_at = last_lt
-
-        # Inline backtick parity: don't split inside `code` (would orphan tick).
-        candidate = remaining[:split_at]
-        bt_count = candidate.count("`") - candidate.count("\\`")
-        if bt_count % 2 == 1:
-            last_bt = candidate.rfind("`")
-            while last_bt > 0 and candidate[last_bt - 1] == "\\":
-                last_bt = candidate.rfind("`", 0, last_bt)
-            if last_bt > 0:
-                safe_split = max(candidate.rfind(" ", 0, last_bt), candidate.rfind("\n", 0, last_bt))
-                if safe_split > cp_limit // 4:
-                    split_at = safe_split
-
-        # HTML <pre>/<code> tag pairing (Codex round-1 fix 4a, refined round-2):
-        # _to_html converts ``` fences to `<pre><code class="language-X">...</code></pre>`
-        # (with class attribute), and inline backticks to `<code>...</code>`.
-        # Naive split mid-tag → malformed HTML → TG plain-text fallback or 400.
-        # Back the split off to before any unclosed open tag.
-        #
-        # Open-tag matching uses the prefix `<code` (no `>`) to catch BOTH
-        # bare `<code>` AND class-attributed `<code class="...">` — Codex
-        # round-2 caught that bare `<code>` prefix missed the class form.
-        # `<pre>` has no class form in `_to_html`, so exact match suffices.
-        #
-        # Limitation: when the unclosed opener sits at offset 0 of the
-        # candidate, no backoff is possible (can't split below 0). The
-        # chunk emits malformed HTML and TG falls back to plain-text
-        # rendering — visually degraded, not a hard failure.
-        candidate = remaining[:split_at]
-        for open_pattern, close_tag in (("<pre>", "</pre>"), ("<code", "</code>")):
-            opens = candidate.count(open_pattern)
-            closes = candidate.count(close_tag)
-            if opens > closes:
-                pos = candidate.rfind(open_pattern)
-                if pos >= 1:
-                    safe = max(candidate.rfind("\n", 0, pos), candidate.rfind(" ", 0, pos))
-                    split_at = safe if safe > cp_limit // 4 else pos
-                    candidate = remaining[:split_at]
+        split_at = _tg_safe_split_at(remaining, cp_limit)
 
         chunk_body = remaining[:split_at]
         remaining = remaining[split_at:].lstrip("\n")
         full_chunk = prefix + chunk_body
 
-        # Walk chunk_body to determine whether we end mid-fence.
-        in_code = carry_lang is not None
-        lang = carry_lang or ""
-        for line in chunk_body.split("\n"):
-            stripped = line.strip()
-            if stripped.startswith("```"):
-                if in_code:
-                    in_code = False
-                    lang = ""
-                else:
-                    in_code = True
-                    tag = stripped[3:].strip()
-                    lang = tag.split()[0] if tag else ""
-
-        if in_code:
-            full_chunk += FENCE_CLOSE
-            carry_lang = lang
-        else:
-            carry_lang = None
+        carry_lang = _tg_next_carry_lang(chunk_body, carry_lang)
+        if carry_lang is not None:
+            full_chunk += _TG_FENCE_CLOSE
 
         parts.append(full_chunk)
 

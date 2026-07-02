@@ -20,6 +20,16 @@ import bridge as tg_bridge
 import tg_mcp
 
 
+def _split_bodies(parts: list[str]) -> list[str]:
+    total = len(parts)
+    bodies = []
+    for idx, part in enumerate(parts):
+        suffix = f" ({idx + 1}/{total})"
+        assert part.endswith(suffix)
+        bodies.append(part[: -len(suffix)])
+    return bodies
+
+
 def test_tg_handler_registration_keeps_transcript_sources_centralized():
     tree = ast.parse(Path(bot.__file__).read_text(encoding="utf-8"))
     main_func = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
@@ -193,6 +203,28 @@ def test_long_link_falls_back_to_plain_chunks():
     assert parse_mode is None
     assert len(parts) > 1
     assert all(bot._utf16_len(part) <= bot._MAX_TG for part in parts)
+
+
+def test_split_avoids_unpaired_inline_backtick_when_safe_boundary_exists():
+    prefix = ("safe text " * 350).strip()
+    text = f"{prefix} `" + ("x" * 1200) + "` tail"
+
+    bodies = _split_bodies(bot._split(text))
+
+    assert len(bodies) > 1
+    assert (bodies[0].count("`") - bodies[0].count("\\`")) % 2 == 0
+    assert bodies[1].lstrip().startswith("`")
+
+
+def test_split_reopens_markdown_fence_across_chunks():
+    text = "```py\n" + ("print('x')\n" * 500) + "```"
+
+    bodies = _split_bodies(bot._split(text))
+
+    assert len(bodies) > 1
+    assert bodies[0].startswith("```py\n")
+    assert bodies[0].endswith("\n```")
+    assert bodies[1].startswith("```py\n")
 
 
 def test_fmt_tool_skips_codex_internal_item_id():
