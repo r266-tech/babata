@@ -7,7 +7,6 @@ keeping session state and exposed tools isolated per channel.
 
 import asyncio
 import copy
-import hashlib
 import json
 import logging
 import os
@@ -63,6 +62,12 @@ from constants import (
     PROJECT,
     SKILL_HOOKS_DIR as _SKILL_HOOKS_DIR,
     STATE_DIR as _STATE_DIR,
+)
+from memory_runtime import (
+    log_memory_reflex_post_answer,
+    memory_reflex_for_prompt,
+    memory_source_from_prompt,
+    render_babata_memory_context_event,
 )
 from skill_evolve_nudge import notify_skill_evolve_turn
 from turn_audit import (
@@ -395,20 +400,12 @@ _MAX_RECENT_SIDS = 200          # ring buffer of past session_ids (~1y at 5/day,
 _RESUME_INJECT_PAIRS = 3        # last N user+assistant pairs to inject on resume failure
 _RESUME_INJECT_CHARS = 300      # per-turn char cap (3 pairs × 300 × 2 ≈ 1.8KB, fits any system_prompt)
 _IDLE_RESET_MINUTES_DEFAULT = 1440  # 24h, parity with hermes session_reset.idle_minutes (gateway/config.py:114)
-_DEFAULT_MEMORY_INJECT_SCRIPT = Path.home() / "cc-workspace/scripts/memory-inject.sh"
-_DEFAULT_MEMORY_REFLEX_SCRIPT = Path.home() / "cc-workspace/bin/babata-memory-reflex"
-_DEFAULT_MEMORY_REFLEX_LOG = Path.home() / "cc-workspace/state/memory-reflex/events.jsonl"
 
 
 def _cc_memory_inject_enabled() -> bool:
     if os.environ.get("BABATA_CRON_AGENT") == "1":
         return False
     return os.environ.get("BABATA_CC_MEMORY_INJECT", "1") != "0"
-
-
-def _memory_inject_script() -> Path:
-    configured = os.environ.get("BABATA_MEMORY_INJECT_SCRIPT")
-    return Path(configured).expanduser() if configured else _DEFAULT_MEMORY_INJECT_SCRIPT
 
 
 def _memory_inject_timeout() -> float:
@@ -419,231 +416,33 @@ def _memory_inject_timeout() -> float:
         return 5.0
 
 
-def _memory_reflex_enabled() -> bool:
-    return os.environ.get("BABATA_MEMORY_REFLEX", "1") != "0"
-
-
-def _memory_reflex_mode() -> str:
-    if not _memory_reflex_enabled():
-        return "off"
-    mode = os.environ.get("BABATA_MEMORY_REFLEX_MODE", "dry-run").strip().lower()
-    return mode if mode in {"dry-run", "enforce"} else "dry-run"
-
-
-def _memory_reflex_script() -> Path:
-    configured = os.environ.get("BABATA_MEMORY_REFLEX_SCRIPT")
-    return Path(configured).expanduser() if configured else _DEFAULT_MEMORY_REFLEX_SCRIPT
-
-
-def _memory_reflex_timeout() -> float:
-    raw = os.environ.get("BABATA_MEMORY_REFLEX_TIMEOUT", "0.8")
-    try:
-        return max(0.1, float(raw))
-    except ValueError:
-        return 0.8
-
-
 def _memory_source_from_prompt(source_prompt: str) -> str:
-    lower = source_prompt.lower()
-    if "source: telegram" in lower:
-        return "tg"
-    if "source: wechat" in lower:
-        return "wechat"
-    if "source: sidebar" in lower:
-        return "sidebar"
-    return os.environ.get("BABATA_MEMORY_SOURCE") or "unknown"
+    return memory_source_from_prompt(source_prompt)
 
 
 def _memory_reflex_for_prompt(source_prompt: str, user_prompt: str | None) -> dict[str, Any]:
-    if not _memory_reflex_enabled() or not user_prompt:
-        return {}
-    script = _memory_reflex_script()
-    if not script.is_file():
-        log.warning("babata memory reflex script missing: %s", script)
-        return {}
     source = _memory_source_from_prompt(source_prompt)
-    try:
-        result = subprocess.run(
-            [
-                str(script),
-                "--message", "-",
-                "--source", source,
-                "--cpu", "claude",
-                "--cwd", _DEFAULT_CWD,
-            ],
-            input=user_prompt,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=_memory_reflex_timeout(),
-            check=False,
-        )
-    except Exception as exc:
-        log.warning("babata memory reflex failed: %s", exc)
-        return {}
-    if result.returncode != 0:
-        log.warning("babata memory reflex exited %s: %s", result.returncode, result.stderr.strip()[:500])
-        return {}
-    try:
-        parsed = json.loads(result.stdout)
-    except Exception as exc:
-        log.warning("babata memory reflex returned invalid json: %s", exc)
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _format_memory_reflex_hint(reflex: dict[str, Any]) -> str:
-    routes = [str(r) for r in reflex.get("routes", []) if str(r)]
-    profile = str(reflex.get("profile") or "lite")
-    if not routes or (profile == "lite" and all(r in {"none", "lite"} for r in routes)):
-        return ""
-    reasons = reflex.get("reasons")
-    reason_text = "; ".join(str(r) for r in reasons[:3]) if isinstance(reasons, list) else ""
-    return "\n".join([
-        "<memory-reflex>",
-        f"routes: {', '.join(routes)}",
-        f"profile: {profile}",
-        "note: router signal only; retrieve deeper evidence only when useful.",
-        f"why: {reason_text}" if reason_text else "why: unspecified",
-        "</memory-reflex>",
-    ])
-
-
-def _memory_reflex_log_path() -> Path:
-    configured = os.environ.get("BABATA_MEMORY_REFLEX_LOG")
-    return Path(configured).expanduser() if configured else _DEFAULT_MEMORY_REFLEX_LOG
-
-
-def _message_summary(text: str | None, limit: int = 180) -> str:
-    compact = " ".join((text or "").split())
-    return compact[:limit].rstrip()
-
-
-def _append_memory_reflex_event(payload: dict[str, Any]) -> None:
-    try:
-        path = _memory_reflex_log_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
-    except Exception as exc:
-        log.warning("babata memory reflex log failed: %s", exc)
-
-
-def _log_memory_reflex_preflight(
-    *,
-    reflex: dict[str, Any],
-    user_prompt: str | None,
-    source: str,
-    cpu: str,
-    mode: str,
-    actual_profile: str,
-    memory_injected: bool,
-    hint_injected: bool,
-) -> str | None:
-    if not reflex:
-        return None
-    now = time.time()
-    digest = hashlib.sha256((user_prompt or "").encode("utf-8")).hexdigest()
-    event_id = hashlib.sha256(f"{now}:{cpu}:{source}:{digest}".encode("utf-8")).hexdigest()[:16]
-    _append_memory_reflex_event({
-        "event": "preflight",
-        "id": event_id,
-        "ts": now,
-        "source": source,
-        "cpu": cpu,
-        "mode": mode,
-        "message_sha256": digest,
-        "message_summary": _message_summary(user_prompt),
-        "router": reflex,
-        "actual_profile": actual_profile,
-        "memory_injected": memory_injected,
-        "hint_injected": hint_injected,
-        "post_answer_observation": "pending",
-    })
-    return event_id
-
-
-def _answer_memory_observation(content: str) -> dict[str, Any]:
-    markers = ("不记得", "没记住", "没有记忆", "没有记录", "查不到", "没查到", "无法确认", "没有找到")
-    return {
-        "heuristic_only": True,
-        "memory_miss_marker": any(marker in content for marker in markers),
-        "wrong_recall": None,
-        "missed_required_lookup": None,
-    }
-
-
-def _log_memory_reflex_post_answer(event_id: str | None, content: str) -> None:
-    if not event_id:
-        return
-    _append_memory_reflex_event({
-        "event": "post_answer",
-        "id": event_id,
-        "ts": time.time(),
-        "answer_sha256": hashlib.sha256((content or "").encode("utf-8")).hexdigest(),
-        "answer_summary": _message_summary(content),
-        "observation": _answer_memory_observation(content or ""),
-    })
+    return memory_reflex_for_prompt(
+        source=source,
+        user_prompt=user_prompt,
+        cpu="claude",
+        cwd=_DEFAULT_CWD,
+    )
 
 
 def _render_babata_memory_context_event(
     source_prompt: str,
     user_prompt: str | None = None,
 ) -> tuple[str, str | None]:
-    if not _cc_memory_inject_enabled():
-        return "", None
-    script = _memory_inject_script()
-    if not script.is_file():
-        log.warning("babata memory inject script missing: %s", script)
-        return "", None
-    reflex = _memory_reflex_for_prompt(source_prompt, user_prompt)
-    mode = _memory_reflex_mode()
-    enforce = mode == "enforce"
     source = _memory_source_from_prompt(source_prompt)
-    actual_profile = os.environ.get("BABATA_MEMORY_PROFILE") or (
-        str(reflex.get("profile") or "lite") if enforce else "lite"
-    )
-    env = os.environ.copy()
-    env["BABATA_MEMORY_PROFILE"] = actual_profile
-    env.setdefault("BABATA_MEMORY_CPU", "claude")
-    env.setdefault("BABATA_MEMORY_SOURCE", source)
-    env.setdefault("BABATA_MEMORY_INCLUDE_TOP", "force")
-    try:
-        result = subprocess.run(
-            [str(script)],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=_memory_inject_timeout(),
-            check=False,
-        )
-    except Exception as exc:
-        log.warning("babata memory inject failed: %s", exc)
-        return "", None
-    if result.returncode != 0:
-        log.warning(
-            "babata memory inject exited %s: %s",
-            result.returncode,
-            result.stderr.strip()[:500],
-        )
-        return "", None
-    parts = [result.stdout.strip()]
-    hint = _format_memory_reflex_hint(reflex) if enforce else ""
-    if hint:
-        parts.append(hint)
-    context = "\n\n".join(part for part in parts if part)
-    event_id = _log_memory_reflex_preflight(
-        reflex=reflex,
-        user_prompt=user_prompt,
+    return render_babata_memory_context_event(
+        enabled=_cc_memory_inject_enabled(),
         source=source,
+        user_prompt=user_prompt,
         cpu="claude",
-        mode=mode,
-        actual_profile=actual_profile,
-        memory_injected=bool(context),
-        hint_injected=bool(hint),
+        cwd=_DEFAULT_CWD,
+        timeout=_memory_inject_timeout(),
     )
-    return context, event_id
 
 
 def _render_babata_memory_context(source_prompt: str, user_prompt: str | None = None) -> str:
@@ -848,7 +647,7 @@ class CC:
         return "\n\n".join(parts)
 
     def _record_memory_reflex_answer(self, content: str) -> None:
-        _log_memory_reflex_post_answer(self._memory_reflex_event_id, content)
+        log_memory_reflex_post_answer(self._memory_reflex_event_id, content)
         self._memory_reflex_event_id = None
 
     # ── state persistence (per-channel) ──────────────────────────────
