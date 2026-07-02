@@ -3780,73 +3780,69 @@ def _last_prompt_tokens(sid: str | None) -> int:
     return 0
 
 
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show current model, context usage, cost, session state."""
-    if not _allowed(update):
-        return
+async def _cmd_status_codex(update: Update) -> None:
+    sid = cc.session_id
+    snap = _codex_status_snapshot(sid)
+    fresh_limits = await _fetch_codex_app_rate_limits()
+    if fresh_limits:
+        snap["rate_limits"] = fresh_limits
+    snap_model = str(snap.get("model") or "")
+    state_model = _last_model if _last_model and _last_model != "codex" else ""
+    actual = (
+        snap_model
+        if snap_model and snap_model != "codex"
+        else state_model or snap_model or os.environ.get("BABATA_CODEX_MODEL") or "codex"
+    )
+    effort = snap.get("effort") or "—"
+    used = int(snap.get("context_used") or 0)
+    win = int(snap.get("context_window") or 0)
+    fallback_used = _last_used_tokens if _last_session_id == sid else 0
+    if not used:
+        used = fallback_used
+    pct_ctx = (used / win * 100) if (win and used > 0) else 0.0
+    bar = _progress_bar(pct_ctx)
+    window_short = _short_window(win)
+    last_usage = snap.get("last_usage") if isinstance(snap.get("last_usage"), dict) else {}
+    out_tokens = int(last_usage.get("output_tokens") or 0)
+    reason_tokens = int(last_usage.get("reasoning_output_tokens") or 0)
+    token_bits = []
+    if used:
+        token_bits.append(f"{_fmt_tok(used)} in")
+    if out_tokens:
+        token_bits.append(f"{_fmt_tok(out_tokens)} out")
+    if reason_tokens:
+        token_bits.append(f"{_fmt_tok(reason_tokens)} reasoning")
+    token_line = " · ".join(token_bits) if token_bits else "tokens —"
+    limits = snap.get("rate_limits") if isinstance(snap.get("rate_limits"), dict) else None
+    five_hour_line = _fmt_codex_limit(limits, "primary", "5h limit", 300)
+    week_line = _fmt_codex_limit(limits, "secondary", "weekly limit", 10_080)
+    plan_type = (limits or {}).get("plan_type") if isinstance(limits, dict) else None
+    sids = cc.recent_session_ids()
+    sid_now = sid if sid else "(new)"
+    labels = {0: "hidden", 1: "flash", 2: "keep"}
+    lines = [
+        "<b>📊 Status</b>",
+        "",
+        f"{bar} {pct_ctx:.0f}% · {html.escape(_short_model(actual))} {html.escape(str(effort))} ({window_short})",
+        "",
+        html.escape(token_line),
+        html.escape(_fmt_review_health_line()),
+    ]
+    if five_hour_line:
+        lines.append(html.escape(five_hour_line))
+    if week_line:
+        lines.append(html.escape(week_line))
+    if plan_type:
+        lines.append(html.escape(f"plan {plan_type}"))
+    lines += [
+        "",
+        f"Codex v{_codex_version()} · {labels.get(_verbose, _verbose)}",
+        f"<code>{sid_now}</code> · {len(sids)} recent",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
-    if _current_cpu_name() == "codex":
-        sid = cc.session_id
-        snap = _codex_status_snapshot(sid)
-        fresh_limits = await _fetch_codex_app_rate_limits()
-        if fresh_limits:
-            snap["rate_limits"] = fresh_limits
-        snap_model = str(snap.get("model") or "")
-        state_model = _last_model if _last_model and _last_model != "codex" else ""
-        actual = (
-            snap_model
-            if snap_model and snap_model != "codex"
-            else state_model or snap_model or os.environ.get("BABATA_CODEX_MODEL") or "codex"
-        )
-        effort = snap.get("effort") or "—"
-        used = int(snap.get("context_used") or 0)
-        win = int(snap.get("context_window") or 0)
-        fallback_used = _last_used_tokens if _last_session_id == sid else 0
-        if not used:
-            used = fallback_used
-        pct_ctx = (used / win * 100) if (win and used > 0) else 0.0
-        bar = _progress_bar(pct_ctx)
-        window_short = _short_window(win)
-        last_usage = snap.get("last_usage") if isinstance(snap.get("last_usage"), dict) else {}
-        out_tokens = int(last_usage.get("output_tokens") or 0)
-        reason_tokens = int(last_usage.get("reasoning_output_tokens") or 0)
-        token_bits = []
-        if used:
-            token_bits.append(f"{_fmt_tok(used)} in")
-        if out_tokens:
-            token_bits.append(f"{_fmt_tok(out_tokens)} out")
-        if reason_tokens:
-            token_bits.append(f"{_fmt_tok(reason_tokens)} reasoning")
-        token_line = " · ".join(token_bits) if token_bits else "tokens —"
-        limits = snap.get("rate_limits") if isinstance(snap.get("rate_limits"), dict) else None
-        five_hour_line = _fmt_codex_limit(limits, "primary", "5h limit", 300)
-        week_line = _fmt_codex_limit(limits, "secondary", "weekly limit", 10_080)
-        plan_type = (limits or {}).get("plan_type") if isinstance(limits, dict) else None
-        sids = cc.recent_session_ids()
-        sid_now = sid if sid else "(new)"
-        labels = {0: "hidden", 1: "flash", 2: "keep"}
-        lines = [
-            "<b>📊 Status</b>",
-            "",
-            f"{bar} {pct_ctx:.0f}% · {html.escape(_short_model(actual))} {html.escape(str(effort))} ({window_short})",
-            "",
-            html.escape(token_line),
-            html.escape(_fmt_review_health_line()),
-        ]
-        if five_hour_line:
-            lines.append(html.escape(five_hour_line))
-        if week_line:
-            lines.append(html.escape(week_line))
-        if plan_type:
-            lines.append(html.escape(f"plan {plan_type}"))
-        lines += [
-            "",
-            f"Codex v{_codex_version()} · {labels.get(_verbose, _verbose)}",
-            f"<code>{sid_now}</code> · {len(sids)} recent",
-        ]
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-        return
 
+async def _cmd_status_claude(update: Update) -> None:
     # Config-level model (what settings.json asks for — may be alias like "opus[1m]").
     # Differs from actual model name SDK reports (resolved full version).
     cfg_model = "—"
@@ -3998,6 +3994,16 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"<code>{sid_now}</code> · {len(sids)} recent",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current model, context usage, cost, session state."""
+    if not _allowed(update):
+        return
+    if _current_cpu_name() == "codex":
+        await _cmd_status_codex(update)
+    else:
+        await _cmd_status_claude(update)
 
 
 def _fmt_tok(n: int) -> str:

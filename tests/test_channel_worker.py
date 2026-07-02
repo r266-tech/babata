@@ -508,6 +508,64 @@ def test_codex_status_prefers_live_app_server_limits(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
+def test_claude_status_renders_provider_usage_snapshot(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        monkeypatch.setattr(bot, "ALLOWED_USER", 7)
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({"recent_sids": ["sid-claude"]}))
+        monkeypatch.setattr(bot, "cc", FakeCpuSession("claude", state_file, "sid-claude"))
+        monkeypatch.setattr(bot, "_last_model", "claude-opus-4-7[1m]")
+        monkeypatch.setattr(bot, "_last_context_window", 1_000_000)
+        monkeypatch.setattr(bot, "_last_used_tokens", 0)
+        monkeypatch.setattr(bot, "_last_session_id", "sid-claude")
+        monkeypatch.setattr(bot, "_last_prompt_tokens", lambda _sid: 250_000)
+        monkeypatch.setattr(bot, "_fmt_review_health_line", lambda: "review ok · soft")
+        monkeypatch.setattr(bot, "_cc_version", lambda: "2.1.112")
+        monkeypatch.setattr(bot, "_sdk_version", lambda: "0.2.4")
+        monkeypatch.setattr(bot, "_fetch_anthropic_quota", lambda _token: asyncio.sleep(0, result={
+            "five_hour": {"utilization": 0.25, "resets_at": 1_778_418_860},
+            "seven_day": {"utilization": 0.50, "resets_at": 1_778_911_266},
+        }))
+        monkeypatch.setattr(bot, "_fetch_or_usage", lambda _key: asyncio.sleep(0, result={
+            "data": {"usage_daily": 1.25, "limit_remaining": 18.75},
+        }))
+        monkeypatch.setattr(bot, "_fetch_ccusage_today", lambda: asyncio.sleep(0, result=3.5))
+        monkeypatch.setattr(bot, "_load_providers", lambda: {
+            "current": "claude-main",
+            "providers": {
+                "claude-main": {
+                    "display_name": "Claude Main",
+                    "env": {"CLAUDE_CODE_OAUTH_TOKEN": "token"},
+                },
+                "openrouter": {
+                    "display_name": "OpenRouter",
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://openrouter.ai/api/v1",
+                        "ANTHROPIC_AUTH_TOKEN": "or-token",
+                    },
+                },
+            },
+        })
+
+        msg = FakeMessage(13, "/status")
+        await bot.cmd_status(FakeUpdate(msg, FakeChat(), user_id=7), FakeCtx())
+
+        text = msg.replies[-1].text
+        assert "25%" in text
+        assert "Opus 4.7 (1M)" in text
+        assert "review ok · soft" in text
+        assert "session 25%" in text
+        assert "week 50%" in text
+        assert "openrouter · $1.25 today · $18.75 left" in text
+        assert "$3.50 today (ccusage) · Claude Main" in text
+        assert "CC v2.1.112 · SDK v0.2.4" in text
+        assert "<code>claude-opus-4-7[1m]</code>" in text
+        assert "<code>sid-claude</code> · 1 recent" in text
+
+    asyncio.run(run())
+
+
 def test_codex_rate_limits_normalizes_app_server_shape():
     result = {
         "rateLimits": {
