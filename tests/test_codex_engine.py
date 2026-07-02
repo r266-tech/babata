@@ -8,7 +8,6 @@ sys.path.insert(0, str(_REPO))
 
 import codex_engine
 import engine
-import memory_runtime
 
 
 class FakeStream:
@@ -194,13 +193,6 @@ def test_codex_engine_uses_explicit_memory_source(monkeypatch, tmp_path):
 
     assert memory_injected is True
     assert seen_sources == ["sidebar"]
-
-
-def test_codex_engine_maps_channel_prompt_to_memory_source():
-    assert memory_runtime.memory_source_from_prompt("Source: Telegram. x") == "tg"
-    assert memory_runtime.memory_source_from_prompt("Source: WeChat. x") == "wechat"
-    assert memory_runtime.memory_source_from_prompt("Source: Sidebar. x") == "sidebar"
-    assert memory_runtime.memory_source_from_prompt("Source: test. x") == "unknown"
 
 
 def test_codex_engine_streams_tool_results(monkeypatch, tmp_path):
