@@ -215,6 +215,48 @@ def log_memory_reflex_post_answer(event_id: str | None, content: str) -> None:
     })
 
 
+def _memory_context_profile(reflex: dict[str, Any], mode: str) -> str:
+    configured = os.environ.get("BABATA_MEMORY_PROFILE")
+    if configured:
+        return configured
+    if mode == "enforce":
+        return str(reflex.get("profile") or "lite")
+    return "lite"
+
+
+def _memory_inject_env(*, profile: str, cpu: str, source: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env["BABATA_MEMORY_PROFILE"] = profile
+    env["BABATA_MEMORY_CPU"] = cpu
+    env["BABATA_MEMORY_SOURCE"] = source
+    env["BABATA_MEMORY_INCLUDE_TOP"] = os.environ.get("BABATA_MEMORY_INCLUDE_TOP") or "skip"
+    return env
+
+
+def _run_memory_inject(script: Path, env: dict[str, str], timeout: float) -> str:
+    try:
+        result = subprocess.run(
+            [str(script)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except Exception as exc:
+        log.warning("babata memory inject failed: %s", exc)
+        return ""
+    if result.returncode != 0:
+        log.warning(
+            "babata memory inject exited %s: %s",
+            result.returncode,
+            result.stderr.strip()[:500],
+        )
+        return ""
+    return result.stdout.strip()
+
+
 def render_babata_memory_context_event(
     *,
     enabled: bool,
@@ -237,37 +279,16 @@ def render_babata_memory_context_event(
         cwd=cwd,
     )
     mode = memory_reflex_mode()
-    enforce = mode == "enforce"
-    actual_profile = os.environ.get("BABATA_MEMORY_PROFILE") or (
-        str(reflex.get("profile") or "lite") if enforce else "lite"
+    actual_profile = _memory_context_profile(reflex, mode)
+    context_text = _run_memory_inject(
+        script,
+        _memory_inject_env(profile=actual_profile, cpu=cpu, source=source),
+        timeout,
     )
-    env = os.environ.copy()
-    env["BABATA_MEMORY_PROFILE"] = actual_profile
-    env["BABATA_MEMORY_CPU"] = cpu
-    env["BABATA_MEMORY_SOURCE"] = source
-    env["BABATA_MEMORY_INCLUDE_TOP"] = os.environ.get("BABATA_MEMORY_INCLUDE_TOP") or "skip"
-    try:
-        result = subprocess.run(
-            [str(script)],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except Exception as exc:
-        log.warning("babata memory inject failed: %s", exc)
+    if not context_text:
         return "", None
-    if result.returncode != 0:
-        log.warning(
-            "babata memory inject exited %s: %s",
-            result.returncode,
-            result.stderr.strip()[:500],
-        )
-        return "", None
-    parts = [result.stdout.strip()]
-    hint = format_memory_reflex_hint(reflex) if enforce else ""
+    parts = [context_text]
+    hint = format_memory_reflex_hint(reflex) if mode == "enforce" else ""
     if hint:
         parts.append(hint)
     context = "\n\n".join(part for part in parts if part)

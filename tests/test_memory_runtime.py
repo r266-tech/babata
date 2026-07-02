@@ -111,6 +111,60 @@ def test_render_memory_context_event_logs_enforced_reflex(monkeypatch, tmp_path)
     assert events[1]["observation"]["memory_miss_marker"] is True
 
 
+def test_render_memory_context_event_preserves_explicit_profile_and_include_top(monkeypatch, tmp_path):
+    inject_log = tmp_path / "inject-env.json"
+    inject_script = tmp_path / "inject.sh"
+    reflex_script = tmp_path / "reflex.py"
+    reflex_log = tmp_path / "events.jsonl"
+
+    _write_executable(
+        inject_script,
+        "\n".join([
+            "#!/usr/bin/env python3",
+            "import json, os",
+            f"open({str(inject_log)!r}, 'w').write(json.dumps({{",
+            "    'profile': os.environ.get('BABATA_MEMORY_PROFILE'),",
+            "    'include_top': os.environ.get('BABATA_MEMORY_INCLUDE_TOP'),",
+            "}, sort_keys=True))",
+            "print('<memory-context>explicit</memory-context>')",
+        ]),
+    )
+    _write_executable(
+        reflex_script,
+        "\n".join([
+            "#!/bin/sh",
+            "printf '%s\\n' '{\"routes\":[\"deep\"],\"profile\":\"deep\"}'",
+        ]),
+    )
+    monkeypatch.setenv("BABATA_MEMORY_INJECT_SCRIPT", str(inject_script))
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_SCRIPT", str(reflex_script))
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_LOG", str(reflex_log))
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX", "1")
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_MODE", "enforce")
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_TIMEOUT", _TEST_REFLEX_TIMEOUT_S)
+    monkeypatch.setenv("BABATA_MEMORY_PROFILE", "recent")
+    monkeypatch.setenv("BABATA_MEMORY_INCLUDE_TOP", "force")
+
+    context, event_id = memory_runtime.render_babata_memory_context_event(
+        enabled=True,
+        source="terminal",
+        user_prompt="need deep",
+        cpu="codex",
+        cwd=str(tmp_path),
+        timeout=float(_TEST_REFLEX_TIMEOUT_S),
+    )
+
+    assert event_id
+    assert "<memory-context>explicit</memory-context>" in context
+    assert json.loads(inject_log.read_text()) == {
+        "include_top": "force",
+        "profile": "recent",
+    }
+    event = json.loads(reflex_log.read_text().splitlines()[0])
+    assert event["actual_profile"] == "recent"
+    assert event["router"] == {"profile": "deep", "routes": ["deep"]}
+
+
 def test_log_memory_reflex_preflight_only_records_router_without_inject(monkeypatch, tmp_path):
     reflex_script = tmp_path / "reflex.py"
     reflex_log = tmp_path / "events.jsonl"
