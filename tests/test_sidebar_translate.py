@@ -137,3 +137,117 @@ def test_translation_raw_content_records_final_transport_failure(monkeypatch):
 
 def test_validated_marker_results_preserves_all_empty_parse():
     assert st._validated_marker_results("not marker output", ["hello"], "model") == [""]
+
+
+def test_translate_batch_dedupes_hits_and_caches_misses(monkeypatch):
+    provider = {
+        "base_url": "https://example.test/api/v1",
+        "api_key": "key",
+        "model": "model",
+    }
+    cache_target = st._cache_target("zh", provider)
+    events: list[tuple] = []
+    cached_store = {"hit": "cached hit"}
+    put_items: list[tuple[str, str, str]] = []
+    translated_inputs: list[list[str]] = []
+
+    async def fake_http_translate(_target, texts, *, url, provider):
+        translated_inputs.append(texts)
+        return ["translated miss"]
+
+    monkeypatch.setattr(st, "_resolve_provider", lambda: provider)
+    monkeypatch.setattr(st, "_cache_get", lambda order, target: dict(cached_store) if target == cache_target else {})
+    monkeypatch.setattr(st, "_cache_put", lambda items: put_items.extend(items))
+    monkeypatch.setattr(st, "_http_translate", fake_http_translate)
+    monkeypatch.setattr(st.sidebar_events, "append", lambda *args, **kwargs: events.append((args, kwargs)))
+
+    rows = asyncio.run(
+        st.translate_batch(
+            "site",
+            "zh",
+            [
+                {"hash": "hit", "text": "Hit"},
+                {"hash": "miss", "text": "old miss"},
+                {"hash": "miss", "text": "new miss"},
+                {"hash": "", "text": "skip"},
+                {"hash": "blank", "text": ""},
+                "not a dict",
+            ],
+            url="https://page.test",
+        )
+    )
+
+    assert rows == [
+        {"hash": "hit", "translated": "cached hit"},
+        {"hash": "miss", "translated": "translated miss"},
+    ]
+    assert translated_inputs == [["new miss"]]
+    assert put_items == [("miss", cache_target, "translated miss")]
+    assert [event[0][1] for event in events] == [
+        "translate_hit",
+        "translate_spawn",
+        "translate_done",
+    ]
+
+
+def test_translate_batch_partial_failure_keeps_only_successful_results(monkeypatch):
+    provider = {
+        "base_url": "https://example.test/api/v1",
+        "api_key": "key",
+        "model": "model",
+    }
+    events: list[tuple] = []
+    put_items: list[tuple[str, str, str]] = []
+
+    async def fake_http_translate(_target, _texts, *, url, provider):
+        return [""]
+
+    monkeypatch.setattr(st, "_resolve_provider", lambda: provider)
+    monkeypatch.setattr(st, "_cache_get", lambda _order, _target: {"hit": "cached hit"})
+    monkeypatch.setattr(st, "_cache_put", lambda items: put_items.extend(items))
+    monkeypatch.setattr(st, "_http_translate", fake_http_translate)
+    monkeypatch.setattr(st.sidebar_events, "append", lambda *args, **kwargs: events.append((args, kwargs)))
+
+    rows = asyncio.run(
+        st.translate_batch(
+            "site",
+            "zh",
+            [{"hash": "hit", "text": "Hit"}, {"hash": "miss", "text": "Miss"}],
+            url="https://page.test",
+        )
+    )
+
+    assert rows == [{"hash": "hit", "translated": "cached hit"}]
+    assert put_items == []
+    assert [event[0][1] for event in events] == [
+        "translate_hit",
+        "translate_spawn",
+        "translate_fail",
+    ]
+
+
+def test_translate_batch_config_error_records_event(monkeypatch):
+    events: list[tuple] = []
+
+    def fail_provider():
+        raise st.TranslateConfigError("missing key")
+
+    monkeypatch.setattr(st, "_resolve_provider", fail_provider)
+    monkeypatch.setattr(st.sidebar_events, "append", lambda *args, **kwargs: events.append((args, kwargs)))
+
+    rows = asyncio.run(
+        st.translate_batch(
+            "site",
+            "zh",
+            [{"hash": "h", "text": "Hello"}],
+            url="https://page.test",
+        )
+    )
+
+    assert rows == []
+    assert events == [
+        (
+            ("https://page.test", "translate_config_error"),
+            {"reason": "missing key", "target": "zh", "model": st._MODEL},
+        )
+    ]

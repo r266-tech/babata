@@ -550,19 +550,7 @@ async def test_translation_provider(payload: dict[str, Any] | None = None) -> di
     }
 
 
-async def translate_batch(site: str, target: str, batch: list[dict], url: str = "") -> list[dict]:
-    if not batch:
-        return []
-    target = (target or "zh").strip() or "zh"
-    try:
-        provider = _resolve_provider()
-    except TranslateConfigError as e:
-        log.error("translate config: %s", e)
-        sidebar_events.append(
-            url, "translate_config_error", reason=str(e)[:200], target=target, model=_MODEL
-        )
-        return []
-
+def _translation_batch_inputs(batch: list[dict]) -> tuple[dict[str, str], list[str]]:
     by_hash: dict[str, str] = {}
     order: list[str] = []
     for item in batch:
@@ -575,7 +563,39 @@ async def translate_batch(site: str, target: str, batch: list[dict], url: str = 
         if h not in by_hash:
             order.append(h)
         by_hash[h] = t
+    return by_hash, order
 
+
+def _cache_translated_misses(
+    cached: dict[str, str],
+    miss_hashes: list[str],
+    translated: list[str],
+    cache_target: str,
+) -> int:
+    to_cache: list[tuple[str, str, str]] = []
+    n_ok = 0
+    for i, h in enumerate(miss_hashes):
+        tr = translated[i] if i < len(translated) else ""
+        if tr:
+            cached[h] = tr
+            to_cache.append((h, cache_target, tr))
+            n_ok += 1
+    _cache_put(to_cache)
+    return n_ok
+
+
+async def translate_batch(site: str, target: str, batch: list[dict], url: str = "") -> list[dict]:
+    if not batch:
+        return []
+    target = (target or "zh").strip() or "zh"
+    try:
+        provider = _resolve_provider()
+    except TranslateConfigError as e:
+        log.error("translate config: %s", e)
+        _record_translate_config_error(url, target, _MODEL, str(e))
+        return []
+
+    by_hash, order = _translation_batch_inputs(batch)
     if not order:
         return []
 
@@ -606,15 +626,7 @@ async def translate_batch(site: str, target: str, batch: list[dict], url: str = 
         for r in results_per_chunk:
             translated.extend(r)
         spawn_ms = int((time.time() - t0) * 1000)
-        to_cache: list[tuple[str, str, str]] = []
-        n_ok = 0
-        for i, h in enumerate(miss_hashes):
-            tr = translated[i] if i < len(translated) else ""
-            if tr:
-                cached[h] = tr
-                to_cache.append((h, cache_target, tr))
-                n_ok += 1
-        _cache_put(to_cache)
+        n_ok = _cache_translated_misses(cached, miss_hashes, translated, cache_target)
         if n_ok == len(miss_texts):
             sidebar_events.append(url, "translate_done", spawn_ms=spawn_ms, n=n_ok, target=target, model=provider["model"])
         else:
