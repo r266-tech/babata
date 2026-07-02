@@ -36,10 +36,13 @@ class FakeClaudeSDKClient:
         self.connected = True
 
     async def query(self, prompt, session_id: str = "default") -> None:
-        async for msg in prompt:
-            if "session_id" not in msg:
-                msg["session_id"] = session_id
-            self.sent.append(msg)
+        if hasattr(prompt, "__aiter__"):
+            async for msg in prompt:
+                if "session_id" not in msg:
+                    msg["session_id"] = session_id
+                self.sent.append(msg)
+        else:
+            self.sent.append(prompt)
 
     async def receive_messages(self):
         while True:
@@ -90,6 +93,123 @@ def result(sid: str, text: str = "done") -> ResultMessage:
             }
         },
     )
+
+
+def test_user_message_payload_and_sdk_event_parser_share_cpu_boundary():
+    payload = cc._user_message_payload(
+        "look",
+        [{"media_type": "image/png", "data": "abc"}],
+    )
+    assert payload["message"]["role"] == "user"
+    assert payload["message"]["content"][0]["source"]["media_type"] == "image/png"
+    assert payload["message"]["content"][1] == {"type": "text", "text": "look"}
+
+    tools_seen: list[str] = []
+    events = []
+    for msg in [
+        StreamEvent(
+            uuid="u1",
+            session_id="sid-1",
+            event={
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "hel"},
+            },
+        ),
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Read", input={"file_path": "a.py"})],
+            model="claude-test",
+        ),
+        UserMessage(
+            content=[
+                ToolResultBlock(
+                    tool_use_id="t1",
+                    content=[{"type": "text", "text": "boom"}],
+                    is_error=True,
+                )
+            ]
+        ),
+    ]:
+        events.extend(cc._events_from_sdk_message(msg, tools_seen))
+
+    assert [event.kind for event in events] == ["text_delta", "tool_use", "tool_result"]
+    assert events[0].chunk == "hel"
+    assert events[1].name == "Read"
+    assert events[1].input_dict == {"file_path": "a.py"}
+    assert events[2].is_error is True
+    assert events[2].text == "boom"
+    assert tools_seen == ["Read"]
+
+    response = cc._response_from_messages([result("sid-1", "final")], ["Read"])
+    assert response.content == "final"
+    assert response.model == "claude-test[200k]"
+    assert response.input_tokens == 10
+    assert response.cache_read_tokens == 2
+
+
+def test_cc_query_one_shot_uses_shared_stream_and_response(monkeypatch, tmp_path):
+    async def run():
+        FakeClaudeSDKClient.instances.clear()
+        monkeypatch.setattr(cc, "ClaudeSDKClient", FakeClaudeSDKClient)
+        monkeypatch.setattr(cc, "notify_skill_evolve_turn", lambda **_kwargs: None)
+        session = cc.CC(
+            state_file=tmp_path / "session.json",
+            source_prompt="Source: test.",
+        )
+        monkeypatch.setattr(session, "_fire_hook", lambda *_: None)
+
+        streamed = []
+
+        async def on_stream(tool_name, tool_input, text_chunk, tool_result):
+            streamed.append((tool_name, tool_input, text_chunk, tool_result))
+
+        task = asyncio.create_task(session.query("hello", on_stream=on_stream))
+        await wait_for(lambda: len(FakeClaudeSDKClient.instances) == 1)
+        client = FakeClaudeSDKClient.instances[-1]
+        await wait_for(lambda: client.sent == ["hello"])
+
+        client.receive_queue.put_nowait(
+            StreamEvent(
+                uuid="u1",
+                session_id="sid-1",
+                event={
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "hel"},
+                },
+            )
+        )
+        client.receive_queue.put_nowait(
+            AssistantMessage(
+                content=[ToolUseBlock(id="t1", name="Read", input={"file_path": "a.py"})],
+                model="claude-test",
+            )
+        )
+        client.receive_queue.put_nowait(
+            UserMessage(
+                content=[
+                    ToolResultBlock(
+                        tool_use_id="t1",
+                        content=[{"type": "text", "text": "boom"}],
+                        is_error=True,
+                    )
+                ]
+            )
+        )
+        client.receive_queue.put_nowait(result("sid-1", "final"))
+
+        response = await task
+
+        assert response.content == "final"
+        assert response.session_id == "sid-1"
+        assert response.tools == ["Read"]
+        assert response.model == "claude-test[200k]"
+        assert streamed == [
+            (None, None, "hel", None),
+            ("Read", {"file_path": "a.py"}, None, None),
+            (None, None, None, {"is_error": True, "text": "boom"}),
+        ]
+        assert client.disconnected is True
+
+    asyncio.run(run())
 
 
 def test_live_session_connect_submit_interrupt_close(monkeypatch, tmp_path):

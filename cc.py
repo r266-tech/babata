@@ -22,7 +22,6 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     ResultMessage,
-    TextBlock,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
@@ -665,6 +664,130 @@ class Event:
     exception: Exception | None = None
 
 
+def _user_message_payload(
+    prompt: str,
+    images: list[dict[str, str]] | None,
+) -> dict[str, Any]:
+    content: str | list[dict[str, Any]]
+    if images:
+        content = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img["media_type"],
+                    "data": img["data"],
+                },
+            }
+            for img in images
+        ]
+        if prompt:
+            content.append({"type": "text", "text": prompt})
+    else:
+        content = prompt
+    return {
+        "type": "user",
+        "message": {"role": "user", "content": content},
+        "parent_tool_use_id": None,
+    }
+
+
+def _events_from_sdk_message(msg: Any, tools_seen: list[str]) -> list[Event]:
+    events: list[Event] = []
+    if isinstance(msg, AssistantMessage):
+        for block in getattr(msg, "content", []) or []:
+            if isinstance(block, ToolUseBlock):
+                name = getattr(block, "name", "")
+                inp = getattr(block, "input", {}) or {}
+                if name and name not in tools_seen:
+                    tools_seen.append(name)
+                events.append(Event(
+                    kind="tool_use",
+                    name=name,
+                    input_dict=inp,
+                ))
+    elif isinstance(msg, StreamEvent):
+        ev = msg.event or {}
+        if ev.get("type") == "content_block_delta":
+            delta = ev.get("delta") or {}
+            if delta.get("type") == "text_delta":
+                chunk = delta.get("text") or ""
+                if chunk:
+                    events.append(Event(kind="text_delta", chunk=chunk))
+    elif isinstance(msg, UserMessage):
+        for block in getattr(msg, "content", []) or []:
+            if isinstance(block, ToolResultBlock):
+                events.append(Event(
+                    kind="tool_result",
+                    is_error=bool(block.is_error),
+                    text=_tool_result_text(block.content),
+                ))
+    return events
+
+
+def _response_from_messages(messages: list[Any], tools_seen: list[str]) -> Response:
+    content = ""
+    cost = 0.0
+    sid = ""
+    model: str | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    in_tok = out_tok = cache_r = cache_c = 0
+    is_error = False
+    err_subtype: str | None = None
+
+    for msg in messages:
+        if isinstance(msg, ResultMessage):
+            cost = getattr(msg, "total_cost_usd", 0.0) or 0.0
+            sid = getattr(msg, "session_id", None) or ""
+            result = getattr(msg, "result", None)
+            if result:
+                content = str(result).strip()
+            is_error = bool(getattr(msg, "is_error", False))
+            err_subtype = getattr(msg, "subtype", None)
+            mu = getattr(msg, "model_usage", None) or {}
+            if mu:
+                model = next(iter(mu.keys()))
+                stats = mu[model] or {}
+                context_window = stats.get("contextWindow")
+                max_output_tokens = stats.get("maxOutputTokens")
+                in_tok = int(stats.get("inputTokens") or 0)
+                out_tok = int(stats.get("outputTokens") or 0)
+                cache_r = int(stats.get("cacheReadInputTokens") or 0)
+                cache_c = int(stats.get("cacheCreationInputTokens") or 0)
+            break
+
+    if not content:
+        parts = []
+        for msg in messages:
+            if isinstance(msg, AssistantMessage):
+                for block in getattr(msg, "content", []) or []:
+                    if hasattr(block, "text"):
+                        parts.append(block.text)
+        content = "\n".join(parts).strip()
+
+    if not content and tools_seen:
+        content = "(done)"
+
+    if is_error and not content:
+        content = _result_error_text(err_subtype, None)
+
+    return Response(
+        content=content,
+        session_id=sid,
+        cost=cost,
+        tools=list(tools_seen),
+        model=model,
+        context_window=context_window,
+        max_output_tokens=max_output_tokens,
+        input_tokens=in_tok,
+        output_tokens=out_tok,
+        cache_read_tokens=cache_r,
+        cache_creation_tokens=cache_c,
+        is_error=is_error,
+    )
+
+
 class CC:
     """Single-session Claude Code interface for one channel.
 
@@ -1260,24 +1383,9 @@ class CC:
 
         try:
             await client.connect()
-
             if images:
-                blocks: list[dict[str, Any]] = [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": img["media_type"],
-                            "data": img["data"],
-                        },
-                    }
-                    for img in images
-                ]
-                if prompt:
-                    blocks.append({"type": "text", "text": prompt})
-
                 async def _multi():
-                    yield {"type": "user", "message": {"role": "user", "content": blocks}}
+                    yield _user_message_payload(prompt, images)
 
                 await client.query(_multi())
             else:
@@ -1292,98 +1400,34 @@ class CC:
                 if not on_stream:
                     continue
 
-                if isinstance(msg, AssistantMessage):
-                    for block in getattr(msg, "content", []) or []:
-                        if isinstance(block, ToolUseBlock):
-                            name = getattr(block, "name", "")
-                            inp = getattr(block, "input", {}) or {}
-                            if name and name not in tools_seen:
-                                tools_seen.append(name)
-                            await on_stream(name, inp, None, None)
-                        # TextBlock not streamed here — it's the *final* full
-                        # text, would duplicate what we already sent via
-                        # StreamEvent text deltas below.
-                elif isinstance(msg, StreamEvent):
-                    ev = msg.event or {}
-                    if ev.get("type") == "content_block_delta":
-                        delta = ev.get("delta") or {}
-                        if delta.get("type") == "text_delta":
-                            chunk = delta.get("text") or ""
-                            if chunk:
-                                await on_stream(None, None, chunk, None)
-                elif isinstance(msg, UserMessage):
-                    for block in getattr(msg, "content", []) or []:
-                        if isinstance(block, ToolResultBlock):
-                            await on_stream(None, None, None, {
-                                "is_error": bool(block.is_error),
-                                "text": _tool_result_text(block.content),
-                            })
+                for event in _events_from_sdk_message(msg, tools_seen):
+                    if event.kind == "tool_use":
+                        await on_stream(event.name, event.input_dict or {}, None, None)
+                    elif event.kind == "text_delta":
+                        await on_stream(None, None, event.chunk or "", None)
+                    elif event.kind == "tool_result":
+                        await on_stream(None, None, None, {
+                            "is_error": event.is_error,
+                            "text": event.text or "",
+                        })
         finally:
             await client.disconnect()
 
         tool_uses = _extract_tool_uses(messages)
         tools_seen = _ordered_tool_names(tools_seen, tool_uses)
+        response = _response_from_messages(messages, tools_seen)
 
-        content = ""
-        cost = 0.0
-        sid = None
-        model: str | None = None
-        context_window: int | None = None
-        max_output_tokens: int | None = None
-        in_tok = out_tok = cache_r = cache_c = 0
-        is_error = False
-        err_subtype: str | None = None
-
-        for msg in messages:
-            if isinstance(msg, ResultMessage):
-                cost = getattr(msg, "total_cost_usd", 0.0) or 0.0
-                sid = getattr(msg, "session_id", None)
-                result = getattr(msg, "result", None)
-                if result:
-                    content = str(result).strip()
-                is_error = bool(getattr(msg, "is_error", False))
-                err_subtype = getattr(msg, "subtype", None)
-                # model_usage shape: {"claude-opus-4-N[1m]": {inputTokens, outputTokens,
-                # cacheReadInputTokens, cacheCreationInputTokens, contextWindow,
-                # maxOutputTokens, ...}}. First key = the model CC actually ran.
-                mu = getattr(msg, "model_usage", None) or {}
-                if mu:
-                    model = next(iter(mu.keys()))
-                    stats = mu[model] or {}
-                    context_window = stats.get("contextWindow")
-                    max_output_tokens = stats.get("maxOutputTokens")
-                    in_tok = int(stats.get("inputTokens") or 0)
-                    out_tok = int(stats.get("outputTokens") or 0)
-                    cache_r = int(stats.get("cacheReadInputTokens") or 0)
-                    cache_c = int(stats.get("cacheCreationInputTokens") or 0)
-                break
-
-        if not content:
-            parts = []
-            for msg in messages:
-                if isinstance(msg, AssistantMessage):
-                    for block in getattr(msg, "content", []) or []:
-                        if hasattr(block, "text"):
-                            parts.append(block.text)
-            content = "\n".join(parts).strip()
-
-        if not content and tools_seen:
-            content = "(done)"
-
-        if is_error and not content:
-            content = _result_error_text(err_subtype, None)
-
-        if sid:
+        if response.session_id:
             # Detect session boundary: SDK starts a fresh sid on first turn,
             # after /reset, or when resume failed and a new session was created
             # implicitly. Fire babata session-start so TG sees the new sid.
             # Skipped when sid is unchanged (same session continuing).
-            if sid != self._session_id:
-                self._fire_hook(_HOOKS_DIR, "session-start.sh", sid)
-            self._session_id = sid
-            self._record_sid(sid)
+            if response.session_id != self._session_id:
+                self._fire_hook(_HOOKS_DIR, "session-start.sh", response.session_id)
+            self._session_id = response.session_id
+            self._record_sid(response.session_id)
             notify_skill_evolve_turn(
-                session_id=sid,
+                session_id=response.session_id,
                 cpu="claude",
                 source=self._memory_source,
                 channel=_channel_label_from_state_file(self._state_file),
@@ -1391,21 +1435,8 @@ class CC:
                 metadata={"tools": tools_seen, "engine": "claude"},
             )
 
-        return Response(
-            content=content,
-            session_id=sid or "",
-            cost=cost,
-            tools=tools_seen,
-            model=model,
-            context_window=context_window,
-            max_output_tokens=max_output_tokens,
-            input_tokens=in_tok,
-            output_tokens=out_tok,
-            cache_read_tokens=cache_r,
-            cache_creation_tokens=cache_c,
-            audit={"tool_uses": tool_uses},
-            is_error=is_error,
-        )
+        response.audit = {"tool_uses": tool_uses}
+        return response
 
 
 class LiveSession(CC):
@@ -1619,34 +1650,8 @@ class LiveSession(CC):
                             yield Event(kind="turn_end", response=response)
                             continue
 
-                        if isinstance(msg, AssistantMessage):
-                            for block in getattr(msg, "content", []) or []:
-                                if isinstance(block, ToolUseBlock):
-                                    name = getattr(block, "name", "")
-                                    inp = getattr(block, "input", {}) or {}
-                                    if name and name not in tools_seen:
-                                        tools_seen.append(name)
-                                    yield Event(
-                                        kind="tool_use",
-                                        name=name,
-                                        input_dict=inp,
-                                    )
-                        elif isinstance(msg, StreamEvent):
-                            ev = msg.event or {}
-                            if ev.get("type") == "content_block_delta":
-                                delta = ev.get("delta") or {}
-                                if delta.get("type") == "text_delta":
-                                    chunk = delta.get("text") or ""
-                                    if chunk:
-                                        yield Event(kind="text_delta", chunk=chunk)
-                        elif isinstance(msg, UserMessage):
-                            for block in getattr(msg, "content", []) or []:
-                                if isinstance(block, ToolResultBlock):
-                                    yield Event(
-                                        kind="tool_result",
-                                        is_error=bool(block.is_error),
-                                        text=_tool_result_text(block.content),
-                                    )
+                        for event in _events_from_sdk_message(msg, tools_seen):
+                            yield event
                 except Exception as e:
                     if self._closed:
                         break
@@ -1873,35 +1878,14 @@ class LiveSession(CC):
         prompt: str,
         images: list[dict[str, str]] | None,
     ) -> dict[str, Any]:
-        if images:
-            blocks: list[dict[str, Any]] = [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": img["media_type"],
-                        "data": img["data"],
-                    },
-                }
-                for img in images
-            ]
-            if prompt:
-                blocks.append({"type": "text", "text": prompt})
-            content: str | list[dict[str, Any]] = blocks
-        else:
-            content = prompt
-        return {
-            "type": "user",
-            "message": {"role": "user", "content": content},
-            "parent_tool_use_id": None,
-        }
+        return _user_message_payload(prompt, images)
 
     def _handle_result_message(
         self,
         messages: list[Any],
         tools_seen: list[str],
     ) -> tuple[Response, tuple[str | None, str] | None]:
-        response = self._response_from_messages(messages, tools_seen)
+        response = _response_from_messages(messages, tools_seen)
         tool_uses = _extract_tool_uses(messages)
         response.tools = _ordered_tool_names(response.tools, tool_uses)
         if self._resume_note_next:
@@ -1957,69 +1941,3 @@ class LiveSession(CC):
         self._blocking_review_round += 1
         self._enqueue_internal_repair(build_repair_prompt(review))
         return True
-
-    @staticmethod
-    def _response_from_messages(
-        messages: list[Any],
-        tools_seen: list[str],
-    ) -> Response:
-        content = ""
-        cost = 0.0
-        sid = ""
-        model: str | None = None
-        context_window: int | None = None
-        max_output_tokens: int | None = None
-        in_tok = out_tok = cache_r = cache_c = 0
-
-        is_error = False
-        err_subtype: str | None = None
-        for msg in messages:
-            if isinstance(msg, ResultMessage):
-                cost = getattr(msg, "total_cost_usd", 0.0) or 0.0
-                sid = getattr(msg, "session_id", None) or ""
-                result = getattr(msg, "result", None)
-                if result:
-                    content = str(result).strip()
-                is_error = bool(getattr(msg, "is_error", False))
-                err_subtype = getattr(msg, "subtype", None)
-                mu = getattr(msg, "model_usage", None) or {}
-                if mu:
-                    model = next(iter(mu.keys()))
-                    stats = mu[model] or {}
-                    context_window = stats.get("contextWindow")
-                    max_output_tokens = stats.get("maxOutputTokens")
-                    in_tok = int(stats.get("inputTokens") or 0)
-                    out_tok = int(stats.get("outputTokens") or 0)
-                    cache_r = int(stats.get("cacheReadInputTokens") or 0)
-                    cache_c = int(stats.get("cacheCreationInputTokens") or 0)
-                break
-
-        if not content:
-            parts = []
-            for msg in messages:
-                if isinstance(msg, AssistantMessage):
-                    for block in getattr(msg, "content", []) or []:
-                        if isinstance(block, TextBlock):
-                            parts.append(block.text)
-            content = "\n".join(parts).strip()
-
-        if not content and tools_seen:
-            content = "(done)"
-
-        if is_error and not content:
-            content = _result_error_text(err_subtype, None)
-
-        return Response(
-            content=content,
-            session_id=sid,
-            cost=cost,
-            tools=list(tools_seen),
-            model=model,
-            context_window=context_window,
-            max_output_tokens=max_output_tokens,
-            input_tokens=in_tok,
-            output_tokens=out_tok,
-            cache_read_tokens=cache_r,
-            cache_creation_tokens=cache_c,
-            is_error=is_error,
-        )
