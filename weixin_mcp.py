@@ -34,13 +34,9 @@ async def list_tools() -> list[Tool]:
             name="wx_send_text",
             description=(
                 "Send a text message to the user's WeChat. "
-                "When invoked from an inbound WeChat conversation, the assistant's "
-                "final turn text is already auto-delivered — this tool is additive, "
-                "for mid-turn pushes, long-running task progress, or proactive sends. "
-                "WeChat client renders Markdown natively (bold/italic/code/headings/"
-                "lists/tables/links/quotes/hr; nested supported). "
-                "HTML tags and [x]/[ ] task lists display literally. "
-                "Bare URLs auto-linked; [text](url) hides URL."
+                "Inbound WeChat final-turn text is already auto-delivered; "
+                "use this additive tool only for mid-turn pushes, long-running progress, "
+                "or proactive sends."
             ),
             inputSchema={
                 "type": "object",
