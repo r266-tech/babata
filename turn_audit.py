@@ -267,127 +267,142 @@ def run_deterministic_guards(
 
     findings: list[dict[str, Any]] = []
     for rel in changed_files:
-        rel_posix = rel.replace("\\", "/")
-        name = Path(rel_posix).name
-        lower = rel_posix.lower()
-        if name == ".env" or name.startswith(".env."):
-            findings.append(_finding(
-                "high",
-                "env-file-changed",
-                "Environment/secret file changed; keep local secrets out of repo commits and public artifacts.",
-                path=rel,
-                blocking=True,
-            ))
-        if "chat-archive" in lower or "/raw/" in lower and "archive" in lower:
-            findings.append(_finding(
-                "medium",
-                "raw-archive-change",
-                "Raw/archive layer changed; babata raw records are append-only unless explicitly authorized.",
-                path=rel,
-            ))
-        if _is_ops_path(rel_posix):
-            findings.append(_finding(
-                "medium",
-                "ops-boundary-file",
-                "Launchd/self-ops surface changed; verify rollout uses scripts/self-ops.sh instead of inline service mutation.",
-                path=rel,
-            ))
-
-        if repo_root is None:
-            continue
-        fp = (repo_root / rel).resolve()
-        if not _safe_child(repo_root, fp) or not fp.is_file() or not _looks_text(fp):
-            continue
-        content = _read_small_text(fp)
-        if not content:
-            continue
-        for rule, pattern in _SECRET_PATTERNS:
-            if pattern.search(content):
-                findings.append(_finding(
-                    "high",
-                    f"secret-pattern:{rule}",
-                    "Changed file contains a token-like secret pattern.",
-                    path=rel,
-                    blocking=True,
-                ))
-        if "launchctl kickstart" in content or "launchctl bootstrap" in content or "launchctl bootout" in content:
-            if rel_posix != "scripts/self-ops.sh":
-                findings.append(_finding(
-                    "high",
-                    "inline-launchctl",
-                    "Service mutation must go through scripts/self-ops.sh for detached self-ops safety.",
-                    path=rel,
-                    blocking=True,
-                ))
+        findings.extend(_changed_file_guard_findings(repo_root, rel))
 
     for tool in tool_uses:
-        name = str(tool.get("name") or "")
-        path = _tool_path(tool)
-        if path:
-            path_name = Path(path.replace("\\", "/")).name
-            if path_name == ".env" or path_name.startswith(".env."):
-                findings.append(_finding(
-                    "high",
-                    "env-file-tool-request",
-                    "Tool request targets an environment/secret file.",
-                    path=path,
-                    blocking=True,
-                ))
-            if _is_ops_path(path):
-                findings.append(_finding(
-                    "medium",
-                    "ops-boundary-tool-request",
-                    "Tool request targets launchd/self-ops surface.",
-                    path=path,
-                ))
-        if tool.get("content_has_secret"):
-            findings.append(_finding(
-                "high",
-                "secret-pattern:tool-input",
-                "Tool input contains a token-like secret pattern.",
-                path=path,
-                blocking=True,
-            ))
-        if tool.get("content_has_launchctl") and path != "scripts/self-ops.sh":
-            findings.append(_finding(
-                "high",
-                "inline-launchctl-tool-input",
-                "Tool input contains launchd mutation outside scripts/self-ops.sh.",
-                path=path,
-                blocking=True,
-            ))
-        command = _tool_command(tool)
-        if not command:
-            continue
-        lowered = command.lower()
-        if name.lower() == "bash" or "bash" in name.lower() or "command" in tool:
-            if re.search(r"\bgit\s+(?:reset\s+--hard|checkout\s+--|clean\s+-[fd])\b", command):
-                findings.append(_finding(
-                    "high",
-                    "dangerous-git-command",
-                    "Dangerous git command was requested; only run with explicit user authorization.",
-                    command=command,
-                    blocking=True,
-                ))
-            if "launchctl kickstart" in lowered or "launchctl bootstrap" in lowered or "launchctl bootout" in lowered:
-                if "scripts/self-ops.sh" not in lowered:
-                    findings.append(_finding(
-                        "high",
-                        "inline-launchctl-command",
-                        "Launchd mutation command bypassed scripts/self-ops.sh.",
-                        command=command,
-                        blocking=True,
-                    ))
-            if re.search(r"\b(?:rm\s+-rf|trash\s+).*(?:/state/|chat-archive|memory)\b", lowered):
-                findings.append(_finding(
-                    "high",
-                    "destructive-memory-command",
-                    "Command appears to delete state/memory/archive data.",
-                    command=command,
-                    blocking=True,
-                ))
+        findings.extend(_tool_guard_findings(tool))
 
     return _dedupe_findings(findings)
+
+
+def _changed_file_guard_findings(repo_root: Path | None, rel: str) -> list[dict[str, Any]]:
+    rel_posix = rel.replace("\\", "/")
+    name = Path(rel_posix).name
+    lower = rel_posix.lower()
+    findings: list[dict[str, Any]] = []
+
+    if name == ".env" or name.startswith(".env."):
+        findings.append(_finding(
+            "high",
+            "env-file-changed",
+            "Environment/secret file changed; keep local secrets out of repo commits and public artifacts.",
+            path=rel,
+            blocking=True,
+        ))
+    if "chat-archive" in lower or ("/raw/" in lower and "archive" in lower):
+        findings.append(_finding(
+            "medium",
+            "raw-archive-change",
+            "Raw/archive layer changed; babata raw records are append-only unless explicitly authorized.",
+            path=rel,
+        ))
+    if _is_ops_path(rel_posix):
+        findings.append(_finding(
+            "medium",
+            "ops-boundary-file",
+            "Launchd/self-ops surface changed; verify rollout uses scripts/self-ops.sh instead of inline service mutation.",
+            path=rel,
+        ))
+
+    if repo_root is None:
+        return findings
+    fp = (repo_root / rel).resolve()
+    if not _safe_child(repo_root, fp) or not fp.is_file() or not _looks_text(fp):
+        return findings
+    content = _read_small_text(fp)
+    if not content:
+        return findings
+    for rule, pattern in _SECRET_PATTERNS:
+        if pattern.search(content):
+            findings.append(_finding(
+                "high",
+                f"secret-pattern:{rule}",
+                "Changed file contains a token-like secret pattern.",
+                path=rel,
+                blocking=True,
+            ))
+    if "launchctl kickstart" in content or "launchctl bootstrap" in content or "launchctl bootout" in content:
+        if rel_posix != "scripts/self-ops.sh":
+            findings.append(_finding(
+                "high",
+                "inline-launchctl",
+                "Service mutation must go through scripts/self-ops.sh for detached self-ops safety.",
+                path=rel,
+                blocking=True,
+            ))
+    return findings
+
+
+def _tool_guard_findings(tool: dict[str, Any]) -> list[dict[str, Any]]:
+    name = str(tool.get("name") or "")
+    path = _tool_path(tool)
+    findings: list[dict[str, Any]] = []
+    if path:
+        path_name = Path(path.replace("\\", "/")).name
+        if path_name == ".env" or path_name.startswith(".env."):
+            findings.append(_finding(
+                "high",
+                "env-file-tool-request",
+                "Tool request targets an environment/secret file.",
+                path=path,
+                blocking=True,
+            ))
+        if _is_ops_path(path):
+            findings.append(_finding(
+                "medium",
+                "ops-boundary-tool-request",
+                "Tool request targets launchd/self-ops surface.",
+                path=path,
+            ))
+    if tool.get("content_has_secret"):
+        findings.append(_finding(
+            "high",
+            "secret-pattern:tool-input",
+            "Tool input contains a token-like secret pattern.",
+            path=path,
+            blocking=True,
+        ))
+    if tool.get("content_has_launchctl") and path != "scripts/self-ops.sh":
+        findings.append(_finding(
+            "high",
+            "inline-launchctl-tool-input",
+            "Tool input contains launchd mutation outside scripts/self-ops.sh.",
+            path=path,
+            blocking=True,
+        ))
+
+    command = _tool_command(tool)
+    if not command:
+        return findings
+    lowered = command.lower()
+    if name.lower() != "bash" and "bash" not in name.lower() and "command" not in tool:
+        return findings
+    if re.search(r"\bgit\s+(?:reset\s+--hard|checkout\s+--|clean\s+-[fd])\b", command):
+        findings.append(_finding(
+            "high",
+            "dangerous-git-command",
+            "Dangerous git command was requested; only run with explicit user authorization.",
+            command=command,
+            blocking=True,
+        ))
+    if "launchctl kickstart" in lowered or "launchctl bootstrap" in lowered or "launchctl bootout" in lowered:
+        if "scripts/self-ops.sh" not in lowered:
+            findings.append(_finding(
+                "high",
+                "inline-launchctl-command",
+                "Launchd mutation command bypassed scripts/self-ops.sh.",
+                command=command,
+                blocking=True,
+            ))
+    if re.search(r"\b(?:rm\s+-rf|trash\s+).*(?:/state/|chat-archive|memory)\b", lowered):
+        findings.append(_finding(
+            "high",
+            "destructive-memory-command",
+            "Command appears to delete state/memory/archive data.",
+            command=command,
+            blocking=True,
+        ))
+    return findings
 
 
 def run_declared_checks(

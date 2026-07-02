@@ -101,6 +101,29 @@ def test_permission_guard_can_enforce_secret_file_writes(monkeypatch):
     assert reason and "env-file-tool-request" in reason
 
 
+def test_deterministic_guards_combine_file_and_tool_findings(monkeypatch, tmp_path):
+    monkeypatch.setenv("BABATA_DETERMINISTIC_GUARDS", "observe")
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-testsecret0000000000000000\n")
+
+    findings = turn_audit.run_deterministic_guards(
+        repo_root=tmp_path,
+        changed_files=[".env"],
+        tool_uses=[
+            {
+                "name": "Bash",
+                "command": "rm -rf /tmp/babata-state/memory",
+            }
+        ],
+    )
+
+    rules = {finding["rule"] for finding in findings}
+    assert {
+        "env-file-changed",
+        "secret-pattern:anthropic_api_key",
+        "destructive-memory-command",
+    } <= rules
+
+
 def test_declared_checks_skip_without_config(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
