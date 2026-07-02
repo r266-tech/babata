@@ -73,6 +73,15 @@ def test_tg_mcp_tool_descriptions_stay_operational():
         assert marker not in page.description
 
 
+def test_tg_instance_schema_stays_compact_without_losing_route_values():
+    assert tg_mcp.INSTANCE_SCHEMA["enum"] == tg_mcp.TG_INSTANCES
+    assert len(tg_mcp.INSTANCE_SCHEMA["description"]) <= 90
+    for marker in ("Optional TG bot selector", "Omit", "bound channel"):
+        assert marker in tg_mcp.INSTANCE_SCHEMA["description"]
+    for label in tg_mcp.INSTANCE_LABELS.values():
+        assert label not in tg_mcp.INSTANCE_SCHEMA["description"]
+
+
 def test_short_bubble_uses_html_parse_mode():
     parts, parse_mode = bot._format_bubble_parts("**ok**")
 

@@ -41,12 +41,7 @@ TG_INSTANCES = [k for k in INSTANCE_LABELS if k != "weixin"]
 INSTANCE_SCHEMA = {
     "type": "string",
     "enum": TG_INSTANCES,
-    "description": (
-        "Optional TG bot selector. "
-        + "; ".join(f"'{k}' → {INSTANCE_LABELS[k]}" for k in TG_INSTANCES)
-        + ". Omit → send via this MCP server's bound socket "
-        "(terminal CC → 主 bot; bot-internal CC → that bot's own channel)."
-    ),
+    "description": "Optional TG bot selector. Omit to send via this MCP server's bound channel.",
 }
 
 
