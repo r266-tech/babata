@@ -214,13 +214,9 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="tg_send_page",
             description=(
-                "Publish a Telegraph (telegra.ph) page from markdown and send the URL to TG — "
-                "renders as an Instant View card with full rich layout (h3/h4 headings, real "
-                "<ul>/<ol> lists, blockquote, syntax-highlighted code, inline b/i/u/s/code/a). "
-                "Use when the reply has headings, long structured content, multi-language code blocks, "
-                "or exceeds what TG's inline HTML parse_mode can render cleanly. "
-                "content_md accepts standard markdown; unsupported elements (tables, h1/h2 in body) "
-                "degrade to plain paragraphs. Returns the Telegraph URL."
+                "Publish a Telegraph page from markdown and send its URL to TG. "
+                "Use for long structured replies, code-heavy content, or output that TG inline HTML "
+                "cannot render cleanly. content_md accepts standard markdown; returns the Telegraph URL."
             ),
             inputSchema={
                 "type": "object",

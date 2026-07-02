@@ -17,6 +17,7 @@ os.environ.setdefault("ALLOWED_USER_ID", "0")
 
 import bot
 import bridge as tg_bridge
+import tg_mcp
 
 
 def test_tg_handler_registration_keeps_transcript_sources_centralized():
@@ -59,6 +60,17 @@ def test_tg_handler_registration_keeps_transcript_sources_centralized():
     ]
 
     assert sum(1 for node in calls if isinstance(node.func, ast.Name) and node.func.id == "_with_transcript") == 3
+
+
+def test_tg_mcp_tool_descriptions_stay_operational():
+    tools = {tool.name: tool for tool in asyncio.run(tg_mcp.list_tools())}
+    page = tools["tg_send_page"]
+
+    assert len(page.description) <= 240
+    for marker in ("Telegraph", "markdown", "long structured", "TG inline HTML", "returns the Telegraph URL"):
+        assert marker in page.description
+    for marker in ("Instant View card", "syntax-highlighted", "<ul>/<ol>", "h3/h4", "unsupported elements"):
+        assert marker not in page.description
 
 
 def test_short_bubble_uses_html_parse_mode():
