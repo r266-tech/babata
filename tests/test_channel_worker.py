@@ -228,6 +228,13 @@ class FakeCpuSession:
     def session_id(self) -> str | None:
         return self._session_id
 
+    @property
+    def assistant_engine_name(self) -> str:
+        return self._babata_engine_name
+
+    def recent_session_ids(self) -> list[str]:
+        return list(self._load_state().get("recent_sids") or [])
+
     def persist_current_session(self):
         if self._state_file is None:
             return
@@ -300,6 +307,8 @@ def test_bot_channel_does_not_reach_into_engine_private_session_state():
 
     assert "cc._session_id" not in source
     assert "cc._record_sid" not in source
+    assert "cc._load_state" not in source
+    assert 'getattr(cc, "_babata_engine_name"' not in source
     assert 'getattr(cc, "_session_id"' not in source
 
 

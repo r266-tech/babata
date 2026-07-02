@@ -886,7 +886,7 @@ class CC:
         # each successful turn, so it doubles as the idle-reset clock.
         state["last_activity_at"] = time.time()
         if sid:
-            hist = [s for s in state.get("recent_sids", []) if s != sid]
+            hist = [s for s in state.get("recent_sids", []) if isinstance(s, str) and s and s != sid]
             hist.insert(0, sid)
             state["recent_sids"] = hist[:_MAX_RECENT_SIDS]
         self._save_state(state)
@@ -894,6 +894,15 @@ class CC:
     @property
     def session_id(self) -> str | None:
         return self._session_id
+
+    @property
+    def assistant_engine_name(self) -> str | None:
+        name = getattr(self, "_babata_engine_name", None)
+        return name if isinstance(name, str) and name else None
+
+    def recent_session_ids(self) -> list[str]:
+        sids = self._load_state().get("recent_sids") or []
+        return [sid for sid in sids if isinstance(sid, str) and sid]
 
     def persist_current_session(self) -> None:
         self._record_sid(self._session_id)

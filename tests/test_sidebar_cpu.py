@@ -8,11 +8,13 @@ import sidebar_bot
 
 def test_cc_exposes_public_session_helpers(tmp_path):
     state_file = tmp_path / "session.json"
-    state_file.write_text('{"session_id": "sid-existing"}')
+    state_file.write_text('{"session_id": "sid-existing", "recent_sids": ["sid-existing", 42, ""]}')
 
     session = cc_module.CC(state_file=state_file, source_prompt="Source: test.")
 
     assert session.session_id == "sid-existing"
+    assert session.assistant_engine_name is None
+    assert session.recent_session_ids() == ["sid-existing"]
     session.persist_current_session()
     state = json.loads(state_file.read_text())
     assert state["session_id"] == "sid-existing"
@@ -36,6 +38,10 @@ def test_sidebar_cpu_status_reads_public_session_property(monkeypatch):
         @property
         def session_id(self):
             return self._sid
+
+        @property
+        def assistant_engine_name(self):
+            return self._name
 
     def engine_name_for(obj, _state_file: Path) -> str:
         return obj._name
@@ -70,6 +76,10 @@ def test_sidebar_cpu_switch_persists_sessions_with_public_api(monkeypatch, tmp_p
         @property
         def session_id(self):
             return None
+
+        @property
+        def assistant_engine_name(self):
+            return self._name
 
         def persist_current_session(self):
             self.persisted += 1
@@ -121,6 +131,10 @@ def test_sidebar_cpu_switch_only_waits_for_chat_turn(monkeypatch, tmp_path):
         def session_id(self):
             return None
 
+        @property
+        def assistant_engine_name(self):
+            return self._name
+
         def persist_current_session(self):
             return None
 
@@ -156,6 +170,7 @@ def test_sidebar_cpu_switch_does_not_reach_into_engine_private_session_state():
     source = Path(sidebar_bot.__file__).read_text()
 
     assert 'getattr(cc, "_session_id"' not in source
+    assert 'getattr(obj, "_babata_engine_name"' not in source
     assert "._record_sid(" not in source
 
 

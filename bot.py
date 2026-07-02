@@ -446,7 +446,7 @@ def _make_tg_engine(target: str | None = None) -> LiveSession:
 
 
 def _current_cpu_name() -> str:
-    name = getattr(cc, "_babata_engine_name", None)
+    name = cc.assistant_engine_name
     if isinstance(name, str) and name:
         return normalize_engine(name)
     return engine_name(SESSION_FILE)
@@ -3048,7 +3048,7 @@ def _scan_recent_session_model() -> str | None:
     model name (e.g. 'claude-opus-4-N') even before this bot instance has run
     a turn, so /status after a restart shows something specific."""
     try:
-        recent = cc._load_state().get("recent_sids") or []
+        recent = cc.recent_session_ids()
     except Exception:
         recent = []
     proj_dir = Path.home() / ".claude" / "projects" / str(Path.home()).replace("/", "-")
@@ -3823,7 +3823,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         five_hour_line = _fmt_codex_limit(limits, "primary", "5h limit", 300)
         week_line = _fmt_codex_limit(limits, "secondary", "weekly limit", 10_080)
         plan_type = (limits or {}).get("plan_type") if isinstance(limits, dict) else None
-        sids = cc._load_state().get("recent_sids") or []
+        sids = cc.recent_session_ids()
         sid_now = sid if sid else "(new)"
         labels = {0: "hidden", 1: "flash", 2: "keep"}
         lines = [
@@ -3967,7 +3967,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     today_str = f"${today_cost:.2f}" if today_cost is not None else "—"
     today_line = f"{today_str} today (ccusage) · {provider_label}"
 
-    sids = cc._load_state().get("recent_sids") or []
+    sids = cc.recent_session_ids()
     sid_now = sid if sid else "(new)"
 
     labels = {0: "hidden", 1: "flash", 2: "keep"}
