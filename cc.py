@@ -384,6 +384,55 @@ def _scan_peer_sids() -> dict[str, list[str]]:
     return out
 
 
+def _recent_session_files(*, scan_all_buckets: bool) -> list[Path]:
+    """Return candidate Claude session JSONL files newest-first.
+
+    The summary subprocess has its own cwd bucket; exclude it so internal
+    "summarize this session" calls do not pollute V-facing `/resume`.
+    """
+    try:
+        if scan_all_buckets:
+            projects_root = _CC_PROJECTS.parent
+            try:
+                sandbox_real = str(_SUMMARY_SANDBOX.resolve())
+            except Exception:
+                sandbox_real = str(_SUMMARY_SANDBOX)
+            sandbox_bucket_name = sandbox_real.replace("/", "-")
+            buckets = [
+                b for b in projects_root.iterdir()
+                if b.is_dir() and b.name != sandbox_bucket_name
+            ]
+            files = (fp for b in buckets for fp in b.glob("*.jsonl"))
+        else:
+            files = _CC_PROJECTS.glob("*.jsonl")
+        return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+    except Exception:
+        return []
+
+
+def _first_real_user_and_entrypoint(fp: Path) -> tuple[str | None, str | None]:
+    """Return the first V-authored user text and its Claude entrypoint."""
+    try:
+        for line in fp.read_text().splitlines():
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("type") != "user":
+                continue
+            msg = d.get("message")
+            if not isinstance(msg, dict):
+                continue
+            text = _extract_text(msg.get("content"))
+            if not text or _is_synthetic_user_text(text):
+                continue
+            entrypoint = d.get("entrypoint")
+            return text, entrypoint if isinstance(entrypoint, str) else None
+    except Exception:
+        return None, None
+    return None, None
+
+
 async def _always_allow(
     tool_name: str,
     tool_input: dict[str, Any],
@@ -829,68 +878,12 @@ class CC:
         peer_map = _scan_peer_sids()
         summary_cache = _load_summary_cache()
         own_channel = _channel_label_from_state_file(self._state_file)
-        try:
-            if scan_all_buckets:
-                # 跨 cwd bucket 扫 — V 在终端不同目录开的 claude session 落在
-                # 不同 bucket (~/.claude/projects/<cwd-hash>/), 单 bucket 扫只
-                # 看得见 babata 自己 cwd 那个. "终端"/"一次性" 渠道用全局视图,
-                # V 不用记自己当时在哪个目录敲的 claude.
-                # 排除 summary subprocess 的 sandbox bucket — 那里全是 babata
-                # 内部 "用一句话总结..." 的 sdk-cli 调用, 不是 V 真正的 oneshot.
-                # 用 realpath 防 _SUMMARY_SANDBOX 路径里有 symlink 时跟 CC CLI
-                # 用 realpath 算 bucket name 不一致 (Codex F-SANDBOX-EXCLUSION).
-                projects_root = _CC_PROJECTS.parent
-                try:
-                    sandbox_real = str(_SUMMARY_SANDBOX.resolve())
-                except Exception:
-                    sandbox_real = str(_SUMMARY_SANDBOX)
-                sandbox_bucket_name = sandbox_real.replace("/", "-")
-                buckets = [
-                    b for b in projects_root.iterdir()
-                    if b.is_dir() and b.name != sandbox_bucket_name
-                ]
-                files = sorted(
-                    (fp for b in buckets for fp in b.glob("*.jsonl")),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-            else:
-                files = sorted(
-                    _CC_PROJECTS.glob("*.jsonl"),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-        except Exception:
-            return []
+        files = _recent_session_files(scan_all_buckets=scan_all_buckets)
 
         out: list[dict] = []
         for fp in files:
             sid = fp.stem
-            first_user: str | None = None
-            entrypoint: str | None = None
-            try:
-                for line in fp.read_text().splitlines():
-                    try:
-                        d = json.loads(line)
-                    except Exception:
-                        continue
-                    if d.get("type") != "user":
-                        continue
-                    msg = d.get("message")
-                    if not isinstance(msg, dict):
-                        continue
-                    text = _extract_text(msg.get("content"))
-                    if not text or _is_synthetic_user_text(text):
-                        continue
-                    first_user = text
-                    # entrypoint 在同一条 user record 上 (cli / sdk-py / sdk-cli /
-                    # claude-desktop). 用来区分 "终端交互" vs "一次性 -p".
-                    ep = d.get("entrypoint")
-                    if isinstance(ep, str):
-                        entrypoint = ep
-                    break
-            except Exception:
-                continue
+            first_user, entrypoint = _first_real_user_and_entrypoint(fp)
             if not first_user:
                 continue
             try:

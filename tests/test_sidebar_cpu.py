@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import cc as cc_module
@@ -21,6 +22,54 @@ def test_cc_exposes_public_session_helpers(tmp_path):
     assert state["session_id"] == "sid-existing"
     assert state["recent_sids"] == ["sid-existing"]
     assert "last_activity_at" in state
+
+
+def test_recent_session_files_scans_buckets_and_excludes_summary_sandbox(monkeypatch, tmp_path):
+    projects_root = tmp_path / "projects"
+    own_bucket = projects_root / "own-cwd"
+    other_bucket = projects_root / "other-cwd"
+    summary_cwd = tmp_path / "summary-sandbox"
+    summary_bucket = projects_root / str(summary_cwd.resolve()).replace("/", "-")
+    for bucket in (own_bucket, other_bucket, summary_bucket):
+        bucket.mkdir(parents=True)
+
+    own_file = own_bucket / "own.jsonl"
+    other_file = other_bucket / "other.jsonl"
+    summary_file = summary_bucket / "summary.jsonl"
+    for fp, mtime in ((own_file, 10), (other_file, 30), (summary_file, 20)):
+        fp.write_text("{}\n")
+        os.utime(fp, (mtime, mtime))
+
+    monkeypatch.setattr(cc_module, "_CC_PROJECTS", own_bucket)
+    monkeypatch.setattr(cc_module, "_SUMMARY_SANDBOX", summary_cwd)
+
+    assert cc_module._recent_session_files(scan_all_buckets=False) == [own_file]
+    assert cc_module._recent_session_files(scan_all_buckets=True) == [other_file, own_file]
+
+
+def test_first_real_user_and_entrypoint_skips_synthetic_user_records(tmp_path):
+    session_file = tmp_path / "sid.jsonl"
+    session_file.write_text(
+        "\n".join([
+            json.dumps({
+                "type": "user",
+                "entrypoint": "cli",
+                "message": {"content": "<command-name>/status</command-name>"},
+            }),
+            json.dumps({
+                "type": "assistant",
+                "message": {"content": "ignored"},
+            }),
+            json.dumps({
+                "type": "user",
+                "entrypoint": "sdk-cli",
+                "message": {"content": [{"type": "text", "text": "真实问题"}]},
+            }),
+        ])
+        + "\n"
+    )
+
+    assert cc_module._first_real_user_and_entrypoint(session_file) == ("真实问题", "sdk-cli")
 
 
 def test_sidebar_cpu_status_reads_public_session_property(monkeypatch):
