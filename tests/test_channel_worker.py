@@ -580,6 +580,20 @@ def test_claude_status_renders_provider_usage_snapshot(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
+def test_claude_status_context_ignores_stale_last_tokens(monkeypatch, tmp_path):
+    reset_bot_globals(monkeypatch, tmp_path)
+    monkeypatch.setattr(bot, "_last_model", "claude-opus-4-7[1m]")
+    monkeypatch.setattr(bot, "_last_context_window", 1_000)
+    monkeypatch.setattr(bot, "_last_used_tokens", 900)
+    monkeypatch.setattr(bot, "_last_session_id", "old-sid")
+    monkeypatch.setattr(bot, "_last_prompt_tokens", lambda _sid: 0)
+
+    snap = bot._claude_status_context_snapshot("new-sid")
+
+    assert snap["pct_ctx"] == 0.0
+    assert snap["bar"] == "░░░░░░░░░░░░░░░"
+
+
 def test_codex_rate_limits_normalizes_app_server_shape():
     result = {
         "rateLimits": {

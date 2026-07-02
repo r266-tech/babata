@@ -4038,23 +4038,7 @@ def _openrouter_usage_lines(
     return None, None, " · ".join(parts) if len(parts) > 1 else None
 
 
-async def _cmd_status_claude(update: Update) -> None:
-    # Config-level model (what settings.json asks for — may be alias like "opus[1m]").
-    # Differs from actual model name SDK reports (resolved full version).
-    cfg_model = "—"
-    try:
-        cfg = json.loads((Path.home() / ".claude/settings.json").read_text())
-        cfg_model = cfg.get("model", "—")
-    except Exception:
-        pass
-
-    # Actual model resolution order:
-    #   1. _last_model — set by this bot instance from ResultMessage.model_usage
-    #      (full alias-suffixed form like 'claude-opus-4-N[1m]').
-    #   2. Scan recent session JSONL (survives bot restart with no turns yet) —
-    #      gives bare 'claude-opus-4-N'; re-attach cfg's [..] suffix so the
-    #      displayed string stays consistent with what model_usage would show.
-    #   3. Fall back to cfg alias — at least shows something concrete.
+def _claude_actual_model(cfg_model: str) -> str:
     actual = _last_model
     if not actual:
         scanned = _scan_recent_session_model()
@@ -4063,7 +4047,18 @@ async def _cmd_status_claude(update: Update) -> None:
             actual = f"{scanned}{suffix_match.group(0)}" if suffix_match else scanned
     if not actual:
         actual = cfg_model
+    return actual
 
+
+def _claude_status_context_snapshot(sid: str | None) -> dict[str, Any]:
+    # Config-level model (what settings.json asks for — may be alias like "opus[1m]").
+    # Differs from actual model name SDK reports (resolved full version).
+    try:
+        cfg = json.loads((Path.home() / ".claude/settings.json").read_text())
+        cfg_model = cfg.get("model", "—")
+    except Exception:
+        cfg_model = "—"
+    actual = _claude_actual_model(cfg_model)
     win = _last_context_window or _infer_window_from_alias(cfg_model)
     # Fallback to _last_used_tokens only when it belongs to the current session.
     # Otherwise idle-reset (4am daily restart spawns a fresh sid) leaks the
@@ -4076,7 +4071,24 @@ async def _cmd_status_claude(update: Update) -> None:
     bar = _progress_bar(pct_ctx)
     model_short = _short_model(actual)
     window_short = _short_window(win)
+    return {
+        "actual": actual,
+        "bar": bar,
+        "model_short": model_short,
+        "pct_ctx": pct_ctx,
+        "window_short": window_short,
+    }
 
+
+def _anthropic_quota_line(rl: dict[str, Any], window_key: str, label: str) -> str:
+    entry = rl.get(window_key) or {}
+    util = entry.get("utilization")
+    if util is None:
+        return f"{label} —"
+    return f"{label} {util * 100:.0f}% · resets {_fmt_reset(entry.get('resets_at'))}"
+
+
+async def _claude_provider_usage_snapshot() -> dict[str, str | None]:
     # Quota policy: show whatever the current /provider points at, plus a
     # secondary OpenRouter line if current isn't already OR. Tokens for other
     # OAuth accounts in providers.json may lack `user:profile` scope (403), so
@@ -4093,24 +4105,12 @@ async def _cmd_status_claude(update: Update) -> None:
     current_oauth_token = current_env.get("CLAUDE_CODE_OAUTH_TOKEN")
     is_or_current = "openrouter" in (current_env.get("ANTHROPIC_BASE_URL", "") or "").lower()
 
-    # Active provider's primary quota — POST a 1-token Claude request live and
-    # read the rate-limit response headers. Real-time, no cache, ~10 tokens
-    # of the cheapest model per /status. The request uses the *current*
-    # provider token, so quota always matches the active provider.
     session_line = week_line = None
     if current_oauth_token and not is_or_current:
         quota = await _fetch_anthropic_quota(current_oauth_token)
         rl = quota or {}
-
-        def _format(window_key: str, label: str) -> str:
-            entry = rl.get(window_key) or {}
-            util = entry.get("utilization")
-            if util is None:
-                return f"{label} —"
-            return f"{label} {util * 100:.0f}% · resets {_fmt_reset(entry.get('resets_at'))}"
-
-        session_line = _format("five_hour", "session")
-        week_line = _format("seven_day", "week")
+        session_line = _anthropic_quota_line(rl, "five_hour", "session")
+        week_line = _anthropic_quota_line(rl, "seven_day", "week")
 
     # OpenRouter — full 2-line layout when OR is current, compact 1-line
     # secondary otherwise. OR data is always fetched (cached, non-blocking).
@@ -4125,7 +4125,20 @@ async def _cmd_status_claude(update: Update) -> None:
 
     today_cost = await _fetch_ccusage_today()
     today_str = f"${today_cost:.2f}" if today_cost is not None else "—"
-    today_line = f"{today_str} today (ccusage) · {provider_label}"
+    return {
+        "or_balance_line": or_balance_line,
+        "or_compact_line": or_compact_line,
+        "or_today_line": or_today_line,
+        "session_line": session_line,
+        "today_line": f"{today_str} today (ccusage) · {provider_label}",
+        "week_line": week_line,
+    }
+
+
+async def _cmd_status_claude(update: Update) -> None:
+    sid = cc.session_id
+    context = _claude_status_context_snapshot(sid)
+    usage = await _claude_provider_usage_snapshot()
 
     sids = cc.recent_session_ids()
     sid_now = sid if sid else "(new)"
@@ -4134,21 +4147,21 @@ async def _cmd_status_claude(update: Update) -> None:
     # noisy stipple inside code blocks). Quota broken into separate lines so
     # mobile doesn't wrap awkwardly. Session UUID on its own line, same reason.
     lines = _claude_status_lines(
-        bar=bar,
-        pct_ctx=pct_ctx,
-        model_short=model_short,
-        window_short=window_short,
+        bar=context["bar"],
+        pct_ctx=context["pct_ctx"],
+        model_short=context["model_short"],
+        window_short=context["window_short"],
         review_line=_fmt_review_health_line(),
-        session_line=session_line,
-        week_line=week_line,
-        or_today_line=or_today_line,
-        or_balance_line=or_balance_line,
-        or_compact_line=or_compact_line,
-        today_line=today_line,
+        session_line=usage["session_line"],
+        week_line=usage["week_line"],
+        or_today_line=usage["or_today_line"],
+        or_balance_line=usage["or_balance_line"],
+        or_compact_line=usage["or_compact_line"],
+        today_line=usage["today_line"],
         cc_version=_cc_version(),
         sdk_version=_sdk_version(),
         verbose=_verbose,
-        actual=actual,
+        actual=context["actual"],
         sid_now=sid_now,
         recent_count=len(sids),
     )
