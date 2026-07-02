@@ -293,6 +293,69 @@ def test_codex_engine_uses_explicit_memory_source(monkeypatch, tmp_path):
     assert seen_sources == ["sidebar"]
 
 
+def test_codex_build_command_preserves_new_and_resume_cli_flags(monkeypatch, tmp_path):
+    monkeypatch.setenv("BABATA_CODEX_CLI_PATH", "codex-bin")
+    monkeypatch.setenv("BABATA_CODEX_MODEL", "codex-test")
+    monkeypatch.setenv("BABATA_CODEX_IGNORE_USER_CONFIG", "1")
+    monkeypatch.setenv("BABATA_CODEX_SEARCH", "1")
+    monkeypatch.setenv("BABATA_CODEX_SANDBOX", "read-only")
+    monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "0")
+    monkeypatch.setattr(
+        codex_engine,
+        "log_memory_reflex_preflight_only",
+        lambda **_kwargs: "event-1",
+    )
+    session = codex_engine.CodexEngine(
+        state_file=tmp_path / "session.json",
+        source_prompt="Source: test.",
+        memory_source="sidebar",
+    )
+    image = tmp_path / "image.png"
+    last_file = tmp_path / "last.txt"
+    common = [
+        "codex-bin",
+        "-c", "notify=[]",
+        "-c", 'approval_policy="never"',
+        "-m", "codex-test",
+        "--search",
+    ]
+
+    cmd, prompt_stdin, memory_injected = session._build_command("hello", [image], last_file)
+
+    assert prompt_stdin == "Source: test.\n\nhello"
+    assert memory_injected is False
+    assert cmd == [
+        *common,
+        "exec",
+        "--ignore-user-config",
+        "--json",
+        "--skip-git-repo-check",
+        "--sandbox", "read-only",
+        "-C", str(Path(codex_engine.__file__).parent),
+        "-o", str(last_file),
+        "-i", str(image),
+        "-",
+    ]
+
+    session._session_id = "sid-123"
+    resume_cmd, resume_prompt, resume_injected = session._build_command("again", [image], last_file)
+
+    assert resume_prompt == "Source: test.\n\nagain"
+    assert resume_injected is False
+    assert resume_cmd == [
+        *common,
+        "exec",
+        "resume",
+        "--ignore-user-config",
+        "--json",
+        "--skip-git-repo-check",
+        "-o", str(last_file),
+        "-i", str(image),
+        "sid-123",
+        "-",
+    ]
+
+
 def test_codex_engine_streams_tool_results(monkeypatch, tmp_path):
     lines = [
         _json_line({"type": "thread.started", "thread_id": "sid-tools"}),

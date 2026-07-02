@@ -561,10 +561,60 @@ class CodexEngine(CC):
         image_paths: list[Path],
         last_file: Path,
     ) -> tuple[list[str], str, bool]:
+        full_prompt, memory_injected = self._build_prompt_stdin(prompt)
+        base = [
+            _codex_cli_path(),
+            "-c", "notify=[]",
+            "-c", 'approval_policy="never"',
+            *_codex_mcp_overrides(self._mcp_servers),
+        ]
+        model = os.environ.get("BABATA_CODEX_MODEL")
+        if model:
+            base.extend(["-m", model])
+        if os.environ.get("BABATA_CODEX_SEARCH") == "1":
+            base.append("--search")
+        if os.environ.get("BABATA_CODEX_IGNORE_USER_CONFIG") == "1":
+            exec_flags = ["--ignore-user-config"]
+        else:
+            exec_flags = []
+        image_args: list[str] = []
+        for fp in image_paths:
+            image_args.extend(["-i", str(fp)])
+        sid = self._session_id
+        if sid:
+            return [
+                *base,
+                "exec",
+                "resume",
+                *exec_flags,
+                "--json",
+                "--skip-git-repo-check",
+                "-o", str(last_file),
+                *image_args,
+                sid,
+                "-",
+            ], full_prompt, memory_injected
+        return (
+            [
+                *base,
+                "exec",
+                *exec_flags,
+                "--json",
+                "--skip-git-repo-check",
+                "--sandbox", _codex_sandbox(),
+                "-C", _codex_cwd(self._memory_source),
+                "-o", str(last_file),
+                *image_args,
+                "-",
+            ],
+            full_prompt,
+            memory_injected,
+        )
+
+    def _build_prompt_stdin(self, prompt: str) -> tuple[str, bool]:
         memory_context = ""
         source = self._memory_source
-        should_inject_memory = self._should_inject_codex_memory()
-        if should_inject_memory:
+        if self._should_inject_codex_memory():
             memory_context, event_id = _render_babata_memory_context_event(
                 source,
                 prompt,
@@ -579,52 +629,7 @@ class CodexEngine(CC):
                 cwd=_codex_cwd(source_name),
             )
         full_prompt = self._build_full_prompt(prompt, memory_context)
-        memory_injected = bool(memory_context)
-        base = [
-            _codex_cli_path(),
-            "-c", "notify=[]",
-            "-c", 'approval_policy="never"',
-            *_codex_mcp_overrides(self._mcp_servers),
-        ]
-        model = os.environ.get("BABATA_CODEX_MODEL")
-        if model:
-            base.extend(["-m", model])
-        if os.environ.get("BABATA_CODEX_IGNORE_USER_CONFIG") == "1":
-            exec_flags = ["--ignore-user-config"]
-        else:
-            exec_flags = []
-        if os.environ.get("BABATA_CODEX_SEARCH") == "1":
-            base.append("--search")
-
-        image_args: list[str] = []
-        for fp in image_paths:
-            image_args.extend(["-i", str(fp)])
-
-        if self._session_id:
-            return [
-                *base,
-                "exec",
-                "resume",
-                *exec_flags,
-                "--json",
-                "--skip-git-repo-check",
-                "-o", str(last_file),
-                *image_args,
-                self._session_id,
-                "-",
-            ], full_prompt, memory_injected
-        return [
-            *base,
-            "exec",
-            *exec_flags,
-            "--json",
-            "--skip-git-repo-check",
-            "--sandbox", _codex_sandbox(),
-            "-C", _codex_cwd(source),
-            "-o", str(last_file),
-            *image_args,
-            "-",
-        ], full_prompt, memory_injected
+        return full_prompt, bool(memory_context)
 
     def _build_full_prompt(self, prompt: str, memory_context: str) -> str:
         parts = []
