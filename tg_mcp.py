@@ -72,159 +72,150 @@ def _voice_description() -> str:
     return f"{base} Current backend is edge-tts (plain text, no markup)."
 
 
+def _object_schema(properties: dict, required: list[str] | None = None) -> dict:
+    schema = {"type": "object", "properties": properties}
+    if required:
+        schema["required"] = required
+    return schema
+
+
+def _tool(name: str, description: str, properties: dict, required: list[str] | None = None) -> Tool:
+    return Tool(
+        name=name,
+        description=description,
+        inputSchema=_object_schema(properties, required),
+    )
+
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
-        Tool(
-            name="tg_send_buttons",
-            description=(
+        _tool(
+            "tg_send_buttons",
+            (
                 "Present interactive buttons. Each option is either a label string "
                 "(callback) or {label, url} (opens link). Returns the callback label "
                 "clicked, or 'Links sent' if all are URL buttons."
             ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "Message above buttons"},
-                    "options": {
-                        "type": "array",
-                        "items": {
-                            "oneOf": [
-                                {"type": "string"},
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "label": {"type": "string"},
-                                        "url": {"type": "string"},
-                                    },
-                                    "required": ["label"],
+            {
+                "text": {"type": "string", "description": "Message above buttons"},
+                "options": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "label": {"type": "string"},
+                                    "url": {"type": "string"},
                                 },
-                            ]
-                        },
-                        "minItems": 1,
-                        "maxItems": 8,
+                                "required": ["label"],
+                            },
+                        ]
                     },
-                    "instance": INSTANCE_SCHEMA,
+                    "minItems": 1,
+                    "maxItems": 8,
                 },
-                "required": ["text", "options"],
+                "instance": INSTANCE_SCHEMA,
             },
+            ["text", "options"],
         ),
-        Tool(
-            name="tg_send_text",
-            description=(
+        _tool(
+            "tg_send_text",
+            (
                 "Send plain text to the user's Telegram. "
                 "Final-turn TG replies are auto-delivered; use this additive tool only for "
                 "mid-turn pushes, long-running progress, or proactive sends."
             ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string"},
-                    "instance": INSTANCE_SCHEMA,
-                },
-                "required": ["text"],
+            {
+                "text": {"type": "string"},
+                "instance": INSTANCE_SCHEMA,
             },
+            ["text"],
         ),
-        Tool(
-            name="tg_send_file",
-            description="Send a local file to the user as a TG document.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute or ~-relative file path"},
-                    "caption": {"type": "string"},
-                    "instance": INSTANCE_SCHEMA,
-                },
-                "required": ["path"],
+        _tool(
+            "tg_send_file",
+            "Send a local file to the user as a TG document.",
+            {
+                "path": {"type": "string", "description": "Absolute or ~-relative file path"},
+                "caption": {"type": "string"},
+                "instance": INSTANCE_SCHEMA,
             },
+            ["path"],
         ),
-        Tool(
-            name="tg_send_album",
-            description="Send 2-10 local images as a TG media album.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 2,
-                        "maxItems": 10,
-                    },
-                    "caption": {"type": "string"},
-                    "instance": INSTANCE_SCHEMA,
+        _tool(
+            "tg_send_album",
+            "Send 2-10 local images as a TG media album.",
+            {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 2,
+                    "maxItems": 10,
                 },
-                "required": ["paths"],
+                "caption": {"type": "string"},
+                "instance": INSTANCE_SCHEMA,
             },
+            ["paths"],
         ),
-        Tool(
-            name="tg_send_location",
-            description="Send a pinpoint location to the user. Attaches an Amap open-link button.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "latitude": {"type": "number"},
-                    "longitude": {"type": "number"},
-                    "name": {"type": "string", "description": "Optional place name for the map label"},
-                    "instance": INSTANCE_SCHEMA,
+        _tool(
+            "tg_send_location",
+            "Send a pinpoint location to the user. Attaches an Amap open-link button.",
+            {
+                "latitude": {"type": "number"},
+                "longitude": {"type": "number"},
+                "name": {"type": "string", "description": "Optional place name for the map label"},
+                "instance": INSTANCE_SCHEMA,
+            },
+            ["latitude", "longitude"],
+        ),
+        _tool(
+            "tg_send_voice",
+            _voice_description(),
+            {
+                "text": {"type": "string", "description": "Text to speak (with optional markup)"},
+                "voice": {
+                    "type": "string",
+                    "description": "Optional voice identifier (backend-specific, e.g. nova/mimo_default/zh-CN-XiaoxiaoNeural)",
                 },
-                "required": ["latitude", "longitude"],
+                "instance": INSTANCE_SCHEMA,
             },
+            ["text"],
         ),
-        Tool(
-            name="tg_send_voice",
-            description=_voice_description(),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "Text to speak (with optional markup)"},
-                    "voice": {
-                        "type": "string",
-                        "description": "Optional voice identifier (backend-specific, e.g. nova/mimo_default/zh-CN-XiaoxiaoNeural)",
-                    },
-                    "instance": INSTANCE_SCHEMA,
-                },
-                "required": ["text"],
+        _tool(
+            "tg_send_video",
+            "Send a local video file (mp4/mov) to the user as a TG video message.",
+            {
+                "path": {"type": "string"},
+                "caption": {"type": "string"},
+                "instance": INSTANCE_SCHEMA,
             },
+            ["path"],
         ),
-        Tool(
-            name="tg_send_video",
-            description="Send a local video file (mp4/mov) to the user as a TG video message.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "caption": {"type": "string"},
-                    "instance": INSTANCE_SCHEMA,
-                },
-                "required": ["path"],
-            },
-        ),
-        Tool(
-            name="tg_send_page",
-            description=(
+        _tool(
+            "tg_send_page",
+            (
                 "Publish a Telegraph page from markdown and send its URL to TG. "
                 "Use for long structured replies, code-heavy content, or output that TG inline HTML "
                 "cannot render cleanly. content_md accepts standard markdown; returns the Telegraph URL."
             ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "Page title",
-                    },
-                    "content_md": {
-                        "type": "string",
-                        "description": "Markdown body. Do NOT repeat the title inside; the page already shows it.",
-                    },
-                    "caption": {
-                        "type": "string",
-                        "description": "Optional short text placed above the URL in the TG message (e.g. a one-line summary)",
-                    },
-                    "instance": INSTANCE_SCHEMA,
+            {
+                "title": {
+                    "type": "string",
+                    "description": "Page title",
                 },
-                "required": ["title", "content_md"],
+                "content_md": {
+                    "type": "string",
+                    "description": "Markdown body. Do NOT repeat the title inside; the page already shows it.",
+                },
+                "caption": {
+                    "type": "string",
+                    "description": "Optional short text placed above the URL in the TG message (e.g. a one-line summary)",
+                },
+                "instance": INSTANCE_SCHEMA,
             },
+            ["title", "content_md"],
         ),
     ]
 

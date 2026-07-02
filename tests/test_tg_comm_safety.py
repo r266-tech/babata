@@ -107,6 +107,36 @@ def test_tg_instance_schema_stays_compact_without_losing_route_values():
         assert label not in tg_mcp.INSTANCE_SCHEMA["description"]
 
 
+def test_tg_mcp_schema_helper_keeps_tool_contracts():
+    tools = {tool.name: tool for tool in asyncio.run(tg_mcp.list_tools())}
+
+    assert list(tools) == [
+        "tg_send_buttons",
+        "tg_send_text",
+        "tg_send_file",
+        "tg_send_album",
+        "tg_send_location",
+        "tg_send_voice",
+        "tg_send_video",
+        "tg_send_page",
+    ]
+    required = {
+        "tg_send_buttons": ["text", "options"],
+        "tg_send_text": ["text"],
+        "tg_send_file": ["path"],
+        "tg_send_album": ["paths"],
+        "tg_send_location": ["latitude", "longitude"],
+        "tg_send_voice": ["text"],
+        "tg_send_video": ["path"],
+        "tg_send_page": ["title", "content_md"],
+    }
+    for name, tool in tools.items():
+        schema = tool.inputSchema
+        assert schema["type"] == "object"
+        assert schema["required"] == required[name]
+        assert schema["properties"]["instance"] is tg_mcp.INSTANCE_SCHEMA
+
+
 def test_short_bubble_uses_html_parse_mode():
     parts, parse_mode = bot._format_bubble_parts("**ok**")
 
