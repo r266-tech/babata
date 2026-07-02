@@ -23,6 +23,7 @@ import secrets
 import signal
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -277,6 +278,45 @@ def chunk_text(text: str, limit: int = _MAX_WX) -> list[str]:
     if text:
         out.append(text)
     return out
+
+
+@dataclass(frozen=True)
+class WxBubbleSendResult:
+    sent_any: bool
+    ok: bool
+
+
+async def _send_wx_bubble(
+    client: WeixinClient,
+    from_user: str,
+    ctx_token: str | None,
+    text: str,
+) -> WxBubbleSendResult:
+    """Send one logical WeChat bubble, with markdown stripping, chunking, and one retry."""
+    text = strip_markdown(text)
+    if not text:
+        return WxBubbleSendResult(sent_any=False, ok=True)
+    sent_any = False
+    ok = True
+    for chunk in chunk_text(text):
+        success = False
+        for attempt in range(2):
+            try:
+                await client.send_message(
+                    from_user, [text_item(chunk)], context_token=ctx_token,
+                )
+                sent_any = True
+                success = True
+                break
+            except Exception:
+                if attempt == 0:
+                    log.warning("wx send failed (retry once)", exc_info=True)
+                    await asyncio.sleep(0.5)
+                else:
+                    log.error("wx send failed (gave up)", exc_info=True)
+        if not success:
+            ok = False
+    return WxBubbleSendResult(sent_any=sent_any, ok=ok)
 
 
 # ── stream coalescer thresholds ───────────────────────────────────────
@@ -749,30 +789,10 @@ async def _process_combined_msgs(
         Retries once on transient failure; permanent failure flips
         had_send_failure so turn-end can rebroadcast resp.content."""
         nonlocal sent_any, had_send_failure
-        text = strip_markdown(text)
-        if not text:
-            return True
-        ok = True
-        for chunk in chunk_text(text):
-            success = False
-            for attempt in range(2):
-                try:
-                    await client.send_message(
-                        from_user, [text_item(chunk)], context_token=ctx_token,
-                    )
-                    sent_any = True
-                    success = True
-                    break
-                except Exception:
-                    if attempt == 0:
-                        log.warning("wx send failed (retry once)", exc_info=True)
-                        await asyncio.sleep(0.5)
-                    else:
-                        log.error("wx send failed (gave up)", exc_info=True)
-            if not success:
-                had_send_failure = True
-                ok = False
-        return ok
+        result = await _send_wx_bubble(client, from_user, ctx_token, text)
+        sent_any = sent_any or result.sent_any
+        had_send_failure = had_send_failure or not result.ok
+        return result.ok
 
     async def _drain(allow_hard_cut: bool) -> None:
         """Drain buf. Always ships any complete \\n\\n\\n-bounded bubbles.

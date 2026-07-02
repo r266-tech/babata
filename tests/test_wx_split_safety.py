@@ -271,6 +271,56 @@ def test_chunk_text_long_splits_at_newline():
     assert all(len(c) <= 2000 for c in chunks)
 
 
+def test_send_wx_bubble_retries_once_then_succeeds(monkeypatch):
+    class FakeClient:
+        def __init__(self):
+            self.calls: list[tuple[str, str | None, str]] = []
+
+        async def send_message(self, to_user, items, context_token=None):
+            text = (items[0].get("text_item") or {}).get("text", "")
+            self.calls.append((to_user, context_token, text))
+            if len(self.calls) == 1:
+                raise RuntimeError("transient")
+
+    async def no_sleep(_delay):
+        return None
+
+    async def run():
+        client = FakeClient()
+        monkeypatch.setattr(wb.asyncio, "sleep", no_sleep)
+
+        result = await wb._send_wx_bubble(client, "u1", "ctx", "hello")
+
+        assert result == wb.WxBubbleSendResult(sent_any=True, ok=True)
+        assert client.calls == [("u1", "ctx", "hello"), ("u1", "ctx", "hello")]
+
+    asyncio.run(run())
+
+
+def test_send_wx_bubble_reports_permanent_failure(monkeypatch):
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def send_message(self, *_args, **_kwargs):
+            self.calls += 1
+            raise RuntimeError("permanent")
+
+    async def no_sleep(_delay):
+        return None
+
+    async def run():
+        client = FakeClient()
+        monkeypatch.setattr(wb.asyncio, "sleep", no_sleep)
+
+        result = await wb._send_wx_bubble(client, "u1", "ctx", "hello")
+
+        assert result == wb.WxBubbleSendResult(sent_any=False, ok=False)
+        assert client.calls == 2
+
+    asyncio.run(run())
+
+
 # ── strip_markdown: fenced code body must survive ───────────────────
 
 
