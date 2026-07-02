@@ -336,7 +336,7 @@ def test_find_safe_split_avoid_unclosed_link():
 
 
 def test_md_balanced_unclosable_buf_returns_false_throughout():
-    """A buf that opens with `\`` and never closes it has NO balanced prefix
+    r"""A buf that opens with `\`` and never closes it has NO balanced prefix
     at any cut > 0; only cut=0 (empty) is balanced."""
     text = "`unclosed code that goes on and on and on with no closer"
     # No prefix length except 0 should be balanced
