@@ -551,7 +551,7 @@ _clean_read_lock = asyncio.Lock()
 
 
 def _engine_name_for(obj: Any, state_file: Path) -> str:
-    name = obj.assistant_engine_name
+    name = getattr(obj, "assistant_engine_name", None)
     if isinstance(name, str) and name.strip():
         return normalize_engine(name)
     return engine_name(state_file)

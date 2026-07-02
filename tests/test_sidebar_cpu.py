@@ -174,6 +174,16 @@ def test_sidebar_cpu_switch_does_not_reach_into_engine_private_session_state():
     assert "._record_sid(" not in source
 
 
+def test_sidebar_engine_name_falls_back_without_engine_accessor(tmp_path):
+    class NamelessEngine:
+        pass
+
+    state_file = tmp_path / "sidebar.json"
+    state_file.write_text('{"assistant_engine": "codex"}')
+
+    assert sidebar_bot._engine_name_for(NamelessEngine(), state_file) == "codex"
+
+
 def test_sidebar_proactive_prompt_stays_thin_and_boundary_focused():
     prompt = sidebar_bot._PROACTIVE_PROMPT
 
