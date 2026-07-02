@@ -106,13 +106,6 @@ def _public_provider(provider: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _fallback_key_available() -> bool:
-    try:
-        return bool(_openrouter_api_key())
-    except TranslateConfigError:
-        return False
-
-
 def get_translation_provider_settings() -> dict[str, Any]:
     return _public_provider(_translation_provider_from_config())
 
