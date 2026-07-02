@@ -87,136 +87,142 @@ def _tool(name: str, description: str, properties: dict, required: list[str] | N
     )
 
 
+_TG_TOOL_SPECS = (
+    (
+        "tg_send_buttons",
+        (
+            "Present interactive buttons. Each option is either a label string "
+            "(callback) or {label, url} (opens link). Returns the callback label "
+            "clicked, or 'Links sent' if all are URL buttons."
+        ),
+        {
+            "text": {"type": "string", "description": "Message above buttons"},
+            "options": {
+                "type": "array",
+                "items": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "url": {"type": "string"},
+                            },
+                            "required": ["label"],
+                        },
+                    ]
+                },
+                "minItems": 1,
+                "maxItems": 8,
+            },
+            "instance": INSTANCE_SCHEMA,
+        },
+        ["text", "options"],
+    ),
+    (
+        "tg_send_text",
+        (
+            "Send plain text to the user's Telegram. "
+            "Final-turn TG replies are auto-delivered; use this additive tool only for "
+            "mid-turn pushes, long-running progress, or proactive sends."
+        ),
+        {
+            "text": {"type": "string"},
+            "instance": INSTANCE_SCHEMA,
+        },
+        ["text"],
+    ),
+    (
+        "tg_send_file",
+        "Send a local file to the user as a TG document.",
+        {
+            "path": {"type": "string", "description": "Absolute or ~-relative file path"},
+            "caption": {"type": "string"},
+            "instance": INSTANCE_SCHEMA,
+        },
+        ["path"],
+    ),
+    (
+        "tg_send_album",
+        "Send 2-10 local images as a TG media album.",
+        {
+            "paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 2,
+                "maxItems": 10,
+            },
+            "caption": {"type": "string"},
+            "instance": INSTANCE_SCHEMA,
+        },
+        ["paths"],
+    ),
+    (
+        "tg_send_location",
+        "Send a pinpoint location to the user. Attaches an Amap open-link button.",
+        {
+            "latitude": {"type": "number"},
+            "longitude": {"type": "number"},
+            "name": {"type": "string", "description": "Optional place name for the map label"},
+            "instance": INSTANCE_SCHEMA,
+        },
+        ["latitude", "longitude"],
+    ),
+    (
+        "tg_send_voice",
+        _voice_description,
+        {
+            "text": {"type": "string", "description": "Text to speak (with optional markup)"},
+            "voice": {
+                "type": "string",
+                "description": "Optional voice identifier (backend-specific, e.g. nova/mimo_default/zh-CN-XiaoxiaoNeural)",
+            },
+            "instance": INSTANCE_SCHEMA,
+        },
+        ["text"],
+    ),
+    (
+        "tg_send_video",
+        "Send a local video file (mp4/mov) to the user as a TG video message.",
+        {
+            "path": {"type": "string"},
+            "caption": {"type": "string"},
+            "instance": INSTANCE_SCHEMA,
+        },
+        ["path"],
+    ),
+    (
+        "tg_send_page",
+        (
+            "Publish a Telegraph page from markdown and send its URL to TG. "
+            "Use for long structured replies, code-heavy content, or output that TG inline HTML "
+            "cannot render cleanly. content_md accepts standard markdown; returns the Telegraph URL."
+        ),
+        {
+            "title": {
+                "type": "string",
+                "description": "Page title",
+            },
+            "content_md": {
+                "type": "string",
+                "description": "Markdown body. Do NOT repeat the title inside; the page already shows it.",
+            },
+            "caption": {
+                "type": "string",
+                "description": "Optional short text placed above the URL in the TG message (e.g. a one-line summary)",
+            },
+            "instance": INSTANCE_SCHEMA,
+        },
+        ["title", "content_md"],
+    ),
+)
+
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
-        _tool(
-            "tg_send_buttons",
-            (
-                "Present interactive buttons. Each option is either a label string "
-                "(callback) or {label, url} (opens link). Returns the callback label "
-                "clicked, or 'Links sent' if all are URL buttons."
-            ),
-            {
-                "text": {"type": "string", "description": "Message above buttons"},
-                "options": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {"type": "string"},
-                            {
-                                "type": "object",
-                                "properties": {
-                                    "label": {"type": "string"},
-                                    "url": {"type": "string"},
-                                },
-                                "required": ["label"],
-                            },
-                        ]
-                    },
-                    "minItems": 1,
-                    "maxItems": 8,
-                },
-                "instance": INSTANCE_SCHEMA,
-            },
-            ["text", "options"],
-        ),
-        _tool(
-            "tg_send_text",
-            (
-                "Send plain text to the user's Telegram. "
-                "Final-turn TG replies are auto-delivered; use this additive tool only for "
-                "mid-turn pushes, long-running progress, or proactive sends."
-            ),
-            {
-                "text": {"type": "string"},
-                "instance": INSTANCE_SCHEMA,
-            },
-            ["text"],
-        ),
-        _tool(
-            "tg_send_file",
-            "Send a local file to the user as a TG document.",
-            {
-                "path": {"type": "string", "description": "Absolute or ~-relative file path"},
-                "caption": {"type": "string"},
-                "instance": INSTANCE_SCHEMA,
-            },
-            ["path"],
-        ),
-        _tool(
-            "tg_send_album",
-            "Send 2-10 local images as a TG media album.",
-            {
-                "paths": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "minItems": 2,
-                    "maxItems": 10,
-                },
-                "caption": {"type": "string"},
-                "instance": INSTANCE_SCHEMA,
-            },
-            ["paths"],
-        ),
-        _tool(
-            "tg_send_location",
-            "Send a pinpoint location to the user. Attaches an Amap open-link button.",
-            {
-                "latitude": {"type": "number"},
-                "longitude": {"type": "number"},
-                "name": {"type": "string", "description": "Optional place name for the map label"},
-                "instance": INSTANCE_SCHEMA,
-            },
-            ["latitude", "longitude"],
-        ),
-        _tool(
-            "tg_send_voice",
-            _voice_description(),
-            {
-                "text": {"type": "string", "description": "Text to speak (with optional markup)"},
-                "voice": {
-                    "type": "string",
-                    "description": "Optional voice identifier (backend-specific, e.g. nova/mimo_default/zh-CN-XiaoxiaoNeural)",
-                },
-                "instance": INSTANCE_SCHEMA,
-            },
-            ["text"],
-        ),
-        _tool(
-            "tg_send_video",
-            "Send a local video file (mp4/mov) to the user as a TG video message.",
-            {
-                "path": {"type": "string"},
-                "caption": {"type": "string"},
-                "instance": INSTANCE_SCHEMA,
-            },
-            ["path"],
-        ),
-        _tool(
-            "tg_send_page",
-            (
-                "Publish a Telegraph page from markdown and send its URL to TG. "
-                "Use for long structured replies, code-heavy content, or output that TG inline HTML "
-                "cannot render cleanly. content_md accepts standard markdown; returns the Telegraph URL."
-            ),
-            {
-                "title": {
-                    "type": "string",
-                    "description": "Page title",
-                },
-                "content_md": {
-                    "type": "string",
-                    "description": "Markdown body. Do NOT repeat the title inside; the page already shows it.",
-                },
-                "caption": {
-                    "type": "string",
-                    "description": "Optional short text placed above the URL in the TG message (e.g. a one-line summary)",
-                },
-                "instance": INSTANCE_SCHEMA,
-            },
-            ["title", "content_md"],
-        ),
+        _tool(name, description() if callable(description) else description, properties, required)
+        for name, description, properties, required in _TG_TOOL_SPECS
     ]
 
 

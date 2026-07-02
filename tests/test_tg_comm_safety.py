@@ -98,6 +98,15 @@ def test_tg_mcp_tool_descriptions_stay_operational():
         assert marker not in voice.description
 
 
+def test_tg_mcp_voice_description_is_resolved_when_tools_are_listed(monkeypatch):
+    monkeypatch.setenv("TTS_BACKEND", "mimo")
+    monkeypatch.setenv("TTS_URL", "https://tts.example.test")
+
+    tools = {tool.name: tool for tool in asyncio.run(tg_mcp.list_tools())}
+
+    assert "<style> prefix" in tools["tg_send_voice"].description
+
+
 def test_tg_instance_schema_stays_compact_without_losing_route_values():
     assert tg_mcp.INSTANCE_SCHEMA["enum"] == tg_mcp.TG_INSTANCES
     assert len(tg_mcp.INSTANCE_SCHEMA["description"]) <= 90
