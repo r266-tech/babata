@@ -27,11 +27,9 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "tab_metadata",
         "dispatch": "bridge",
         "description": (
-            "Read current active tab's meta (url / title / current selection / "
-            "scrollY / docHeight / lang). Lightweight — no DOM extraction. "
-            "Use to verify what V is looking at before deciding whether to "
-            "compose dom_query for content. Pass tab_id/window_id from "
-            "page_context to avoid racing V's active tab."
+            "Read active/target tab meta: url, title, selection, scrollY, "
+            "docHeight, lang. No DOM text. Use first to confirm V's page; pass "
+            "tab_id/window_id to avoid active-tab races."
         ),
         "inputSchema": {"type": "object", "properties": _target_props()},
     },
@@ -39,13 +37,10 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "dom_query",
         "dispatch": "bridge",
         "description": (
-            "querySelectorAll on V's active tab, return per-element prop list. "
-            "selector default 'body'. props default ['tag','text']; available: "
-            "tag / id / class / text (innerText, capped 1500) / html (innerHTML, "
-            "capped 2000) / href / value / name / type / placeholder / rect "
-            "(x/y/w/h px) / attrs (full attribute map). Use 'root' (selector) to "
-            "scope querying inside one ancestor. limit caps result count (default "
-            "50)."
+            "querySelectorAll on target tab. Defaults: selector body, props "
+            "tag/text, limit 50; text cap 1500, html cap 2000. props: tag, id, "
+            "class, text, html, href, value, name, type, placeholder, rect, "
+            "attrs. root scopes inside an ancestor."
         ),
         "inputSchema": {
             "type": "object",
@@ -65,11 +60,9 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "dom_inject",
         "dispatch": "bridge",
         "description": (
-            "insertAdjacentHTML on every element matching selector. position: "
-            "beforebegin | afterbegin | beforeend (default) | afterend. Use for "
-            "explicit page annotations or small UI helpers when V asks for page "
-            "modification. Automatic page translation is handled by the content "
-            "script /translate path, not this tool. Returns {count}."
+            "insertAdjacentHTML into matches. position: beforebegin, afterbegin, "
+            "beforeend default, afterend. Use only for V-requested annotations/UI "
+            "helpers; translation uses /translate. Returns {count}."
         ),
         "inputSchema": {
             "type": "object",
@@ -88,11 +81,9 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "dom_set",
         "dispatch": "bridge",
         "description": (
-            "Set property on every match. prop: value (sets input/textarea + "
-            "fires input/change events) | textContent | <any "
-            "attribute name>. Use for filling forms or explicit page edits. "
-            "Automatic page translation is handled by the content script "
-            "/translate path, not this tool. Returns {count}."
+            "Set input value, textContent, or attribute on matches; inputs fire "
+            "input/change. Use for form filling or explicit page edits; "
+            "translation uses /translate. Returns {count}."
         ),
         "inputSchema": {
             "type": "object",
@@ -108,10 +99,9 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "dom_click",
         "dispatch": "bridge",
         "description": (
-            "Synthetic .click() on first match. Returns {ok}. NOTE: synthetic "
-            "(not isTrusted=true); some captcha-protected / OAuth buttons "
-            "won't fire. If that happens, report the limitation instead of "
-            "claiming trusted input."
+            "Synthetic .click() on first match. Returns {ok}. Not trusted input; "
+            "captcha/OAuth buttons may refuse. Report that limit instead of "
+            "claiming real user input."
         ),
         "inputSchema": {
             "type": "object",
@@ -123,11 +113,9 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "page_snapshot",
         "dispatch": "bridge",
         "description": (
-            "Build a compact visible-page map for the target tab. Returns "
-            "{snapshot_id, tab_id, window_id, url, title, items, lines}. "
-            "Each item has ref/role/tag/name/selector/rect/is_new. Prefer this "
-            "before clicking or reasoning about page UI; is_new compares with "
-            "the previous snapshot for the same tab."
+            "Compact visible-page map for target tab: {snapshot_id, tab_id, "
+            "window_id, url, title, items, lines}. Items include ref, role, name, "
+            "selector, rect, is_new. Use before UI reasoning/clicking."
         ),
         "inputSchema": {
             "type": "object",
@@ -140,11 +128,10 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "article_extract",
         "dispatch": "bridge",
         "description": (
-            "Extract the main readable article/content from V's current tab. "
-            "Returns url/title/site metadata, paragraph list with ids, plain text "
-            "with [pN] anchors, markdown, char_count, and extraction_method. Use "
-            "when you decide the user's question needs the page's original text; "
-            "do not use shell/curl to read the current tab."
+            "Extract main readable content from current tab. Returns metadata, "
+            "paragraph ids, plain text with [pN], markdown, char_count, "
+            "extraction_method. Use for original page text; don't shell/curl "
+            "current tab."
         ),
         "inputSchema": {"type": "object", "properties": _target_props()},
     },
@@ -152,10 +139,9 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "page_click_ref",
         "dispatch": "bridge",
         "description": (
-            "Click an element by ref from a previous page_snapshot. Required: "
-            "snapshot_id and ref (e.g. e3). Uses the stored selector on the "
-            "same tab, scrolls it into view, focuses if possible, then synthetic "
-            ".click(). Returns {ok, selector, rect} or a stale-ref error."
+            "Click ref from page_snapshot on the same tab. Requires snapshot_id "
+            "and ref. Reuses stored selector, scrolls/focuses if possible, then "
+            "synthetic click. Returns {ok, selector, rect} or stale-ref."
         ),
         "inputSchema": {
             "type": "object",
@@ -180,10 +166,9 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "translate",
         "dispatch": "translate",
         "description": (
-            "Translate plain text to target_lang (default zh) using the sidebar "
-            "translation backend. Pure text tool: no DOM read, no DOM injection, "
-            "no page side effect. Use when V asks to translate text or when you "
-            "need a translation before deciding how to answer."
+            "Translate plain text to target_lang (default zh). Pure text: no DOM "
+            "read/inject/page side effect. Use for text translation or before "
+            "deciding how to answer."
         ),
         "inputSchema": {
             "type": "object",
@@ -198,11 +183,8 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "suggest_prompts",
         "dispatch": "notify",
         "description": (
-            "Push prediction chips to the sidepanel UI. After reading a page / "
-            "answering V's question, you may forecast 1–2 likely follow-up "
-            "prompts (e.g. '总结全文' / '提取人物关系' / '帮我填表'). UI "
-            "renders them as click-to-send chips. Don't over-suggest — only "
-            "when you genuinely predict V's next move; empty list clears."
+            "Push 1-2 short follow-up chips to sidepanel after reading/answering. "
+            "Use only when you can predict V's next move; [] clears."
         ),
         "inputSchema": {
             "type": "object",
@@ -220,13 +202,10 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "mascot_speak",
         "dispatch": "notify",
         "description": (
-            "Make the babata mascot float a speech bubble on V's current page "
-            "(content widget Shadow DOM). Use sparingly — only when you have "
-            "a real opinion / heads-up / invitation worth interrupting V. "
-            "Keep text short (≤40 zh chars), spoken-style. Examples: "
-            "'这篇凑字数, 别浪费时间', '要我帮你填吗', '8 行总结好了, 看吗'. "
-            "Auto-dismisses 30s. V can click bubble to open sidebar. Pass "
-            "tab_id/window_id from page_context or proactive trigger when known."
+            "Show a short babata speech bubble on V's page. Interrupt only for a "
+            "real opinion, heads-up, or invitation. Keep <=40 zh chars; "
+            "auto-dismiss 30s; click opens sidebar. Pass tab_id/window_id when "
+            "known."
         ),
         "inputSchema": {
             "type": "object",
@@ -282,10 +261,9 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "tabs_query",
         "dispatch": "bridge",
         "description": (
-            "Query open tabs. Filters all optional: active / audible / pinned "
-            "(boolean) / current_window (true to scope) / url (URL pattern e.g. "
-            "'*://x.com/*'). Returns array of {id, url, title, active, audible, "
-            "pinned, group_id, window_id, last_accessed}."
+            "Query open tabs. Optional filters: active, audible, pinned, "
+            "current_window, url pattern. Returns {id, url, title, active, "
+            "audible, pinned, group_id, window_id, last_accessed}."
         ),
         "inputSchema": {
             "type": "object",
@@ -341,9 +319,9 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "history_search",
         "dispatch": "bridge",
         "description": (
-            "Search V's browsing history. text matches url/title fragments. "
-            "start_ms/end_ms are unix epoch ms (default: 0 to now). "
-            "Returns {id, url, title, last_visit, visit_count}."
+            "Search browsing history by url/title text. start_ms/end_ms are unix "
+            "epoch ms (default 0..now). Returns {id, url, title, last_visit, "
+            "visit_count}."
         ),
         "inputSchema": {
             "type": "object",

@@ -193,3 +193,18 @@ def test_sidebar_prompt_tool_map_is_compact_and_complete():
     for tool in SIDEBAR_TOOLS:
         assert tool["name"] in tool_lines
         assert "prompt" not in tool
+
+
+def test_sidebar_model_visible_tool_descriptions_stay_compact():
+    descriptions = [tool["description"] for tool in SIDEBAR_TOOLS]
+    by_name = {tool["name"]: tool["description"] for tool in SIDEBAR_TOOLS}
+
+    assert sum(len(description) for description in descriptions) <= 3200
+    assert max(len(description) for description in descriptions) <= 240
+    for marker in ("共同进化", "哲学", "身份认同", "prompt chips", "高杠杆"):
+        assert all(marker not in description for description in descriptions)
+    assert "Not trusted input" in by_name["dom_click"]
+    assert "translation uses /translate" in by_name["dom_inject"]
+    assert "translation uses /translate" in by_name["dom_set"]
+    assert "don't shell/curl current tab" in by_name["article_extract"]
+    assert "[] clears" in by_name["suggest_prompts"]
