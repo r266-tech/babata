@@ -80,6 +80,36 @@ def _split_error_content(content: str) -> str:
     )
 
 
+async def _terminate_process(proc: Any, timeout: float) -> None:
+    with suppress(ProcessLookupError, Exception):
+        proc.terminate()
+    with suppress(asyncio.TimeoutError, Exception):
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+
+
+async def _cancel_task(task: asyncio.Task[Any]) -> None:
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
+def _split_error_result(
+    *,
+    sid: str | None,
+    content: str,
+    tools: list[str],
+    tool_uses: list[dict[str, Any]],
+    usage: dict[str, int],
+) -> dict[str, Any]:
+    return {
+        "sid": sid,
+        "content": _split_error_content(content),
+        "tools": tools,
+        "tool_uses": tool_uses,
+        "usage": usage,
+    }
+
+
 def _codex_cli_path() -> str:
     return (
         os.environ.get("BABATA_CODEX_CLI_PATH")
@@ -594,10 +624,7 @@ class CodexEngine(CC):
                     else:
                         raw = await proc.stdout.readline()
                 except asyncio.TimeoutError:
-                    with suppress(ProcessLookupError, Exception):
-                        proc.terminate()
-                    with suppress(asyncio.TimeoutError, Exception):
-                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    await _terminate_process(proc, timeout=5)
                     raise RuntimeError(
                         f"codex stalled: no stdout event for {stall_timeout:.0f}s"
                     )
@@ -664,31 +691,21 @@ class CodexEngine(CC):
                     }
             rc = await proc.wait()
         except asyncio.CancelledError:
-            with suppress(ProcessLookupError, Exception):
-                proc.terminate()
-            with suppress(asyncio.TimeoutError, Exception):
-                await asyncio.wait_for(proc.wait(), timeout=2)
-            stderr_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await stderr_task
+            await _terminate_process(proc, timeout=2)
+            await _cancel_task(stderr_task)
             raise
         except Exception as e:
-            with suppress(ProcessLookupError, Exception):
-                proc.terminate()
-            with suppress(asyncio.TimeoutError, Exception):
-                await asyncio.wait_for(proc.wait(), timeout=2)
-            stderr_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await stderr_task
+            await _terminate_process(proc, timeout=2)
+            await _cancel_task(stderr_task)
             if _is_codex_split_error(str(e)):
                 log.warning("codex stdout split failure: %s", str(e)[:300])
-                return {
-                    "sid": sid,
-                    "content": _split_error_content(content),
-                    "tools": tools,
-                    "tool_uses": tool_uses,
-                    "usage": usage,
-                }
+                return _split_error_result(
+                    sid=sid,
+                    content=content,
+                    tools=tools,
+                    tool_uses=tool_uses,
+                    usage=usage,
+                )
             raise
 
         stderr = (await stderr_task).decode("utf-8", errors="replace").strip()
@@ -696,13 +713,13 @@ class CodexEngine(CC):
         if rc != 0 or failure_message:
             if _is_codex_split_error(error_text):
                 log.warning("codex output split failure: %s", error_text[:300])
-                return {
-                    "sid": sid,
-                    "content": _split_error_content(content),
-                    "tools": tools,
-                    "tool_uses": tool_uses,
-                    "usage": usage,
-                }
+                return _split_error_result(
+                    sid=sid,
+                    content=content,
+                    tools=tools,
+                    tool_uses=tool_uses,
+                    usage=usage,
+                )
             raise RuntimeError(error_text or f"codex exited {rc}")
         return {
             "sid": sid,

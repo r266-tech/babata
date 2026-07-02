@@ -50,6 +50,22 @@ class HangingStream(FakeStream):
         return b""
 
 
+class CancellableReadStream(FakeStream):
+    def __init__(self):
+        super().__init__()
+        self.started = asyncio.Event()
+        self.cancelled = False
+
+    async def read(self):
+        self.started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return b""
+
+
 class FakeProcess:
     def __init__(self, lines: list[str], returncode: int = 0, stderr: bytes = b""):
         self.stdout = FakeStream(lines)
@@ -319,6 +335,38 @@ def test_codex_engine_stall_timeout_terminates_process(monkeypatch, tmp_path):
             raise AssertionError("expected codex stall timeout")
 
         assert proc.terminated is True
+
+    asyncio.run(run())
+
+
+def test_codex_run_command_cancellation_cleans_stderr_reader(monkeypatch, tmp_path):
+    proc = FakeProcess([])
+    proc.stdout = HangingStream()
+    stderr = CancellableReadStream()
+    proc.stderr = stderr
+
+    async def fake_create(*_cmd, **_kwargs):
+        return proc
+
+    async def run():
+        monkeypatch.setattr(codex_engine.asyncio, "create_subprocess_exec", fake_create)
+        session = codex_engine.CodexEngine(
+            state_file=tmp_path / "session.json",
+            source_prompt="Source: test.",
+        )
+        task = asyncio.create_task(session._run_command(["codex"], "hello", None))
+        await asyncio.wait_for(stderr.started.wait(), timeout=1)
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("expected cancelled _run_command task")
+
+        assert proc.terminated is True
+        assert stderr.cancelled is True
 
     asyncio.run(run())
 
