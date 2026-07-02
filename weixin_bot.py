@@ -660,12 +660,25 @@ async def _flush_pending(key: tuple[str, str]) -> bool:
             return False
 
 
-async def _process_combined_msgs(
-    client: WeixinClient, msgs: list[dict[str, Any]], account_id: str
-) -> bool:
-    if not msgs:
-        return True
+def _format_wx_message_bodies(message_bodies: list[str]) -> str:
+    combined = "\n".join(message_bodies).strip()
+    if len(message_bodies) <= 1:
+        return combined
+    blocks = [
+        "Multiple WeChat messages, oldest to newest; later messages may "
+        "clarify or supersede earlier ones.",
+        "",
+    ]
+    for idx, body in enumerate(message_bodies, start=1):
+        blocks.append(f"<user_message n={idx}>\n{body}\n</user_message>")
+        blocks.append("")
+    return "\n".join(blocks).strip()
 
+
+async def _collect_wx_turn_inputs(
+    client: WeixinClient,
+    msgs: list[dict[str, Any]],
+) -> tuple[str, str | None, str, list[dict[str, str]]]:
     from_user = msgs[0].get("from_user_id") or ""
     ctx_token = next(
         (m.get("context_token") for m in reversed(msgs) if m.get("context_token")),
@@ -688,18 +701,16 @@ async def _process_combined_msgs(
             body = f"{ref_note}\n{body}" if body else ref_note
         if body:
             message_bodies.append(body)
+    return from_user, ctx_token, _format_wx_message_bodies(message_bodies), images
 
-    combined = "\n".join(message_bodies).strip()
-    if len(message_bodies) > 1:
-        blocks = [
-            "Multiple WeChat messages, oldest to newest; later messages may "
-            "clarify or supersede earlier ones.",
-            "",
-        ]
-        for idx, body in enumerate(message_bodies, start=1):
-            blocks.append(f"<user_message n={idx}>\n{body}\n</user_message>")
-            blocks.append("")
-        combined = "\n".join(blocks).strip()
+
+async def _process_combined_msgs(
+    client: WeixinClient, msgs: list[dict[str, Any]], account_id: str
+) -> bool:
+    if not msgs:
+        return True
+
+    from_user, ctx_token, combined, images = await _collect_wx_turn_inputs(client, msgs)
     if not combined and not images:
         log.info("inbound from %s: no decodable content", from_user)
         return True

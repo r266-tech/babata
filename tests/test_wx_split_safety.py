@@ -380,6 +380,42 @@ def test_weixin_process_retries_same_turn_before_failure_reply(monkeypatch):
     asyncio.run(run())
 
 
+def test_collect_wx_turn_inputs_preserves_prompt_contract():
+    class FakeClient:
+        pass
+
+    async def run():
+        from_user, ctx_token, prompt, images = await wb._collect_wx_turn_inputs(
+            FakeClient(),
+            [
+                {
+                    "from_user_id": "u1",
+                    "context_token": "ctx1",
+                    "item_list": [
+                        {"type": wb.ITEM_TEXT, "text_item": {"text": "first"}},
+                    ],
+                },
+                {
+                    "from_user_id": "u1",
+                    "context_token": "ctx2",
+                    "item_list": [
+                        {"type": wb.ITEM_TEXT, "text_item": {"text": "second"}},
+                    ],
+                },
+            ],
+        )
+
+        assert from_user == "u1"
+        assert ctx_token == "ctx2"
+        assert images == []
+        assert "Multiple WeChat messages, oldest to newest" in prompt
+        assert "clarify or supersede" in prompt
+        assert "<user_message n=1>\nfirst\n</user_message>" in prompt
+        assert "<user_message n=2>\nsecond\n</user_message>" in prompt
+
+    asyncio.run(run())
+
+
 def test_weixin_sync_buf_saved_after_message_processing(monkeypatch, tmp_path):
     saved: list[str] = []
     processed: list[str] = []
