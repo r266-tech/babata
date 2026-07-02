@@ -3876,6 +3876,92 @@ async def _cmd_status_codex(update: Update) -> None:
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+def _claude_status_lines(
+    *,
+    bar: str,
+    pct_ctx: float,
+    model_short: str,
+    window_short: str,
+    review_line: str,
+    session_line: str | None,
+    week_line: str | None,
+    or_today_line: str | None,
+    or_balance_line: str | None,
+    or_compact_line: str | None,
+    today_line: str,
+    cc_version: str,
+    sdk_version: str,
+    verbose: int,
+    actual: str,
+    sid_now: str,
+    recent_count: int,
+) -> list[str]:
+    labels = {0: "hidden", 1: "flash", 2: "keep"}
+    lines = [
+        "<b>📊 Status</b>",
+        "",
+        f"{bar} {pct_ctx:.0f}% · {html.escape(model_short)} ({window_short})",
+        "",
+        html.escape(review_line),
+    ]
+    if session_line:
+        lines.append(html.escape(session_line))
+    if week_line:
+        lines.append(html.escape(week_line))
+    if or_today_line:
+        lines.append(html.escape(or_today_line))
+        lines.append(html.escape(or_balance_line or ""))
+    if or_compact_line:
+        lines.append(html.escape(or_compact_line))
+    lines += [
+        today_line,
+        "",
+        f"CC v{cc_version} · SDK v{sdk_version} · {labels.get(verbose, verbose)}",
+        f"<code>{html.escape(actual)}</code>",
+        f"<code>{sid_now}</code> · {recent_count} recent",
+    ]
+    return lines
+
+
+def _openrouter_usage_lines(
+    *,
+    is_current: bool,
+    data: dict[str, Any] | None,
+) -> tuple[str | None, str | None, str | None]:
+    if is_current:
+        if not data:
+            return "today —", "usage —", None
+        usage = data.get("usage")
+        today = data.get("usage_daily")
+        remaining = data.get("limit_remaining")
+        limit = data.get("limit")
+        today_line = f"${today:.2f} today" if today is not None else "today —"
+        if usage is not None and remaining is not None:
+            return today_line, f"${usage:.2f} used · ${remaining:.2f} left USD", None
+        if usage is not None and limit is not None:
+            return today_line, f"${usage:.2f} used · ${(limit - usage):.2f} left USD", None
+        if usage is not None:
+            return today_line, f"${usage:.2f} used · no limit USD", None
+        return today_line, "usage —", None
+
+    if not data:
+        return None, None, None
+    usage = data.get("usage")
+    today = data.get("usage_daily")
+    remaining = data.get("limit_remaining")
+    limit = data.get("limit")
+    parts = ["openrouter"]
+    if today is not None:
+        parts.append(f"${today:.2f} today")
+    if remaining is not None:
+        parts.append(f"${remaining:.2f} left")
+    elif usage is not None and limit is not None:
+        parts.append(f"${(limit - usage):.2f} left")
+    elif usage is not None:
+        parts.append(f"${usage:.2f} used")
+    return None, None, " · ".join(parts) if len(parts) > 1 else None
+
+
 async def _cmd_status_claude(update: Update) -> None:
     # Config-level model (what settings.json asks for — may be alias like "opus[1m]").
     # Differs from actual model name SDK reports (resolved full version).
@@ -3955,42 +4041,11 @@ async def _cmd_status_claude(update: Update) -> None:
     # Pass key from the same snapshot that drove provider_key/label so a
     # /provider switch mid-render can't desync them.
     or_key = _openrouter_key_from_providers(snapshot)
-    or_today_line = or_balance_line = or_compact_line = None
     or_data = await _fetch_or_usage(or_key)
-    if is_or_current:
-        if or_data:
-            d = or_data.get("data") or {}
-            or_used = d.get("usage")
-            or_today = d.get("usage_daily")
-            or_rem = d.get("limit_remaining")
-            or_limit = d.get("limit")
-            or_today_line = f"${or_today:.2f} today" if or_today is not None else "today —"
-            if or_used is not None and or_rem is not None:
-                or_balance_line = f"${or_used:.2f} used · ${or_rem:.2f} left USD"
-            elif or_used is not None and or_limit is not None:
-                or_balance_line = f"${or_used:.2f} used · ${(or_limit - or_used):.2f} left USD"
-            elif or_used is not None:
-                or_balance_line = f"${or_used:.2f} used · no limit USD"
-            else:
-                or_balance_line = "usage —"
-        else:
-            or_today_line, or_balance_line = "today —", "usage —"
-    elif or_data:
-        d = or_data.get("data") or {}
-        or_used = d.get("usage")
-        or_today = d.get("usage_daily")
-        or_rem = d.get("limit_remaining")
-        or_limit = d.get("limit")
-        parts = ["openrouter"]
-        if or_today is not None:
-            parts.append(f"${or_today:.2f} today")
-        if or_rem is not None:
-            parts.append(f"${or_rem:.2f} left")
-        elif or_used is not None and or_limit is not None:
-            parts.append(f"${(or_limit - or_used):.2f} left")
-        elif or_used is not None:
-            parts.append(f"${or_used:.2f} used")
-        or_compact_line = " · ".join(parts) if len(parts) > 1 else None
+    or_today_line, or_balance_line, or_compact_line = _openrouter_usage_lines(
+        is_current=is_or_current,
+        data=(or_data.get("data") or {}) if or_data else None,
+    )
 
     today_cost = await _fetch_ccusage_today()
     today_str = f"${today_cost:.2f}" if today_cost is not None else "—"
@@ -3999,34 +4054,28 @@ async def _cmd_status_claude(update: Update) -> None:
     sids = cc.recent_session_ids()
     sid_now = sid if sid else "(new)"
 
-    labels = {0: "hidden", 1: "flash", 2: "keep"}
-
     # Layout: header two lines in default font (no <code> — TG renders ▓/░ as
     # noisy stipple inside code blocks). Quota broken into separate lines so
     # mobile doesn't wrap awkwardly. Session UUID on its own line, same reason.
-    lines = [
-        "<b>📊 Status</b>",
-        "",
-        f"{bar} {pct_ctx:.0f}% · {html.escape(model_short)} ({window_short})",
-        "",
-        html.escape(_fmt_review_health_line()),
-    ]
-    if session_line:
-        lines.append(html.escape(session_line))
-    if week_line:
-        lines.append(html.escape(week_line))
-    if or_today_line:
-        lines.append(html.escape(or_today_line))
-        lines.append(html.escape(or_balance_line))
-    if or_compact_line:
-        lines.append(html.escape(or_compact_line))
-    lines += [
-        today_line,
-        "",
-        f"CC v{_cc_version()} · SDK v{_sdk_version()} · {labels.get(_verbose, _verbose)}",
-        f"<code>{html.escape(actual)}</code>",
-        f"<code>{sid_now}</code> · {len(sids)} recent",
-    ]
+    lines = _claude_status_lines(
+        bar=bar,
+        pct_ctx=pct_ctx,
+        model_short=model_short,
+        window_short=window_short,
+        review_line=_fmt_review_health_line(),
+        session_line=session_line,
+        week_line=week_line,
+        or_today_line=or_today_line,
+        or_balance_line=or_balance_line,
+        or_compact_line=or_compact_line,
+        today_line=today_line,
+        cc_version=_cc_version(),
+        sdk_version=_sdk_version(),
+        verbose=_verbose,
+        actual=actual,
+        sid_now=sid_now,
+        recent_count=len(sids),
+    )
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 

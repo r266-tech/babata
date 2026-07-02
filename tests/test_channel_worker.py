@@ -666,6 +666,50 @@ def test_channel_worker_send_completed_text_bubble_formats_and_tracks(monkeypatc
     asyncio.run(run())
 
 
+def test_claude_status_lines_escape_and_include_optional_usage():
+    lines = bot._claude_status_lines(
+        bar="[##]",
+        pct_ctx=25.0,
+        model_short="Opus <4>",
+        window_short="1M",
+        review_line="review <ok>",
+        session_line="session 25%",
+        week_line=None,
+        or_today_line="$1.00 today",
+        or_balance_line="$9.00 left USD",
+        or_compact_line=None,
+        today_line="$3.50 today (ccusage) · Claude Main",
+        cc_version="2.1.112",
+        sdk_version="0.2.4",
+        verbose=1,
+        actual="claude-opus-4<id>",
+        sid_now="sid-1",
+        recent_count=2,
+    )
+
+    text = "\n".join(lines)
+    assert "Opus &lt;4&gt;" in text
+    assert "review &lt;ok&gt;" in text
+    assert "session 25%" in text
+    assert "$1.00 today" in text
+    assert "$9.00 left USD" in text
+    assert "CC v2.1.112 · SDK v0.2.4 · flash" in text
+    assert "<code>claude-opus-4&lt;id&gt;</code>" in text
+    assert "<code>sid-1</code> · 2 recent" in text
+
+
+def test_openrouter_usage_lines_current_and_secondary():
+    assert bot._openrouter_usage_lines(
+        is_current=True,
+        data={"usage": 1.25, "usage_daily": 0.50, "limit_remaining": 8.75},
+    ) == ("$0.50 today", "$1.25 used · $8.75 left USD", None)
+
+    assert bot._openrouter_usage_lines(
+        is_current=False,
+        data={"usage_daily": 1.25, "limit_remaining": 18.75},
+    ) == (None, None, "openrouter · $1.25 today · $18.75 left")
+
+
 def test_channel_worker_single_turn_clean_reset(monkeypatch, tmp_path):
     """Baseline: one user msg → one turn → in_flight returns to 0."""
     async def run():
