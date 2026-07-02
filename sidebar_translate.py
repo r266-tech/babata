@@ -410,6 +410,98 @@ def _parse_marker_results(raw: str, expected: int) -> list[str]:
     return out
 
 
+def _translation_request_body(provider: dict[str, str], target: str, texts: list[str]) -> dict[str, Any]:
+    return {
+        "model": provider["model"],
+        "messages": [{"role": "user", "content": _build_prompt(target, texts)}],
+        "temperature": 0,
+        "max_tokens": _MAX_TOKENS,
+    }
+
+
+def _record_translate_config_error(url: str, target: str, model: str, reason: str) -> None:
+    sidebar_events.append(
+        url, "translate_config_error", reason=reason[:200], target=target, model=model
+    )
+
+
+def _extract_chat_content(resp: httpx.Response) -> str | None:
+    try:
+        data = resp.json()
+        return (
+            ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+            or ""
+        ).strip()
+    except (ValueError, AttributeError, IndexError) as e:
+        log.warning("translate http bad response: %s; body=%r", e, resp.text[:500])
+        return None
+
+
+async def _translation_raw_content(
+    provider: dict[str, str],
+    body: dict[str, Any],
+    headers: dict[str, str],
+    *,
+    url: str,
+    target: str,
+) -> str | None:
+    async with _translate_sema:
+        for attempt in range(2):
+            client = _get_http_client()
+            try:
+                resp = await client.post(
+                    _provider_chat_url(provider["base_url"]), headers=headers, json=body
+                )
+            except httpx.RequestError as e:
+                await _discard_http_client(client)
+                log.warning("translate http request failed (attempt %d): %s", attempt, e)
+                if attempt == 0:
+                    await asyncio.sleep(1.0)
+                    continue
+                _record_translate_config_error(url, target, provider["model"], str(e))
+                return None
+
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt == 0:
+                log.warning(
+                    "translate http retryable status=%s: %s",
+                    resp.status_code,
+                    resp.text[:500],
+                )
+                await asyncio.sleep(1.0)
+                continue
+
+            if resp.status_code >= 400:
+                log.warning(
+                    "translate http status=%s: %s",
+                    resp.status_code,
+                    resp.text[:500],
+                )
+                return None
+
+            return _extract_chat_content(resp)
+    return None
+
+
+def _validated_marker_results(raw: str, texts: list[str], model: str) -> list[str]:
+    parsed = _parse_marker_results(raw, len(texts))
+    # 全空 = parse fail / LLM truncate / 非合格 marker 输出. log raw 头尾便于诊断
+    # (V 装上反复 fail 时看 server log 即可定位真因, 不用重启 debug).
+    if all(not p for p in parsed):
+        log.warning(
+            "translate parse all-empty (n=%d, model=%s): raw_head=%r raw_tail=%r",
+            len(texts), model, raw[:300], raw[-200:] if len(raw) > 300 else "",
+        )
+        return parsed
+    # Sanity: 译文长度比原文短一半以上 → 可能 truncation, log 出来便于诊断.
+    for orig, tr in zip(texts, parsed):
+        if tr and len(tr) * 2 < len(orig):
+            log.warning(
+                "translate suspiciously short: in=%d chars out=%d chars; orig=%r tr=%r",
+                len(orig), len(tr), orig[:120], tr[:120],
+            )
+    return parsed
+
+
 async def _http_translate(
     target: str,
     texts: list[str],
@@ -428,87 +520,22 @@ async def _http_translate(
     except TranslateConfigError as e:
         # 配置层故障 — 不是 transient. 写 events 让事件流可见, log.error 留痕.
         log.error("translate config: %s", e)
-        sidebar_events.append(
-            url, "translate_config_error", reason=str(e)[:200], target=target, model=_MODEL
-        )
+        _record_translate_config_error(url, target, _MODEL, str(e))
         return [""] * len(texts)
 
-    prompt = _build_prompt(target, texts)
-    body = {
-        "model": resolved_provider["model"],
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-        "max_tokens": _MAX_TOKENS,
-    }
+    body = _translation_request_body(resolved_provider, target, texts)
     headers = _provider_headers(resolved_provider["api_key"])
-    raw = ""
-    async with _translate_sema:
-        for attempt in range(2):
-            client = _get_http_client()
-            try:
-                resp = await client.post(
-                    _provider_chat_url(resolved_provider["base_url"]), headers=headers, json=body
-                )
-            except httpx.RequestError as e:
-                await _discard_http_client(client)
-                log.warning("translate http request failed (attempt %d): %s", attempt, e)
-                if attempt == 0:
-                    await asyncio.sleep(1.0)
-                    continue
-                sidebar_events.append(
-                    url, "translate_config_error", reason=str(e)[:200], target=target, model=resolved_provider["model"]
-                )
-                return [""] * len(texts)
-
-            if resp.status_code in (429, 500, 502, 503, 504) and attempt == 0:
-                log.warning(
-                    "translate http retryable status=%s: %s",
-                    resp.status_code,
-                    resp.text[:500],
-                )
-                await asyncio.sleep(1.0)
-                continue
-
-            if resp.status_code >= 400:
-                log.warning(
-                    "translate http status=%s: %s",
-                    resp.status_code,
-                    resp.text[:500],
-                )
-                return [""] * len(texts)
-
-            try:
-                data = resp.json()
-                raw = (
-                    ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
-                    or ""
-                ).strip()
-            except (ValueError, AttributeError, IndexError) as e:
-                log.warning("translate http bad response: %s; body=%r", e, resp.text[:500])
-                return [""] * len(texts)
-            break
+    raw = await _translation_raw_content(
+        resolved_provider, body, headers, url=url, target=target
+    )
+    if raw is None:
+        return [""] * len(texts)
 
     if not raw:
         log.warning("translate http empty output")
         return [""] * len(texts)
 
-    parsed = _parse_marker_results(raw, len(texts))
-    # 全空 = parse fail / LLM truncate / 非合格 marker 输出. log raw 头尾便于诊断
-    # (V 装上反复 fail 时看 server log 即可定位真因, 不用重启 debug).
-    if all(not p for p in parsed):
-        log.warning(
-            "translate parse all-empty (n=%d, model=%s): raw_head=%r raw_tail=%r",
-            len(texts), resolved_provider["model"], raw[:300], raw[-200:] if len(raw) > 300 else "",
-        )
-        return parsed
-    # Sanity: 译文长度比原文短一半以上 → 可能 truncation, log 出来便于诊断.
-    for orig, tr in zip(texts, parsed):
-        if tr and len(tr) * 2 < len(orig):
-            log.warning(
-                "translate suspiciously short: in=%d chars out=%d chars; orig=%r tr=%r",
-                len(orig), len(tr), orig[:120], tr[:120],
-            )
-    return parsed
+    return _validated_marker_results(raw, texts, resolved_provider["model"])
 
 
 async def test_translation_provider(payload: dict[str, Any] | None = None) -> dict[str, str]:
