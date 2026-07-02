@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import uuid
 from pathlib import Path
 
 import cc as cc_module
@@ -71,6 +72,37 @@ def test_first_real_user_and_entrypoint_skips_synthetic_user_records(tmp_path):
     )
 
     assert cc_module._first_real_user_and_entrypoint(session_file) == ("真实问题", "sdk-cli")
+
+
+def test_complete_jsonl_prefix_trims_racing_tail_records():
+    assert cc_module._complete_jsonl_prefix(b'{"ok": 1}\n{"partial":') == b'{"ok": 1}\n'
+    assert cc_module._complete_jsonl_prefix(b'{"partial":') == b""
+    assert cc_module._complete_jsonl_prefix(b"not-json\n") == b""
+    assert cc_module._complete_jsonl_prefix(b'{"ok": 1}\nnot-json\n') == b'{"ok": 1}\n'
+    assert cc_module._complete_jsonl_prefix(b'{"ok": 1}\n') == b'{"ok": 1}\n'
+    assert cc_module._complete_jsonl_prefix(b"") == b""
+
+
+def test_import_jsonl_to_bucket_forks_and_trims_racing_tail(monkeypatch, tmp_path):
+    projects_root = tmp_path / "projects"
+    own_bucket = projects_root / "own-cwd"
+    other_bucket = projects_root / "other-cwd"
+    own_bucket.mkdir(parents=True)
+    other_bucket.mkdir(parents=True)
+    source = other_bucket / "source-sid.jsonl"
+    source_content = b'{"type": "user"}\n{"partial":'
+    source.write_bytes(source_content)
+
+    monkeypatch.setattr(cc_module, "_CC_PROJECTS", own_bucket)
+    monkeypatch.setattr(uuid, "uuid4", lambda: "new-sid")
+
+    imported_sid = cc_module._import_jsonl_to_bucket("source-sid")
+
+    assert imported_sid == "new-sid"
+    assert source.read_bytes() == source_content
+    assert (own_bucket / "new-sid.jsonl").read_bytes() == b'{"type": "user"}\n'
+    assert not (own_bucket / ".new-sid.jsonl.tmp").exists()
+    assert not (own_bucket / ".import-source-sid.lock").exists()
 
 
 def _write_session_jsonl(path: Path, text: str, *, entrypoint: str = "cli", mtime: int = 10):

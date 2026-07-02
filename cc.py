@@ -121,6 +121,28 @@ def _find_jsonl_any_bucket(sid: str) -> Path | None:
     return None
 
 
+def _complete_jsonl_prefix(content: bytes) -> bytes:
+    """Return only complete JSONL records from a possibly racing session copy."""
+    if not content:
+        return content
+    if not content.endswith(b"\n"):
+        # Last line not newline-terminated; treat as in-progress write.
+        last_nl = content.rfind(b"\n")
+        if last_nl >= 0:
+            return content[: last_nl + 1]
+        # Single incomplete line — drop to empty rather than corrupt.
+        return b""
+
+    lines = content.splitlines()
+    if not lines:
+        return content
+    try:
+        json.loads(lines[-1])
+        return content
+    except Exception:
+        return b"\n".join(lines[:-1]) + (b"\n" if lines[:-1] else b"")
+
+
 def _import_jsonl_to_bucket(source_sid: str) -> str | None:
     """Resolve <source_sid>.jsonl to a sid that lives in babata's bucket.
 
@@ -167,22 +189,9 @@ def _import_jsonl_to_bucket(source_sid: str) -> str | None:
         # session 正 append, 末行可能截断. 不能 parse 就 trim.
         try:
             content = tmp_path.read_bytes()
-            if content and not content.endswith(b"\n"):
-                # Last line not newline-terminated; treat as in-progress write.
-                last_nl = content.rfind(b"\n")
-                if last_nl >= 0:
-                    tmp_path.write_bytes(content[: last_nl + 1])
-                else:
-                    # Single incomplete line — drop to empty rather than corrupt.
-                    tmp_path.write_bytes(b"")
-            else:
-                # Validate last line parses as JSON; if not, trim it.
-                lines = content.splitlines()
-                if lines:
-                    try:
-                        json.loads(lines[-1])
-                    except Exception:
-                        tmp_path.write_bytes(b"\n".join(lines[:-1]) + (b"\n" if lines[:-1] else b""))
+            complete = _complete_jsonl_prefix(content)
+            if complete != content:
+                tmp_path.write_bytes(complete)
         except Exception:
             pass
         with open(tmp_path, "rb") as t:
