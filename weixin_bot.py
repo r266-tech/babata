@@ -94,12 +94,9 @@ _WEIXIN_MCP_SCRIPT = str(Path(__file__).parent / "weixin_mcp.py")
 
 _WX_SOURCE_PROMPT = (
     "Source: WeChat. "
-    "Markdown rendered natively: bold/italic/strikethrough/inline-code/"
-    "code-fence-with-syntax-highlight/headings/bullet-lists/numbered-lists/"
-    "tables/links/blockquotes/hr; nested markdown supported. "
-    "Bare URLs auto-linked (URL visible); [text](url) shows only text (URL hidden). "
-    "HTML tags / [x]/[ ] task lists / HTML entities display literally. "
-    "New bubble: separate paragraphs with three newlines (\\n\\n\\n). "
+    "Markdown mostly renders natively; bare URLs stay visible, [text](url) hides URL, "
+    "HTML/task lists/entities display literally. "
+    "New bubble: separate response bubbles with three newlines (\\n\\n\\n). "
     "No edit-message; each bubble is final once sent. "
     "Max 4000 chars/message."
 )

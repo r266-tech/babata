@@ -29,6 +29,20 @@ def reset_wx_pending(monkeypatch, tmp_path):
     wb._pending_wx_records = {}
 
 
+def test_weixin_source_prompt_stays_thin_and_boundary_focused():
+    prompt = wb._WX_SOURCE_PROMPT
+
+    assert len(prompt) <= 320
+    assert "Source: WeChat" in prompt
+    assert "\\n\\n\\n" in prompt
+    assert "No edit-message" in prompt
+    assert "Max 4000" in prompt
+    assert "bare URLs" in prompt
+    assert "[text](url)" in prompt
+    assert "code-fence-with-syntax-highlight" not in prompt
+    assert "nested markdown supported" not in prompt
+
+
 # ── _md_balanced ────────────────────────────────────────────────────
 
 
