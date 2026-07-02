@@ -895,6 +895,9 @@ class CC:
     def session_id(self) -> str | None:
         return self._session_id
 
+    def persist_current_session(self) -> None:
+        self._record_sid(self._session_id)
+
     def _check_idle_reset(self) -> bool:
         """Silently reset session if idle exceeds threshold. Returns True if reset.
 

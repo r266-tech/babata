@@ -1,51 +1,34 @@
-# babata broadcast
+# babata transport adapter
 
-babata is the authorized user's local personal agent. The CPU can be Claude Code
-or Codex; this repo is only the transport shell for Telegram, WeChat, and
-Sidebar. The shell exposes capabilities and handles wire-specific formatting;
-the CPU decides.
+This repo is babata's transport shell for Telegram, WeChat, Sidebar, and
+terminal-adjacent channel plumbing. Shared identity, philosophy, memory,
+personal-context routing, and public-action permissions come from
+`~/cc-workspace/AGENTS.md` / `~/cc-workspace/CLAUDE.md` plus rendered memory
+context; do not duplicate them here.
 
-Terminal Codex/Claude Code sessions are first-class babata channels too. The
-communication medium changes, but shared memory/raw/fact/brain layers remain
-the source of truth.
+For Codex terminal sessions, load shared context first when acting as babata:
 
-## Highest Philosophy
+```bash
+~/cc-workspace/bin/babata-memory-context --profile standing --cpu codex --source terminal --include-top skip
+```
 
-- 1000x north star: keep mechanisms that would still matter if the model were
-  much smarter; delete scaffolding that only compensates for current weakness.
-- Bot only does what the CPU physically cannot: transport, media conversion,
-  bridge/MCP exposure, restart safety, and channel formatting.
-- Facts > rules: keep durable facts in memory/raw layers, not as prompt rule
-  dumps.
-- Capabilities > workflows: expose tools and boundaries; avoid telling the CPU
-  how to use them unless the boundary is physical, security, or channel-specific.
+## Boundary
 
-## Tool Existence
+- Keep this repo thin: channel protocol, formatting, auth, media conversion,
+  MCP/bridge exposure, restart safety, and state handoff.
+- Entrypoints: `bot.py` (Telegram), `weixin_bot.py` (WeChat),
+  `sidebar_bot.py` (Sidebar).
+- CPU adapters: `cc.py`, `codex_engine.py`, selector in `engine.py`.
+- Bridge/MCP surfaces: `bridge.py`, `tg_mcp.py`, `weixin_bridge.py`,
+  `weixin_mcp.py`, `sidebar_mcp.py`.
 
-- Channel entrypoints: `bot.py` (Telegram), `weixin_bot.py` (WeChat),
-  `sidebar_bot.py` (browser Sidebar).
-- Channel MCP/bridge surfaces: `tg_mcp.py`, `weixin_mcp.py`, `sidebar_mcp.py`.
-  Treat these as capabilities, not mandatory workflows.
-- Runtime prompt injection is code-owned: channel source prompts live in the
-  channel entrypoints; shared memory is injected by `cc.py` / `codex_engine.py`.
-- Long-term babata memory starts at `~/cc-workspace/memory/MEMORY.md`; the
-  user's curated second brain is accessed only through
-  `~/cc-workspace/bin/second-brain`.
-- Memory integrity runners live in `~/cc-workspace/bin/`: `memory-guard`,
-  `chat-archive-guard`, and `memory-integrity-check`.
+## Safety
 
-## Permission Boundaries
+- Do not put secrets or private identifiers in public repo files, logs,
+  generated artifacts, PRs, or issues.
+- Raw records and archives are append-only.
+- Self-modification touching launchd services, CPU binaries, dependencies, or
+  bot `ProgramArguments` goes through `scripts/self-ops.sh`.
 
-- Public/external actions ask the user first: PRs, comments, contacting people,
-  purchases, deletes, or other irreversible externally visible actions.
-- Secrets and private identifiers must not enter public repos, logs, summaries,
-  issues, PRs, or generated artifacts.
-- Raw records are append-only: do not rewrite `chat-archive` to improve a
-  summary.
-- Self-modification that touches launchd services, CPU binaries, dependencies,
-  or bot `ProgramArguments` must go through `scripts/self-ops.sh` as a detached
-  helper. Do not inline `launchctl kickstart -k` against the running bot, CPU
-  updates, or global package churn from inside the live process.
-
-Detailed setup, architecture, file maps, and command lists belong in README or
-lower memory/docs layers, not in this broadcast file.
+Setup and public architecture belong in `README.md`, `CONTRIBUTING.md`, or
+`docs/`. Durable facts belong in shared memory/brain, not repo prompt files.

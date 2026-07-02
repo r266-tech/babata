@@ -520,10 +520,6 @@ class CodexEngine(CC):
         )
         self._memory_reflex_event_id: str | None = None
 
-    @property
-    def session_id(self) -> str | None:
-        return self._session_id
-
     async def query(
         self,
         prompt: str,

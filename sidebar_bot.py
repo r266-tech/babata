@@ -603,7 +603,7 @@ def _cpu_status_payload() -> dict[str, Any]:
         "label": engine_label(current),
         "proactive_cpu": proactive,
         "proactive_label": engine_label(proactive),
-        "busy": chat_busy,
+        "busy": chat_busy or proactive_busy,
         "chat_busy": chat_busy,
         "proactive_busy": proactive_busy,
         "choices": [
@@ -631,22 +631,20 @@ async def _switch_sidebar_cpu(target: str) -> dict[str, Any]:
         payload["message"] = f"CPU 已经是 {engine_label(target_name)}"
         return payload
 
-    if _cc_lock.locked():
+    if _cc_lock.locked() or _proactive_lock.locked():
         raise RuntimeError("当前还有 sidebar turn 在跑，等结束后再切 CPU")
 
     # Preserve each current engine's sid in the per-engine slot before replacing
     # the top-level session_id with the target CPU's stored sid.
     for obj in (cc, proactive_cc):
-        if hasattr(obj, "_record_sid"):
-            obj._record_sid(getattr(obj, "_session_id", None))
+        obj.persist_current_session()
 
     cc = _make_sidebar_engine(target_name)
     proactive_cc = _make_proactive_engine(target_name)
     persist_engine(_SIDEBAR_SESSION_FILE, target_name)
     persist_engine(_PROACTIVE_SESSION_FILE, target_name)
     for obj in (cc, proactive_cc):
-        if hasattr(obj, "_record_sid"):
-            obj._record_sid(getattr(obj, "_session_id", None))
+        obj.persist_current_session()
 
     payload = _cpu_status_payload()
     payload["changed"] = True
