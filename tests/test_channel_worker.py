@@ -613,6 +613,39 @@ def test_codex_rate_limits_rejects_empty_app_server_snapshot():
     assert bot._normalize_codex_rate_limits_response(result) is None
 
 
+def test_stream_display_text_keeps_short_text_and_truncates_tail():
+    short = "hello"
+    long_text = "x" * (bot._MAX_TG + 10)
+
+    assert bot._stream_display_text(short) == short
+    display = bot._stream_display_text(long_text)
+    assert len(display) == bot._MAX_TG
+    assert display.startswith("…")
+    assert display.endswith("x" * (bot._MAX_TG - 1))
+
+
+def test_channel_worker_reply_anchor_prefers_active_payload(monkeypatch, tmp_path):
+    reset_bot_globals(monkeypatch, tmp_path)
+    worker = bot.ChannelWorker(FakeSession(), instance_label="test")
+    chat = FakeChat()
+    latest = bot.Payload(update=FakeUpdate(FakeMessage(1), chat), ctx=FakeCtx(), text="latest")
+    turn = bot.Payload(update=FakeUpdate(FakeMessage(2), chat), ctx=FakeCtx(), text="turn")
+    active = bot.Payload(update=FakeUpdate(FakeMessage(3), chat), ctx=FakeCtx(), text="active")
+
+    worker._latest_payload = latest
+    worker._turn_payload = turn
+    worker._active_reply_payload = active
+    worker._anchor_generation = 7
+
+    anchor = worker._current_reply_anchor()
+
+    assert anchor is not None
+    assert anchor.generation == 7
+    assert anchor.payload is active
+    assert anchor.message.message_id == 3
+    assert anchor.chat is chat
+
+
 def test_channel_worker_single_turn_clean_reset(monkeypatch, tmp_path):
     """Baseline: one user msg → one turn → in_flight returns to 0."""
     async def run():

@@ -1556,6 +1556,14 @@ class Payload:
     update_id: int | None = None  # idempotency: turn end 时 _mark_processed
 
 
+@dataclass(frozen=True)
+class ReplyAnchor:
+    generation: int
+    payload: Payload
+    chat: Any
+    message: Any
+
+
 def _format_coalesced_tg_prompt(payloads: list[Payload]) -> str:
     if len(payloads) <= 1:
         return payloads[0].text if payloads else ""
@@ -1578,6 +1586,12 @@ def _format_coalesced_tg_prompt(payloads: list[Payload]) -> str:
         blocks.append(f"<user_message {' '.join(meta)}>\n{text}\n</user_message>")
         blocks.append("")
     return "\n".join(blocks).strip()
+
+
+def _stream_display_text(text: str) -> str:
+    if len(text) <= _MAX_TG:
+        return text
+    return "…" + text[-(_MAX_TG - 1):]
 
 
 class _ReplayChat:
@@ -2088,6 +2102,20 @@ class ChannelWorker:
         self._tool_edit_supported = False
         self._tool_status = None
 
+    def _current_reply_anchor(self) -> ReplyAnchor | None:
+        payload = (
+            self._active_reply_payload
+            or self._turn_payload
+            or self._latest_payload
+        )
+        if payload is None:
+            return None
+        chat = payload.update.effective_chat
+        msg = payload.update.effective_message
+        if chat is None or msg is None:
+            return None
+        return ReplyAnchor(self._anchor_generation, payload, chat, msg)
+
     async def _handle_text_delta(self, chunk: str) -> None:
         if not chunk:
             return
@@ -2096,18 +2124,12 @@ class ChannelWorker:
         # P1.4 fallback: turn_payload / latest_payload 兜底 (race 窗口).
         # P1-A: snapshot generation 入口, 每次 await 边界检查; 变了就 abort
         # 避免 stale write 覆盖新 anchor 状态.
-        gen = self._anchor_generation
-        payload = (
-            self._active_reply_payload
-            or self._turn_payload
-            or self._latest_payload
-        )
-        if payload is None:
+        anchor = self._current_reply_anchor()
+        if anchor is None:
             return
-        chat = payload.update.effective_chat
-        msg = payload.update.effective_message
-        if chat is None or msg is None:
-            return
+        gen = anchor.generation
+        chat = anchor.chat
+        msg = anchor.message
 
         self._text_buffer += chunk
 
@@ -2227,10 +2249,7 @@ class ChannelWorker:
         now = time.monotonic()
         if not self._text_buffer:
             return
-        if len(self._text_buffer) <= _MAX_TG:
-            display = self._text_buffer
-        else:
-            display = "…" + self._text_buffer[-(_MAX_TG - 1):]
+        display = _stream_display_text(self._text_buffer)
 
         if self._text_message is None:
             try:
@@ -2290,18 +2309,12 @@ class ChannelWorker:
         # 同 _handle_text_delta: per-message reply anchor 优先, 让 tool 状态也
         # 跟着新 V 消息走 (不混到上一条 reply 链).
         # P1-B: gen check 同 _handle_text_delta.
-        gen = self._anchor_generation
-        payload = (
-            self._active_reply_payload
-            or self._turn_payload
-            or self._latest_payload
-        )
-        if payload is None:
+        anchor = self._current_reply_anchor()
+        if anchor is None:
             return
-        chat = payload.update.effective_chat
-        msg = payload.update.effective_message
-        if chat is None or msg is None:
-            return
+        gen = anchor.generation
+        chat = anchor.chat
+        msg = anchor.message
 
         if ev.kind == "tool_use" and ev.name:
             self._tool_entries.append(_fmt_tool(ev.name, ev.input_dict or {}))
