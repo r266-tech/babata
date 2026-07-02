@@ -43,6 +43,13 @@ class FakeSentMessage:
         self.deleted = True
 
 
+class HtmlRejectingSentMessage(FakeSentMessage):
+    async def edit_text(self, text: str, parse_mode=None, reply_markup=None):
+        if parse_mode:
+            raise RuntimeError("html rejected")
+        await super().edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+
+
 class FakeMessage:
     def __init__(self, message_id: int, text: str = ""):
         self.message_id = message_id
@@ -61,6 +68,13 @@ class FakeMessage:
         msg.reply_markup = reply_markup
         self.replies.append(msg)
         return msg
+
+
+class HtmlRejectingMessage(FakeMessage):
+    async def reply_text(self, text: str, parse_mode=None, reply_markup=None):
+        if parse_mode:
+            raise RuntimeError("html rejected")
+        return await super().reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
 
 
 class FakeChat:
@@ -662,6 +676,48 @@ def test_channel_worker_send_completed_text_bubble_formats_and_tracks(monkeypatc
         assert len(message.replies) == 1
         assert message.replies[0].text == "<b>done</b>"
         assert message.replies[0].parse_mode == "HTML"
+
+    asyncio.run(run())
+
+
+def test_channel_worker_completed_text_bubble_plain_fallback_on_edit_reject(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        worker = bot.ChannelWorker(FakeSession(), instance_label="test")
+        message = FakeMessage(1, "hello")
+        existing = HtmlRejectingSentMessage("partial")
+        worker._text_message = existing
+
+        sent = await worker._send_completed_text_bubble(
+            message,
+            "**done**",
+            worker._anchor_generation,
+        )
+
+        assert sent == bot.TextBubbleSendResult(sent_ok=True, shipped_msgs=[existing])
+        assert existing.text == "**done**"
+        assert existing.edits[-1] == ("**done**", None, None)
+        assert worker._stale_text_messages == []
+
+    asyncio.run(run())
+
+
+def test_channel_worker_completed_text_bubble_plain_fallback_on_reply_reject(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        worker = bot.ChannelWorker(FakeSession(), instance_label="test")
+        message = HtmlRejectingMessage(1, "hello")
+
+        sent = await worker._send_completed_text_bubble(
+            message,
+            "**done**",
+            worker._anchor_generation,
+        )
+
+        assert sent == bot.TextBubbleSendResult(sent_ok=True, shipped_msgs=message.replies)
+        assert len(message.replies) == 1
+        assert message.replies[0].text == "**done**"
+        assert message.replies[0].parse_mode is None
 
     asyncio.run(run())
 
