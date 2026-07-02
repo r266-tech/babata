@@ -10,8 +10,9 @@ Endpoints:
     GET  /ws       — single SW WebSocket (bridge attaches sender; round-trip
                      for dom_* primitives and one-way for suggest_prompts etc)
 
-哲学全在 _SIDEBAR_SOURCE_PROMPT — 写思想不写规则 (`feedback_no_few_shot_in_prompts`).
-LLM 自决何时抓页面 / 翻不翻 / 推不推. 扩展端只暴露 raw primitive.
+Source prompts only carry channel boundaries, tool scope, and output format.
+Shared identity, philosophy, and memory stay in the shared runtime context.
+扩展端只暴露 raw primitive.
 """
 
 import asyncio
@@ -87,7 +88,6 @@ _ALLOWED_ORIGINS = {
 # ── source prompt ────────────────────────────────────────────────────
 
 # Proactive review prompt — sidebar widget / SW trigger, fire-and-forget cheap reason.
-# 哲学: LLM 自决做不做事 (翻译 / 推 chip / 静默), 不写死规则.
 _PROACTIVE_PROMPT = """\
 你是 babata 浏览器 sidebar 的轻量旁观通道: widget 或 service worker 触发你看一眼当前 tab。
 默认静默; 只有页面此刻真的值得提示、追问或锐评时才动作。

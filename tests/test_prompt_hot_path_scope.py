@@ -47,6 +47,20 @@ PROMPT_CASES = [
         ("默认静默", "mascot_speak", "suggest_prompts", "tab_id/window_id", "不编造观察"),
         (),
     ),
+    (
+        "sidebar-agent-view",
+        lambda: sidebar_bot._AGENT_VIEW_SOURCE_PROMPT,
+        220,
+        ("Source: babata sidebar avatar agent-view", "title/url/visible lines", "不读取文件", "不引入 babata 记忆", "一句中文短句"),
+        ("共同进化", "哲学", "身份认同"),
+    ),
+    (
+        "sidebar-clean-read",
+        lambda: sidebar_bot._CLEAN_READ_SOURCE_PROMPT,
+        220,
+        ("Source: babata sidebar clean-read", "网页正文", "不读取文件", "不引入 babata 记忆", "不补写原文没有的信息", "中文 Markdown"),
+        ("共同进化", "哲学", "身份认同"),
+    ),
 ]
 
 
