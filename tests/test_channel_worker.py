@@ -736,6 +736,26 @@ def test_channel_worker_completed_text_bubble_plain_fallback_on_reply_reject(mon
     asyncio.run(run())
 
 
+def test_channel_worker_text_delta_closes_multiple_stream_bubbles(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        worker = bot.ChannelWorker(FakeSession(), instance_label="test")
+        chat = FakeChat()
+        message = FakeMessage(1, "hello")
+        payload = bot.Payload(update=FakeUpdate(message, chat), ctx=FakeCtx(), text="hello")
+        worker._active_reply_payload = payload
+        worker._anchor_generation = 1
+
+        await worker._handle_text_delta("one\n\n\ntwo\n\n\nthree")
+
+        assert [reply.text for reply in message.replies] == ["one", "two", "three"]
+        assert worker._streamed_bubble_count == 2
+        assert worker._text_buffer == "three"
+        assert worker._text_message is message.replies[-1]
+
+    asyncio.run(run())
+
+
 def test_claude_status_lines_escape_and_include_optional_usage():
     lines = bot._claude_status_lines(
         bar="[##]",

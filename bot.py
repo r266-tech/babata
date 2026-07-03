@@ -2286,37 +2286,8 @@ class ChannelWorker:
                 sent_ok = False
         return TextBubbleSendResult(sent_ok=sent_ok, shipped_msgs=shipped_msgs)
 
-    async def _handle_text_delta(self, chunk: str) -> None:
-        if not chunk:
-            return
-        # 优先用 _active_reply_payload (V 视角"当前活跃消息" — 每条 V msg 都切到
-        # 自己, 即使 SDK 还没 turn_end 也能让新消息有独立 reply).
-        # P1.4 fallback: turn_payload / latest_payload 兜底 (race 窗口).
-        # P1-A: snapshot generation 入口, 每次 await 边界检查; 变了就 abort
-        # 避免 stale write 覆盖新 anchor 状态.
-        anchor = self._current_reply_anchor()
-        if anchor is None:
-            return
-        gen = anchor.generation
-        chat = anchor.chat
-        msg = anchor.message
-
-        self._text_buffer += chunk
-
-        # Fallback mode (3 prior flood strikes): drop streaming edits entirely.
-        # Buffer stays accumulated so turn-end _deliver_response can ship it
-        # (it splits on \n\n\n itself).
-        if not self._text_edit_supported:
-            return
-
-        # \n\n\n marker = LLM-driven bubble break (see _TG_SOURCE_PROMPT).
-        # Close the current bubble (final-edit it) and start a fresh one for
-        # the next chunks. Loop handles multiple markers in one delta (rare).
-        # streamed_bubble_count tracks bubbles successfully shipped — only
-        # increments on real send/edit success so _deliver_response can resend
-        # any that flood-failed mid-stream. Long bubbles are delivered as plain
-        # chunks because rendered HTML cannot be split safely at arbitrary
-        # Telegram boundaries.
+    async def _close_completed_text_bubbles(self, msg: Any, gen: int) -> bool:
+        # Triple newline is the source-prompt boundary between Telegram bubbles.
         while "\n\n\n" in self._text_buffer:
             prefix, tail = self._text_buffer.split("\n\n\n", 1)
             prefix = prefix.rstrip()
@@ -2324,48 +2295,39 @@ class ChannelWorker:
             shipped_msgs: list[Any] = []
             if prefix:
                 if gen != self._anchor_generation:
-                    return
+                    return False
                 sent = await self._send_completed_text_bubble(msg, prefix, gen)
                 if sent is None:
                     self._text_buffer = tail.lstrip("\n")
                     continue
                 sent_ok = sent.sent_ok
                 shipped_msgs = sent.shipped_msgs
-            # P0 gen check: close-bubble state writes must not pollute new anchor.
             if gen != self._anchor_generation:
-                # shipped_msgs are now orphan replies under the old anchor.
                 if shipped_msgs:
                     self._spawn_orphan_cleanup(shipped_msgs)
-                return
+                return False
             self._text_message = None
             self._text_buffer = tail.lstrip("\n")
             self._text_last_edit = 0.0
             if sent_ok:
                 self._streamed_bubble_count += 1
+        return True
 
-        now = time.monotonic()
-        if not self._text_buffer:
-            return
-        display = _stream_display_text(self._text_buffer)
-
+    async def _update_stream_text_message(
+        self,
+        chat: Any,
+        msg: Any,
+        display: str,
+        now: float,
+        gen: int,
+    ) -> None:
         if self._text_message is None:
             try:
                 new_reply = await msg.reply_text(display or "…")
             except Exception as e:
-                # First-send flood: classify and possibly enter fallback so we
-                # don't pound TG with retries. Tail still in _text_buffer →
-                # _deliver_response covers it at turn end.
-                # Gen-check before mutating shared state: cut-in may have
-                # bumped generation while reply_text awaited; this failure
-                # belongs to the now-stale anchor, don't poison new state.
-                # Codex round-1 fix.
                 if gen == self._anchor_generation:
                     self._on_text_edit_failure(e)
                 return
-            # P1-A: gen 没变才装回 _text_message. 变了说明 submit 已切到新 anchor,
-            # 这条 reply 在旧 m_old 下是 orphan — 删掉, 让 V 只看到 m_new 下的新
-            # reply (符合 V spec "切入后回复在对应消息下面"; 留着会让 V 看到 m_old
-            # 下的 "…"/half-chunk 残留, 跟终端体感不齐).
             if gen == self._anchor_generation:
                 self._text_message = new_reply
                 self._text_last_edit = now
@@ -2373,22 +2335,14 @@ class ChannelWorker:
                 self._spawn_orphan_cleanup([new_reply])
             return
 
-        # Adaptive interval: doubles on each flood strike, resets to base on
-        # successful edit (handled below). _text_edit_interval is per-stream
-        # state set by `_on_text_edit_failure`.
         if now - self._text_last_edit < self._text_edit_interval:
             return
-        # P1-A: 在 edit await 前再查一次 gen — 变了就 abort, 不把新 chunk
-        # 写到旧 reply (chunk 在 V 视角属于新 anchor).
         if gen != self._anchor_generation:
             return
         self._text_last_edit = now
         target = self._text_message
         try:
             await target.edit_text(display)
-            # Gen-check after await: if cut-in landed while edit awaited,
-            # this success belongs to the old anchor — don't reset *new*
-            # anchor's flood state with this stale outcome. Codex round-1.
             if gen == self._anchor_generation:
                 self._text_flood_strikes = 0
                 self._text_edit_interval = _TEXT_EDIT_INTERVAL_BASE
@@ -2399,6 +2353,31 @@ class ChannelWorker:
             await chat.send_action("typing")
         except Exception:
             pass
+
+    async def _handle_text_delta(self, chunk: str) -> None:
+        if not chunk:
+            return
+        anchor = self._current_reply_anchor()
+        if anchor is None:
+            return
+        gen = anchor.generation
+        chat = anchor.chat
+        msg = anchor.message
+
+        self._text_buffer += chunk
+
+        if not self._text_edit_supported:
+            return
+
+        if not await self._close_completed_text_bubbles(msg, gen):
+            return
+
+        now = time.monotonic()
+        if not self._text_buffer:
+            return
+        display = _stream_display_text(self._text_buffer)
+
+        await self._update_stream_text_message(chat, msg, display, now, gen)
 
     async def _handle_tool_event(self, ev: Event) -> None:
         if _verbose == 0:
