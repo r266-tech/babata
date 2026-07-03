@@ -13,7 +13,6 @@ UPGRADE_SDK=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --upgrade-sdk) UPGRADE_SDK=1; shift ;;
-        --delay-restart) shift; [ $# -gt 0 ] && shift ;;  # compatibility no-op
         *) shift ;;
     esac
 done

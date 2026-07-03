@@ -23,10 +23,14 @@ def test_auto_update_has_single_canonical_implementation():
     assert "running_launchd_labels()" in canonical_text
     assert "launchctl list" in canonical_text
     assert "for label in $LABELS" in canonical_text
+    assert "--delay-restart" not in canonical_text
 
     self_ops_text = self_ops.read_text(encoding="utf-8")
     assert '"$REPO_DIR/scripts/auto-update.sh" --upgrade-sdk' in self_ops_text
     assert '"$REPO_DIR/auto-update.sh"' not in self_ops_text
+
+    pyproject_text = (repo / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'addopts = "-p no:cacheprovider"' in pyproject_text
 
 
 def test_sidebar_translate_private_helpers_have_call_sites():
