@@ -835,6 +835,44 @@ def test_channel_worker_finalize_stream_text_resends_when_edit_fails(monkeypatch
     asyncio.run(run())
 
 
+def test_channel_worker_deliver_turn_response_acks_and_accounts(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        recorded = []
+        acked = []
+
+        async def fake_record_pending_delivery(payload, resp, update_ids):
+            recorded.append((payload.text, resp.content, list(update_ids)))
+            return "delivery-1"
+
+        async def fake_ack_pending_delivery(delivery_id):
+            acked.append(delivery_id)
+
+        monkeypatch.setattr(bot, "_record_pending_delivery", fake_record_pending_delivery)
+        monkeypatch.setattr(bot, "_ack_pending_delivery", fake_ack_pending_delivery)
+        worker = bot.ChannelWorker(FakeSession(), instance_label="test")
+        chat = FakeChat()
+        message = FakeMessage(1, "hello")
+        payload = bot.Payload(
+            update=FakeUpdate(message, chat),
+            ctx=FakeCtx(),
+            text="hello",
+            update_id=101,
+        )
+        resp = Response(content="done", session_id="sid-1", cost=0.25)
+
+        ok = await worker._deliver_turn_response(payload, resp, [101, None])
+
+        assert ok is True
+        assert recorded == [("hello", "done", [101, None])]
+        assert acked == ["delivery-1"]
+        assert message.replies[0].text == "done"
+        assert bot._session_turns == 1
+        assert bot._last_cost == 0.25
+
+    asyncio.run(run())
+
+
 def test_claude_status_lines_escape_and_include_optional_usage():
     lines = bot._claude_status_lines(
         bar="[##]",

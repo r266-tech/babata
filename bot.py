@@ -2473,7 +2473,6 @@ class ChannelWorker:
             )
             active_uids = list(self._active_update_ids)
             delivery_ok = False
-            delivery_id: str | None = None
             # P1.3: try/finally guarantees turn state resets even if TG edits
             # raise — otherwise _in_flight stays >0 and graceful shutdown hangs.
             try:
@@ -2483,32 +2482,11 @@ class ChannelWorker:
                     )
                     self._apply_accounting(resp)
                     return
-                delivery_id = await _record_pending_delivery(
-                    payload=payload,
-                    resp=resp,
-                    update_ids=active_uids,
+                delivery_ok = await self._deliver_turn_response(
+                    payload,
+                    resp,
+                    active_uids,
                 )
-                try:
-                    delivery_ok = await self._deliver_response(payload, resp)
-                except Exception as e:
-                    log.exception("deliver_response failed: %s", e)
-                    delivery_ok = False
-                if delivery_ok:
-                    await _ack_pending_delivery(delivery_id)
-                else:
-                    log.warning(
-                        "turn_end response not acknowledged by TG delivery; "
-                        "leaving update_ids=%s pending",
-                        [u for u in active_uids if u is not None],
-                    )
-                self._apply_accounting(resp)
-                if resp.cost > 0:
-                    log.info(
-                        "Cost: $%.4f | Session: %s",
-                        resp.cost,
-                        resp.session_id[:8] if resp.session_id else "new",
-                    )
-                self._turn_recovery_attempts = 0
             finally:
                 # 只 fire 完成态给 _active_marks (= 当前 turn 的 V msgs). _pending_marks
                 # 是 cut-in 期间 push 的 (= 下一 turn 的 V msgs), 留着等 _begin_turn
@@ -2542,6 +2520,40 @@ class ChannelWorker:
                 # interrupt + SDK batch 卡死.
                 if self._pending_payloads:
                     await self._start_next_pending_locked()
+
+    async def _deliver_turn_response(
+        self,
+        payload: Payload,
+        resp: Response,
+        update_ids: list[int | None],
+    ) -> bool:
+        delivery_id = await _record_pending_delivery(
+            payload=payload,
+            resp=resp,
+            update_ids=update_ids,
+        )
+        try:
+            delivery_ok = await self._deliver_response(payload, resp)
+        except Exception as e:
+            log.exception("deliver_response failed: %s", e)
+            delivery_ok = False
+        if delivery_ok:
+            await _ack_pending_delivery(delivery_id)
+        else:
+            log.warning(
+                "turn_end response not acknowledged by TG delivery; "
+                "leaving update_ids=%s pending",
+                [u for u in update_ids if u is not None],
+            )
+        self._apply_accounting(resp)
+        if resp.cost > 0:
+            log.info(
+                "Cost: $%.4f | Session: %s",
+                resp.cost,
+                resp.session_id[:8] if resp.session_id else "new",
+            )
+        self._turn_recovery_attempts = 0
+        return delivery_ok
 
     async def _handle_error(self, exc: Exception) -> None:
         log.error("CC stream failed: %s", exc)
