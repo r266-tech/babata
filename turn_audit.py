@@ -336,24 +336,46 @@ def _changed_file_guard_findings(repo_root: Path | None, rel: str) -> list[dict[
 def _tool_guard_findings(tool: dict[str, Any]) -> list[dict[str, Any]]:
     name = str(tool.get("name") or "")
     path = _tool_path(tool)
+    findings = _tool_path_guard_findings(path)
+    findings.extend(_tool_content_guard_findings(tool, path))
+
+    command = _tool_command(tool)
+    if not command:
+        return findings
+    if name.lower() != "bash" and "bash" not in name.lower() and "command" not in tool:
+        return findings
+    findings.extend(_tool_command_guard_findings(command))
+    return findings
+
+
+def _tool_path_guard_findings(path: str | None) -> list[dict[str, Any]]:
+    if not path:
+        return []
+    path_name = Path(path.replace("\\", "/")).name
     findings: list[dict[str, Any]] = []
-    if path:
-        path_name = Path(path.replace("\\", "/")).name
-        if path_name == ".env" or path_name.startswith(".env."):
-            findings.append(_finding(
-                "high",
-                "env-file-tool-request",
-                "Tool request targets an environment/secret file.",
-                path=path,
-                blocking=True,
-            ))
-        if _is_ops_path(path):
-            findings.append(_finding(
-                "medium",
-                "ops-boundary-tool-request",
-                "Tool request targets launchd/self-ops surface.",
-                path=path,
-            ))
+    if path_name == ".env" or path_name.startswith(".env."):
+        findings.append(_finding(
+            "high",
+            "env-file-tool-request",
+            "Tool request targets an environment/secret file.",
+            path=path,
+            blocking=True,
+        ))
+    if _is_ops_path(path):
+        findings.append(_finding(
+            "medium",
+            "ops-boundary-tool-request",
+            "Tool request targets launchd/self-ops surface.",
+            path=path,
+        ))
+    return findings
+
+
+def _tool_content_guard_findings(
+    tool: dict[str, Any],
+    path: str | None,
+) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
     if tool.get("content_has_secret"):
         findings.append(_finding(
             "high",
@@ -370,14 +392,13 @@ def _tool_guard_findings(tool: dict[str, Any]) -> list[dict[str, Any]]:
             path=path,
             blocking=True,
         ))
+    return findings
 
-    command = _tool_command(tool)
-    if not command:
-        return findings
+
+def _tool_command_guard_findings(command: str) -> list[dict[str, Any]]:
     lowered = command.lower()
-    if name.lower() != "bash" and "bash" not in name.lower() and "command" not in tool:
-        return findings
-    if re.search(r"\bgit\s+(?:reset\s+--hard|checkout\s+--|clean\s+-[fd])\b", command):
+    findings: list[dict[str, Any]] = []
+    if _is_dangerous_git_command(command):
         findings.append(_finding(
             "high",
             "dangerous-git-command",
@@ -403,6 +424,13 @@ def _tool_guard_findings(tool: dict[str, Any]) -> list[dict[str, Any]]:
             blocking=True,
         ))
     return findings
+
+
+def _is_dangerous_git_command(command: str) -> bool:
+    return bool(
+        re.search(r"\bgit\s+(?:reset\s+--hard|checkout\s+--)\b", command)
+        or re.search(r"\bgit\s+clean\s+-[A-Za-z]*[fd][A-Za-z]*\b", command)
+    )
 
 
 def run_declared_checks(

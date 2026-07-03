@@ -124,6 +124,48 @@ def test_deterministic_guards_combine_file_and_tool_findings(monkeypatch, tmp_pa
     } <= rules
 
 
+def test_tool_guards_keep_path_content_command_and_self_ops_rules(monkeypatch):
+    monkeypatch.setenv("BABATA_DETERMINISTIC_GUARDS", "observe")
+
+    findings = turn_audit.run_deterministic_guards(
+        repo_root=None,
+        changed_files=[],
+        tool_uses=[
+            {
+                "name": "Write",
+                "file_path": ".env.local",
+                "content_has_secret": True,
+                "content_has_launchctl": True,
+            },
+            {
+                "name": "Write",
+                "file_path": "scripts/self-ops.sh",
+                "content_has_launchctl": True,
+            },
+            {
+                "name": "Bash",
+                "command": "git clean -fd",
+            },
+        ],
+    )
+
+    rules = {finding["rule"] for finding in findings}
+    assert {
+        "env-file-tool-request",
+        "secret-pattern:tool-input",
+        "inline-launchctl-tool-input",
+        "ops-boundary-tool-request",
+        "dangerous-git-command",
+    } <= rules
+    self_ops_inline = [
+        finding
+        for finding in findings
+        if finding["rule"] == "inline-launchctl-tool-input"
+        and finding.get("path") == "scripts/self-ops.sh"
+    ]
+    assert self_ops_inline == []
+
+
 def test_declared_checks_skip_without_config(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
