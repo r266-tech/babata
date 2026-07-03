@@ -1099,16 +1099,31 @@ def _unwrap_shell_command(command: str) -> str:
         parts = shlex.split(command)
     except ValueError:
         return command
-    if len(parts) >= 3 and Path(parts[0]).name in {"bash", "sh", "zsh"} and parts[1] in {"-c", "-lc"}:
+    shell_wrapper = len(parts) >= 3 and Path(parts[0]).name in {"bash", "sh", "zsh"}
+    if shell_wrapper and parts[1] in {"-c", "-lc"}:
         return parts[2]
     return command
 
 
-def _shell_summary(command: str) -> tuple[str, str]:
-    command = _unwrap_shell_command(command)
-    if not command or command == "[secret]":
-        return "Shell", command
+def _second_brain_detail(command: str) -> str:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    action = next(
+        (Path(p).name for p in parts if not p.startswith("-") and Path(p).name != "second-brain"),
+        "",
+    )
+    if "append-diary" in parts:
+        action = "append diary"
+    elif "read-diary" in parts:
+        action = "read diary"
+    elif "list-diaries" in parts:
+        action = "list diaries"
+    return "second-brain" + (f" {action}" if action else "")
 
+
+def _shell_special_summary(command: str) -> tuple[str, str] | None:
     if "babata-memory-context" in command or "memory-inject.sh" in command:
         return "Memory", _memory_context_detail(command)
     if "babata-memory-reflex" in command:
@@ -1125,29 +1140,14 @@ def _shell_summary(command: str) -> tuple[str, str]:
         return "Process", _ps_detail(_split_shell_parts(segment))
 
     skill_name = _skill_name_from_text(command)
-    if skill_name and "SKILL.md" in command:
+    if skill_name and ("SKILL.md" in command or "second-brain" not in command):
         return "Skill", skill_name
-
     if "second-brain" in command:
-        try:
-            parts = shlex.split(command)
-        except ValueError:
-            parts = command.split()
-        action = next((Path(p).name for p in parts if p.startswith("-") is False and Path(p).name != "second-brain"), "")
-        if "append-diary" in parts:
-            action = "append diary"
-        elif "read-diary" in parts:
-            action = "read diary"
-        elif "list-diaries" in parts:
-            action = "list diaries"
-        detail = "second-brain" + (f" {action}" if action else "")
-        return "Skill", detail
+        return "Skill", _second_brain_detail(command)
+    return None
 
-    skill_name = _skill_name_from_text(command)
-    if skill_name:
-        return "Skill", skill_name
 
-    parts = _split_shell_parts(command)
+def _parsed_shell_summary(command: str, parts: list[str]) -> tuple[str, str]:
     if not parts:
         return "Shell", ""
     tool = Path(parts[0]).name
@@ -1177,6 +1177,17 @@ def _shell_summary(command: str) -> tuple[str, str]:
     else:
         detail = tool
     return "Shell", detail
+
+
+def _shell_summary(command: str) -> tuple[str, str]:
+    command = _unwrap_shell_command(command)
+    if not command or command == "[secret]":
+        return "Shell", command
+
+    special = _shell_special_summary(command)
+    if special is not None:
+        return special
+    return _parsed_shell_summary(command, _split_shell_parts(command))
 
 
 def _fmt_tool(name: str, inp: dict) -> str:

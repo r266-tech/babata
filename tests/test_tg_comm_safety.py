@@ -344,6 +344,19 @@ def test_fmt_tool_summarizes_common_operational_commands():
         },
     ) == "🚀 Launchd · list babata labels"
 
+    assert bot._fmt_tool(
+        "/bin/zsh",
+        {
+            "type": "command_execution",
+            "command": "second-brain append-diary --date today",
+        },
+    ) == "📚 Skill · second-brain append diary"
+
+    assert bot._fmt_tool(
+        "/bin/zsh",
+        {"type": "command_execution", "command": "ps -p 123,456 -o pid,command"},
+    ) == "📋 Process · 2 pids"
+
 
 def test_restart_reason_peek_survives_until_startup(monkeypatch, tmp_path):
     monkeypatch.setattr(bot, "STATE_DIR", tmp_path)
