@@ -1358,6 +1358,55 @@ async def _build_sidebar_chat_input(data: dict[str, Any], message: str) -> Sideb
     )
 
 
+def _record_sidebar_user_turn(message: str, chat_input: SidebarChatInput) -> None:
+    if chat_input.chat_url:
+        sidebar_events.append(
+            chat_input.chat_url,
+            "chat_turn",
+            message=message[:500],
+        )
+    if message.strip() == "/new":
+        sidebar_history.boundary()
+        return
+    sidebar_history.append(
+        "user",
+        message,
+        url=chat_input.chat_url,
+        title=chat_input.chat_title,
+        has_image=bool(chat_input.images),
+        has_attach=chat_input.has_attach,
+    )
+
+
+def _record_sidebar_assistant_turn(
+    message: str,
+    chat_input: SidebarChatInput,
+    stream_trace: SidebarStreamTrace,
+    *,
+    done_ok: bool,
+) -> None:
+    if message.strip() == "/new" or not done_ok:
+        return
+    assistant_text = stream_trace.assistant_text()
+    if assistant_text or stream_trace.tool_trace:
+        sidebar_history.append(
+            "assistant",
+            assistant_text,
+            url=chat_input.chat_url,
+            tool_trace=stream_trace.tool_trace,
+        )
+
+
+def _sidebar_sse_headers(request: web.Request) -> dict[str, str]:
+    return {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        "x-accel-buffering": "no",
+        "connection": "keep-alive",
+        **_cors_headers(request),
+    }
+
+
 async def handle_chat(request: web.Request) -> web.StreamResponse:
     rejected = _reject_untrusted_origin(request)
     if rejected:
@@ -1374,36 +1423,12 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
     chat_input = await _build_sidebar_chat_input(data, message)
     prompt = chat_input.prompt
     images = chat_input.images
-
-    # 写 chat_turn 事件 (page memory 累积).
-    chat_url = chat_input.chat_url
-    chat_title = chat_input.chat_title
-    if chat_url:
-        sidebar_events.append(chat_url, "chat_turn", message=message[:500])
-
-    # /new = V 在 sidepanel 点新对话 — cc.py 内部识别 + 我们写一条 boundary
-    # 让 sidebar UI mount 时只拉最近一个 boundary 之后的 turn.
-    if message.strip() == "/new":
-        sidebar_history.boundary()
-    else:
-        # 持久化 V 的 user turn (UI mount/refresh 恢复).
-        sidebar_history.append(
-            "user", message,
-            url=chat_url, title=chat_title,
-            has_image=bool(images),
-            has_attach=chat_input.has_attach,
-        )
+    _record_sidebar_user_turn(message, chat_input)
 
     resp = web.StreamResponse(
         status=200,
         reason="OK",
-        headers={
-            "content-type": "text/event-stream; charset=utf-8",
-            "cache-control": "no-cache, no-transform",
-            "x-accel-buffering": "no",
-            "connection": "keep-alive",
-            **_cors_headers(request),
-        },
+        headers=_sidebar_sse_headers(request),
     )
     await resp.prepare(request)
 
@@ -1430,18 +1455,12 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
         except Exception:
             pass
     finally:
-        # 持久化 assistant turn (UI mount/refresh 恢复). /new 不写 (boundary 已写).
-        # 只在 SSE done 正常发出时写完整 turn; cancel/crash 不写, 防 reload 后
-        # 把截断答案当完整答案展示 (V 看到的错误流已由 SSE error event 反馈).
-        if message.strip() != "/new" and done_ok:
-            assistant_text = stream_trace.assistant_text()
-            if assistant_text or stream_trace.tool_trace:
-                sidebar_history.append(
-                    "assistant",
-                    assistant_text,
-                    url=chat_url,
-                    tool_trace=stream_trace.tool_trace,
-                )
+        _record_sidebar_assistant_turn(
+            message,
+            chat_input,
+            stream_trace,
+            done_ok=done_ok,
+        )
         # video tmp files cleanup. file 类不删 (CC 可能后续 turn 用).
         for p in chat_input.cleanup_paths:
             try:

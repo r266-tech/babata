@@ -370,6 +370,101 @@ def test_sidebar_chat_input_builds_prompt_boundary(monkeypatch, tmp_path):
     assert chat_input.has_attach is True
 
 
+def test_sidebar_user_turn_records_event_history_and_boundary(monkeypatch):
+    events: list[tuple] = []
+    history: list[tuple] = []
+    boundaries: list[str] = []
+    monkeypatch.setattr(
+        sidebar_bot.sidebar_events,
+        "append",
+        lambda *args, **kwargs: events.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        sidebar_bot.sidebar_history,
+        "append",
+        lambda *args, **kwargs: history.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        sidebar_bot.sidebar_history,
+        "boundary",
+        lambda: boundaries.append("boundary"),
+    )
+    chat_input = sidebar_bot.SidebarChatInput(
+        prompt="hello",
+        images=[{"media_type": "image/png", "data": "abc"}],
+        cleanup_paths=[],
+        chat_url="https://x.test",
+        chat_title="X",
+        has_attach=True,
+    )
+
+    sidebar_bot._record_sidebar_user_turn("hello", chat_input)
+    sidebar_bot._record_sidebar_user_turn("/new", chat_input)
+
+    assert events == [
+        (("https://x.test", "chat_turn"), {"message": "hello"}),
+        (("https://x.test", "chat_turn"), {"message": "/new"}),
+    ]
+    assert history == [
+        (("user", "hello"), {
+            "url": "https://x.test",
+            "title": "X",
+            "has_image": True,
+            "has_attach": True,
+        }),
+    ]
+    assert boundaries == ["boundary"]
+
+
+def test_sidebar_assistant_turn_records_only_completed_response(monkeypatch):
+    history: list[tuple] = []
+    monkeypatch.setattr(
+        sidebar_bot.sidebar_history,
+        "append",
+        lambda *args, **kwargs: history.append((args, kwargs)),
+    )
+    chat_input = sidebar_bot.SidebarChatInput(
+        prompt="hello",
+        images=[],
+        cleanup_paths=[],
+        chat_url="https://x.test",
+        chat_title="X",
+        has_attach=False,
+    )
+    trace = sidebar_bot.SidebarStreamTrace(object())
+    trace.assistant_text_parts.append("answer")
+    trace.tool_trace.append({"name": "dom_read", "status": "done"})
+
+    sidebar_bot._record_sidebar_assistant_turn("hello", chat_input, trace, done_ok=True)
+    sidebar_bot._record_sidebar_assistant_turn("hello", chat_input, trace, done_ok=False)
+    sidebar_bot._record_sidebar_assistant_turn("/new", chat_input, trace, done_ok=True)
+
+    assert history == [
+        (("assistant", "answer"), {
+            "url": "https://x.test",
+            "tool_trace": [{"name": "dom_read", "status": "done"}],
+        }),
+    ]
+
+
+def test_sidebar_sse_headers_include_no_buffer_and_cors(monkeypatch):
+    monkeypatch.setattr(
+        sidebar_bot,
+        "_cors_headers",
+        lambda _request: {"access-control-allow-origin": "https://x.test"},
+    )
+
+    headers = sidebar_bot._sidebar_sse_headers(object())
+
+    assert headers == {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        "x-accel-buffering": "no",
+        "connection": "keep-alive",
+        "access-control-allow-origin": "https://x.test",
+    }
+
+
 def test_sidebar_process_attachments_routes_images_files_and_video(monkeypatch, tmp_path):
     async def fake_understand_video(path):
         assert path.read_bytes() == b"video bytes"
