@@ -61,10 +61,6 @@ def engine_name(state_file: Path | None = None, *, override: str | None = None) 
     return normalize_engine(raw)
 
 
-def is_codex_engine(state_file: Path | None = None) -> bool:
-    return engine_name(state_file) == "codex"
-
-
 def persist_engine(state_file: Path, name: str) -> None:
     state = _load_state(state_file)
     state[ENGINE_STATE_KEY] = normalize_engine(name)

@@ -657,6 +657,12 @@ def test_engine_state_overrides_env_and_keeps_engine_specific_sid(monkeypatch, t
     assert made._memory_source == "unknown"
 
 
+def test_engine_module_has_no_dead_codex_boolean_helper():
+    source = Path(engine.__file__).read_text(encoding="utf-8")
+
+    assert "def is_codex_engine" not in source
+
+
 def test_make_engine_accepts_explicit_memory_source(tmp_path):
     made = engine.make_engine(
         state_file=tmp_path / "session.json",
