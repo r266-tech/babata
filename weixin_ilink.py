@@ -654,27 +654,3 @@ def file_item(uploaded: dict[str, Any], file_name: str) -> dict[str, Any]:
             "len": str(uploaded["raw_size"]),
         },
     }
-
-
-def voice_item(uploaded: dict[str, Any], *, playtime: int = 0, **_unused: Any) -> dict[str, Any]:
-    """[NOT REACHABLE — see weixin_mcp.py / weixin_bridge.py 同名 verdict]
-
-    2026-04-26 round 2 verdict 实证: ilink server silent filter bot→user voice.
-    保留函数仅为 import 不破裂; wx_send_voice MCP tool 已下线, _handle_send_voice
-    fail-fast 兜底, 这里不会被调到. 字段是 Java SDK live wire dump 实测值
-    (encode_type=7, playtime, sample_rate=24000, media has 3 fields) — 即使将来
-    协议放开重启探索, 这是已知最贴近的起点. 实证证据见
-    `~/cc-workspace/memory/feedback_ilink_voice_send_blocked.md`.
-    """
-    media = _media_ref(uploaded)
-    if uploaded.get("full_url"):
-        media["full_url"] = uploaded["full_url"]
-    return {
-        "type": ITEM_VOICE,
-        "voice_item": {
-            "media": media,
-            "encode_type": 7,
-            "playtime": int(playtime or 0),
-            "sample_rate": 24000,
-        },
-    }

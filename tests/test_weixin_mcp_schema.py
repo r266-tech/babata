@@ -9,6 +9,7 @@ if _SDK_SITE:
 sys.path.insert(0, str(_REPO))
 
 import weixin_mcp
+import weixin_ilink
 
 
 def _tools():
@@ -76,3 +77,4 @@ def test_wx_voice_tool_stays_absent_from_model_visible_schema():
     tools = _tools()
 
     assert "wx_send_voice" not in tools
+    assert not hasattr(weixin_ilink, "voice_item")
