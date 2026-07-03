@@ -527,6 +527,54 @@ def test_codex_status_prefers_live_app_server_limits(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
+def test_codex_app_server_requests_and_rate_limit_message_normalization():
+    requests = bot._codex_app_server_requests()
+
+    assert [request["id"] for request in requests] == [1, 2]
+    assert requests[0]["method"] == "initialize"
+    assert requests[0]["params"]["capabilities"] == {"experimentalApi": True}
+    assert requests[1]["method"] == "account/rateLimits/read"
+
+    ignored = bot._codex_app_server_rate_limit_message(
+        json.dumps({"id": 1, "result": {}}).encode(),
+    )
+    malformed = bot._codex_app_server_rate_limit_message(b"not-json")
+    no_result = bot._codex_app_server_rate_limit_message(
+        json.dumps({"id": 2, "result": "bad"}).encode(),
+    )
+    parsed = bot._codex_app_server_rate_limit_message(
+        json.dumps({
+            "id": 2,
+            "result": {
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "limitId": "codex",
+                        "limitName": "Codex",
+                        "primary": {
+                            "usedPercent": 40,
+                            "windowDurationMins": 300,
+                            "resetsAt": 111,
+                        },
+                        "secondary": {
+                            "usedPercent": 50,
+                            "windowDurationMins": 10_080,
+                            "resetsAt": 222,
+                        },
+                        "planType": "prolite",
+                    },
+                },
+            },
+        }).encode(),
+    )
+
+    assert ignored is None
+    assert malformed is None
+    assert no_result == {}
+    assert parsed["primary"]["used_percent"] == 40
+    assert parsed["secondary"]["window_minutes"] == 10_080
+    assert parsed["plan_type"] == "prolite"
+
+
 def test_codex_status_snapshot_reads_collaboration_settings(monkeypatch, tmp_path):
     session_file = tmp_path / "rollout-sid-2.jsonl"
     session_file.write_text("\n".join([

@@ -3453,6 +3453,74 @@ def _codex_session_status_from_file(
     return model, effort, info, rate_limits
 
 
+def _codex_app_server_requests() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "babata-status", "version": "0"},
+                "capabilities": {"experimentalApi": True},
+            },
+        },
+        {"id": 2, "method": "account/rateLimits/read"},
+    ]
+
+
+async def _write_codex_app_server_requests(proc: Any) -> bool:
+    if proc.stdin is None:
+        return False
+    for req in _codex_app_server_requests():
+        proc.stdin.write((json.dumps(req, separators=(",", ":")) + "\n").encode())
+    await proc.stdin.drain()
+    return True
+
+
+def _codex_app_server_rate_limit_message(raw: bytes) -> dict[str, Any] | None:
+    try:
+        msg = json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    if not isinstance(msg, dict) or msg.get("id") != 2:
+        return None
+    result = msg.get("result")
+    if not isinstance(result, dict):
+        return {}
+    return _normalize_codex_rate_limits_response(result)
+
+
+async def _read_codex_app_server_rate_limits(proc: Any, timeout: float) -> dict[str, Any] | None:
+    if proc.stdout is None:
+        return None
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return None
+        try:
+            raw = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return None
+        if not raw:
+            return None
+        parsed = _codex_app_server_rate_limit_message(raw)
+        if parsed is None:
+            continue
+        return parsed or None
+
+
+async def _close_codex_app_server_proc(proc: Any) -> None:
+    if proc is None or proc.returncode is not None:
+        return
+    if proc.stdin is not None:
+        with suppress(Exception):
+            proc.stdin.close()
+    with suppress(ProcessLookupError, Exception):
+        proc.terminate()
+    with suppress(asyncio.TimeoutError, Exception):
+        await asyncio.wait_for(proc.wait(), timeout=1)
+
+
 async def _fetch_codex_app_rate_limits() -> dict[str, Any] | None:
     """Read current Codex quota from the local app-server account API.
 
@@ -3479,53 +3547,14 @@ async def _fetch_codex_app_rate_limits() -> dict[str, Any] | None:
         )
         assert proc.stdin is not None
         assert proc.stdout is not None
-        requests = [
-            {
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "clientInfo": {"name": "babata-status", "version": "0"},
-                    "capabilities": {"experimentalApi": True},
-                },
-            },
-            {"id": 2, "method": "account/rateLimits/read"},
-        ]
-        for req in requests:
-            proc.stdin.write((json.dumps(req, separators=(",", ":")) + "\n").encode())
-        await proc.stdin.drain()
-
-        deadline = asyncio.get_running_loop().time() + 8.0
-        while True:
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                return None
-            try:
-                raw = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
-            except asyncio.TimeoutError:
-                return None
-            if not raw:
-                return None
-            try:
-                msg = json.loads(raw.decode("utf-8", errors="replace"))
-            except Exception:
-                continue
-            if msg.get("id") != 2:
-                continue
-            if isinstance(msg.get("result"), dict):
-                return _normalize_codex_rate_limits_response(msg["result"])
+        if not await _write_codex_app_server_requests(proc):
             return None
+        return await _read_codex_app_server_rate_limits(proc, timeout=8.0)
     except Exception as e:
         log.debug("codex app-server rate-limit refresh failed: %s", e)
         return None
     finally:
-        if proc is not None and proc.returncode is None:
-            if proc.stdin is not None:
-                with suppress(Exception):
-                    proc.stdin.close()
-            with suppress(ProcessLookupError, Exception):
-                proc.terminate()
-            with suppress(asyncio.TimeoutError, Exception):
-                await asyncio.wait_for(proc.wait(), timeout=1)
+        await _close_codex_app_server_proc(proc)
 
 
 def _codex_status_snapshot(sid: str | None) -> dict[str, Any]:
