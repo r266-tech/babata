@@ -50,6 +50,11 @@ class HtmlRejectingSentMessage(FakeSentMessage):
         await super().edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
 
 
+class RejectingSentMessage(FakeSentMessage):
+    async def edit_text(self, text: str, parse_mode=None, reply_markup=None):
+        raise RuntimeError("edit rejected")
+
+
 class FakeMessage:
     def __init__(self, message_id: int, text: str = ""):
         self.message_id = message_id
@@ -788,6 +793,44 @@ def test_channel_worker_response_bubble_plain_fallback_on_reply_reject(monkeypat
         assert len(message.replies) == 1
         assert message.replies[0].text == "**done**"
         assert message.replies[0].parse_mode is None
+
+    asyncio.run(run())
+
+
+def test_channel_worker_finalize_stream_text_plain_fallback_on_edit_reject(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        worker = bot.ChannelWorker(FakeSession(), instance_label="test")
+        message = FakeMessage(1, "hello")
+        existing = HtmlRejectingSentMessage("partial")
+        worker._text_message = existing
+
+        sent = await worker._finalize_stream_text_message(message, "**done**")
+
+        assert sent is True
+        assert existing.text == "**done**"
+        assert existing.edits[-1] == ("**done**", None, None)
+        assert message.replies == []
+        assert worker._stale_text_messages == []
+
+    asyncio.run(run())
+
+
+def test_channel_worker_finalize_stream_text_resends_when_edit_fails(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        worker = bot.ChannelWorker(FakeSession(), instance_label="test")
+        message = FakeMessage(1, "hello")
+        existing = RejectingSentMessage("partial")
+        worker._text_message = existing
+
+        sent = await worker._finalize_stream_text_message(message, "**done**")
+
+        assert sent is True
+        assert worker._stale_text_messages == [existing]
+        assert len(message.replies) == 1
+        assert message.replies[0].text == "<b>done</b>"
+        assert message.replies[0].parse_mode == "HTML"
 
     asyncio.run(run())
 

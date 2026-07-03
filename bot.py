@@ -2671,6 +2671,42 @@ class ChannelWorker:
                 return False
         return True
 
+    async def _finalize_stream_text_message(self, msg: Any, target_text: str) -> bool:
+        target_text = target_text.strip()
+        parts, parse_mode = _format_bubble_parts(target_text)
+        if not parts:
+            return True
+        first_delivered = False
+        try:
+            await self._text_message.edit_text(parts[0], **_parse_kwargs(parse_mode))
+            first_delivered = True
+        except Exception:
+            try:
+                raw_parts = _plain_bubble_parts(target_text)
+                await self._text_message.edit_text(raw_parts[0])
+                for pp in raw_parts[1:]:
+                    await msg.reply_text(pp)
+                parts = []
+                first_delivered = True
+            except Exception:
+                self._stale_text_messages.append(self._text_message)
+        if not first_delivered:
+            if not await self._send_response_bubble(msg, target_text):
+                return False
+            parts = []
+        for part in parts[1:]:
+            try:
+                await msg.reply_text(part, **_parse_kwargs(parse_mode))
+            except Exception:
+                if parse_mode:
+                    try:
+                        await msg.reply_text(part)
+                    except Exception:
+                        return False
+                else:
+                    return False
+        return True
+
     async def _deliver_response(self, payload: Payload, resp: Response) -> bool:
         msg = payload.update.effective_message
         if msg is None:
@@ -2714,41 +2750,8 @@ class ChannelWorker:
 
         if self._text_message:
             # First pending bubble = trailing partial in _text_message; finalize.
-            target = pending[0]
-            target_text = target.strip()
-            parts, parse_mode = _format_bubble_parts(target_text)
-            if parts:
-                first_delivered = False
-                try:
-                    await self._text_message.edit_text(
-                        parts[0], **_parse_kwargs(parse_mode)
-                    )
-                    first_delivered = True
-                except Exception:
-                    try:
-                        raw_parts = _plain_bubble_parts(target_text)
-                        await self._text_message.edit_text(raw_parts[0])
-                        for pp in raw_parts[1:]:
-                            await msg.reply_text(pp)
-                        parts = []
-                        first_delivered = True
-                    except Exception:
-                        self._stale_text_messages.append(self._text_message)
-                if not first_delivered:
-                    if not await self._send_response_bubble(msg, target_text):
-                        return False
-                    parts = []
-                for part in parts[1:]:
-                    try:
-                        await msg.reply_text(part, **_parse_kwargs(parse_mode))
-                    except Exception:
-                        if parse_mode:
-                            try:
-                                await msg.reply_text(part)
-                            except Exception:
-                                return False
-                        else:
-                            return False
+            if not await self._finalize_stream_text_message(msg, pending[0]):
+                return False
             for bubble in pending[1:]:
                 if not await self._send_response_bubble(msg, bubble):
                     return False
