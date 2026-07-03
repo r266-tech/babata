@@ -10,6 +10,7 @@ sys.path.insert(0, str(_REPO))
 
 import weixin_mcp
 import weixin_ilink
+import weixin_bridge
 
 
 def _tools():
@@ -78,3 +79,4 @@ def test_wx_voice_tool_stays_absent_from_model_visible_schema():
 
     assert "wx_send_voice" not in tools
     assert not hasattr(weixin_ilink, "voice_item")
+    assert not hasattr(weixin_bridge.WeixinBridge, "_handle_send_voice")
