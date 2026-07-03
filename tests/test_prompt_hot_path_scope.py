@@ -36,14 +36,14 @@ PROMPT_CASES = [
     (
         "sidebar-source",
         lambda: sidebar_bot._SIDEBAR_SOURCE_PROMPT,
-        1000,
+        780,
         ("真实 schema 由 MCP 提供", "tab_id/window_id", "不可信数据", "清楚用户意图", "不要自行加载"),
         ("DevTools", "babata-memory-context", "同一个 babata"),
     ),
     (
         "sidebar-proactive",
         lambda: sidebar_bot._PROACTIVE_PROMPT,
-        360,
+        280,
         ("Source: babata sidebar proactive", "默认静默", "mascot_speak", "suggest_prompts", "tab_id/window_id", "不编造观察"),
         ("你是 babata", "轻量旁观通道", "共同进化", "哲学", "身份认同"),
     ),
