@@ -381,6 +381,12 @@ def test_fmt_tool_marks_subagent_and_web_search():
     )
 
 
+def test_fmt_tool_keeps_current_task_tools_without_legacy_todowrite():
+    assert "TodoWrite" not in bot._TOOL_EMOJI
+    assert bot._fmt_tool("TaskCreate", {"name": "audit"}) == "✅ Task+ · audit"
+    assert bot._fmt_tool("TaskUpdate", {"name": "audit"}) == "☑️ Task~ · audit"
+
+
 class FakeUser:
     def __init__(self, user_id: int):
         self.id = user_id

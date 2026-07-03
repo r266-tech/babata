@@ -792,7 +792,6 @@ _TOOL_EMOJI = {
     "WebFetch": "\U0001f4c4",       # 📄 page fetch
     "WebSearch": "\U0001f310",      # 🌐 web search
     "Task": "\U0001f500",           # 🔀 delegate
-    "TodoWrite": "\u2705",          # ✅ (legacy SDK <=0.1.x; 0.2.x split into Task*)
     "TaskCreate": "\u2705",         # ✅ task new (SDK 0.2.x)
     "TaskUpdate": "\u2611\ufe0f",  # ☑️ task update
     "TaskGet": "\U0001f4cb",        # 📋 task read
@@ -1251,7 +1250,6 @@ def _fmt_tool(name: str, inp: dict) -> str:
         "MultiEdit": "Edit",
         "Glob": "Files",
         "Grep": "Search",
-        "TodoWrite": "Todo",
         "TaskCreate": "Task+",
         "TaskUpdate": "Task~",
         "TaskGet": "Task?",
