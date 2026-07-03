@@ -1,8 +1,12 @@
+import asyncio
 import json
 import subprocess
 import sys
 from pathlib import Path
 
+from claude_agent_sdk.types import ToolPermissionContext
+
+import cc
 import turn_audit
 from cc import Response
 
@@ -86,6 +90,17 @@ def test_permission_guard_can_enforce_dangerous_commands(monkeypatch):
     )
     assert block is True
     assert reason and "dangerous-git-command" in reason
+
+    result = asyncio.run(
+        cc._always_allow(
+            "Bash",
+            {"command": "git reset --hard HEAD"},
+            ToolPermissionContext(),
+        )
+    )
+
+    assert result.behavior == "deny"
+    assert "dangerous-git-command" in result.message
 
 
 def test_permission_guard_can_enforce_secret_file_writes(monkeypatch):

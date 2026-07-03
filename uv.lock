@@ -218,7 +218,7 @@ wx = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.10" },
-    { name = "claude-agent-sdk", specifier = ">=0.1.39" },
+    { name = "claude-agent-sdk", specifier = ">=0.2.87" },
     { name = "cryptography", specifier = ">=42.0" },
     { name = "edge-tts", specifier = ">=6.1" },
     { name = "faster-whisper", specifier = ">=1.0" },

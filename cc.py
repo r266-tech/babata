@@ -34,13 +34,10 @@ from blocking_review import (
 )
 from claude_agent_sdk.types import (
     PermissionResultAllow,
+    PermissionResultDeny,
     StreamEvent,
     ToolPermissionContext,
 )
-try:
-    from claude_agent_sdk.types import PermissionResultDeny
-except ImportError:  # pragma: no cover - old SDK compatibility
-    PermissionResultDeny = None
 
 log = logging.getLogger(__name__)
 
@@ -483,7 +480,7 @@ async def _always_allow(
     tool_name: str,
     tool_input: dict[str, Any],
     ctx: ToolPermissionContext,
-) -> PermissionResultAllow | Any:
+) -> PermissionResultAllow | PermissionResultDeny:
     """Auto-approve every SDK permission prompt.
 
     bypassPermissions mode alone doesn't cover CC's "protected paths"
@@ -495,9 +492,7 @@ async def _always_allow(
     block, reason = should_block_for_permission(tool_name, tool_input)
     if block:
         message = reason or "Blocked by babata deterministic guard"
-        if PermissionResultDeny is not None:
-            return PermissionResultDeny(message=message)
-        raise PermissionError(message)
+        return PermissionResultDeny(message=message)
     return PermissionResultAllow()
 
 # Tunables. These are storage / token-budget params, not "importance judgments" —
