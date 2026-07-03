@@ -1481,6 +1481,43 @@ def test_pending_delivery_replays_before_model_replay(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
+def test_pending_delivery_replay_skips_processed_and_counts_malformed(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+
+        ctx = FakeCtx()
+        bot._processed_set = {601}
+        bot._pending_delivery_records = {
+            "done": {
+                "delivery_id": "done",
+                "update_ids": [601],
+                "anchor_update_id": 601,
+                "chat_id": 42,
+                "message_id": 7,
+                "content": "already delivered",
+                "session_id": "sid-1",
+                "created_at": 1.0,
+            },
+            "bad": {
+                "delivery_id": "bad",
+                "update_ids": [],
+                "chat_id": 42,
+                "created_at": 2.0,
+            },
+        }
+        app = type("FakeApp", (), {"bot": ctx.bot})()
+
+        summary = await bot._replay_pending_deliveries(app)
+
+        assert summary.skipped_processed == 1
+        assert summary.malformed == 1
+        assert summary.delivered == 0
+        assert "done" not in bot._pending_delivery_records
+        assert "bad" in bot._pending_delivery_records
+
+    asyncio.run(run())
+
+
 def test_tg_pending_update_replays_after_restart_and_acks(monkeypatch, tmp_path):
     async def run():
         reset_bot_globals(monkeypatch, tmp_path)

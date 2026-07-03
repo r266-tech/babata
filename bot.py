@@ -183,6 +183,18 @@ class DeliveryReplaySummary:
     failed: int = 0
 
 
+@dataclass(frozen=True)
+class PendingDeliveryRecord:
+    delivery_id: str
+    update_ids: tuple[int, ...]
+    chat_id: int
+    message_id: int
+    anchor_update_id: int
+    content: str
+    session_id: str
+    resume_note: str | None
+
+
 def _pending_replay_notice_lines(summary: PendingReplaySummary) -> list[str]:
     lines: list[str] = []
     if summary.replayed:
@@ -3051,72 +3063,106 @@ async def _replay_pending_updates(app: Application) -> PendingReplaySummary:
     )
 
 
+def _pending_delivery_sort_key(record: dict[str, Any]) -> tuple[float, str]:
+    try:
+        created = float(record.get("created_at") or 0)
+    except (TypeError, ValueError):
+        created = 0.0
+    return (created, str(record.get("delivery_id") or ""))
+
+
+def _parse_pending_delivery_record(record: dict[str, Any]) -> PendingDeliveryRecord:
+    update_ids = tuple(int(u) for u in (record.get("update_ids") or []))
+    return PendingDeliveryRecord(
+        delivery_id=str(record.get("delivery_id") or ""),
+        update_ids=update_ids,
+        chat_id=int(record["chat_id"]),
+        message_id=int(record["message_id"]),
+        anchor_update_id=int(record.get("anchor_update_id") or update_ids[-1]),
+        content=str(record.get("content") or ""),
+        session_id=str(record.get("session_id") or ""),
+        resume_note=record.get("resume_note") or None,
+    )
+
+
+def _payload_for_pending_delivery(
+    bot_obj: Any,
+    record: PendingDeliveryRecord,
+) -> Payload | None:
+    return _payload_from_pending_record(
+        bot_obj,
+        {
+            "update_id": record.anchor_update_id,
+            "chat_id": record.chat_id,
+            "message_id": record.message_id,
+            "text": "[pending delivery replay]",
+            "images": [],
+        },
+    )
+
+
+async def _replay_pending_delivery_record(
+    app: Application,
+    record: PendingDeliveryRecord,
+) -> str:
+    if record.update_ids and all(uid in _processed_set for uid in record.update_ids):
+        await _ack_pending_delivery(record.delivery_id)
+        return "skipped_processed"
+
+    payload = _payload_for_pending_delivery(app.bot, record)
+    if payload is None:
+        log.warning("pending delivery payload is malformed: delivery_id=%s", record.delivery_id)
+        return "malformed"
+
+    try:
+        ok = await _worker()._deliver_response(
+            payload,
+            Response(
+                content=record.content,
+                session_id=record.session_id,
+                cost=0.0,
+                resume_note=record.resume_note,
+            ),
+        )
+    except Exception as e:
+        log.warning("pending delivery replay failed: delivery_id=%s: %s", record.delivery_id, e)
+        ok = False
+    if not ok:
+        return "failed"
+
+    for uid in record.update_ids:
+        await _mark_processed(uid)
+    await _ack_pending_delivery(record.delivery_id)
+    return "delivered"
+
+
 async def _replay_pending_deliveries(app: Application) -> DeliveryReplaySummary:
     async with _pending_deliveries_lock:
         records = list(_pending_delivery_records.values())
     if not records:
         return DeliveryReplaySummary()
 
-    def _sort_key(record: dict[str, Any]) -> tuple[float, str]:
-        try:
-            created = float(record.get("created_at") or 0)
-        except (TypeError, ValueError):
-            created = 0.0
-        return (created, str(record.get("delivery_id") or ""))
-
     delivered = 0
     skipped_processed = 0
     malformed = 0
     failed = 0
-    for record in sorted(records, key=_sort_key):
-        delivery_id = str(record.get("delivery_id") or "")
+    for raw_record in sorted(records, key=_pending_delivery_sort_key):
         try:
-            update_ids = [int(u) for u in (record.get("update_ids") or [])]
-            chat_id = int(record["chat_id"])
-            message_id = int(record["message_id"])
-            anchor_update_id = int(record.get("anchor_update_id") or update_ids[-1])
+            record = _parse_pending_delivery_record(raw_record)
         except (KeyError, TypeError, ValueError, IndexError):
+            delivery_id = str(raw_record.get("delivery_id") or "")
             log.warning("pending delivery record is malformed: delivery_id=%s", delivery_id)
             malformed += 1
             continue
-        if update_ids and all(uid in _processed_set for uid in update_ids):
-            await _ack_pending_delivery(delivery_id)
+        result = await _replay_pending_delivery_record(app, record)
+        if result == "delivered":
+            delivered += 1
+        elif result == "skipped_processed":
             skipped_processed += 1
-            continue
-        payload = _payload_from_pending_record(
-            app.bot,
-            {
-                "update_id": anchor_update_id,
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": "[pending delivery replay]",
-                "images": [],
-            },
-        )
-        if payload is None:
-            log.warning("pending delivery payload is malformed: delivery_id=%s", delivery_id)
+        elif result == "malformed":
             malformed += 1
-            continue
-        try:
-            ok = await _worker()._deliver_response(
-                payload,
-                Response(
-                    content=str(record.get("content") or ""),
-                    session_id=str(record.get("session_id") or ""),
-                    cost=0.0,
-                    resume_note=record.get("resume_note") or None,
-                ),
-            )
-        except Exception as e:
-            log.warning("pending delivery replay failed: delivery_id=%s: %s", delivery_id, e)
-            ok = False
-        if not ok:
+        else:
             failed += 1
-            continue
-        for uid in update_ids:
-            await _mark_processed(uid)
-        await _ack_pending_delivery(delivery_id)
-        delivered += 1
     if delivered:
         log.warning("replayed %d pending TG response delivery record(s)", delivered)
     return DeliveryReplaySummary(
