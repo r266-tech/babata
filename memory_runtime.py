@@ -24,7 +24,7 @@ def memory_inject_script() -> Path:
 
 
 def memory_reflex_enabled() -> bool:
-    return os.environ.get("BABATA_MEMORY_REFLEX", "1") != "0"
+    return os.environ.get("BABATA_MEMORY_REFLEX") == "1"
 
 
 def memory_reflex_mode() -> str:
