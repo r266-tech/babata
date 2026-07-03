@@ -7,7 +7,16 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$SCRIPT_DIR"
+cd "$SCRIPT_DIR" || exit 1
+
+UPGRADE_SDK=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --upgrade-sdk) UPGRADE_SDK=1; shift ;;
+        --delay-restart) shift; [ $# -gt 0 ] && shift ;;  # compatibility no-op
+        *) shift ;;
+    esac
+done
 
 # Pull just PROJECT_STATE_DIR from .env (avoid blanket-exporting tokens
 # to subprocess). Caller-set PROJECT_STATE_DIR wins.
@@ -19,7 +28,7 @@ if [ -f "$ENV_FILE" ] && [ -z "${PROJECT_STATE_DIR:-}" ]; then
 fi
 
 PROJECT_NAMESPACE="${PROJECT_NAMESPACE:-babata}"
-LABEL="com.${PROJECT_NAMESPACE}"
+LABEL_PREFIX="com.${PROJECT_NAMESPACE}"
 SERVICE="${PROJECT_NAMESPACE}.service"
 STATE_DIR_R="${PROJECT_STATE_DIR:-$SCRIPT_DIR/state}"
 RESTART_IDLE_WAIT_SECONDS="${RESTART_IDLE_WAIT_SECONDS:-3600}"
@@ -38,18 +47,26 @@ export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PA
 
 UV=$(command -v uv 2>/dev/null || echo "$HOME/.local/bin/uv")
 CLAUDE_BIN="${CLAUDE_CLI_PATH:-$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")}"
+VENV_PY="$SCRIPT_DIR/.venv/bin/python"
 
 CODE_CHANGED=0
 DEPS_CHANGED=0
 CLI_CHANGED=0
+SDK_CHANGED=0
 
 runtime_file_for_label() {
     local label="$1"
     local instance=""
-    if [ "$label" != "com.${PROJECT_NAMESPACE}" ]; then
-        instance="${label#com.${PROJECT_NAMESPACE}.}"
+    if [ "$label" != "$LABEL_PREFIX" ]; then
+        instance="${label#"$LABEL_PREFIX".}"
     fi
     printf '%s/runtime-status-%s.json\n' "$STATE_DIR_R" "$instance"
+}
+
+running_launchd_labels() {
+    launchctl list | awk -v prefix="$LABEL_PREFIX" '
+        $1 ~ /^[0-9]+$/ && $3 ~ ("^" prefix "($|[.])") {print $3}
+    '
 }
 
 wait_runtime_idle() {
@@ -114,8 +131,25 @@ if [ -x "$CLAUDE_BIN" ]; then
     fi
 fi
 
-# 4) 重启 service (代码 / deps / cli 任一变了)
-if [ "$CODE_CHANGED" = "1" ] || [ "$DEPS_CHANGED" = "1" ] || [ "$CLI_CHANGED" = "1" ]; then
+# 4) Optional SDK upgrade for manual/self-ops/root compatibility paths.
+if [ "$UPGRADE_SDK" = "1" ]; then
+    if [ -x "$UV" ] && [ -x "$VENV_PY" ]; then
+        OLD_SDK=$("$VENV_PY" -c "import claude_agent_sdk; print(claude_agent_sdk.__version__)" 2>/dev/null)
+        "$UV" pip install --python "$VENV_PY" --upgrade claude-agent-sdk 2>&1 | tail -5
+        "$UV" --directory "$SCRIPT_DIR" lock --upgrade-package claude-agent-sdk 2>&1 | tail -3 \
+            || echo "WARN: uv lock failed after claude-agent-sdk upgrade"
+        NEW_SDK=$("$VENV_PY" -c "import claude_agent_sdk; print(claude_agent_sdk.__version__)" 2>/dev/null)
+        if [ "$OLD_SDK" != "$NEW_SDK" ]; then
+            echo "claude-agent-sdk: $OLD_SDK -> $NEW_SDK"
+            SDK_CHANGED=1
+        fi
+    else
+        echo "WARN: --upgrade-sdk requested but uv or venv python is missing"
+    fi
+fi
+
+# 5) 重启 service (代码 / deps / cli / sdk 任一变了)
+if [ "$CODE_CHANGED" = "1" ] || [ "$DEPS_CHANGED" = "1" ] || [ "$CLI_CHANGED" = "1" ] || [ "$SDK_CHANGED" = "1" ]; then
     # Build a one-line reason for bot.py's restart-reason channel — V 看到的
     # TG alert 会拼上这串, 知道为啥重启 (而不是空洞的 "launchd 自愈").
     reason_parts=""
@@ -128,6 +162,10 @@ if [ "$CODE_CHANGED" = "1" ] || [ "$DEPS_CHANGED" = "1" ] || [ "$CLI_CHANGED" = 
         [ -n "$reason_parts" ] && reason_parts="$reason_parts+"
         reason_parts="${reason_parts}cli"
     fi
+    if [ "$SDK_CHANGED" = "1" ]; then
+        [ -n "$reason_parts" ] && reason_parts="$reason_parts+"
+        reason_parts="${reason_parts}sdk"
+    fi
     REASON="auto-update (scripts/): $reason_parts"
 
     case "$(uname -s)" in
@@ -137,15 +175,22 @@ if [ "$CODE_CHANGED" = "1" ] || [ "$DEPS_CHANGED" = "1" ] || [ "$CLI_CHANGED" = 
             fi
             ;;
         Darwin)
-            if launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
-                mkdir -p "$STATE_DIR_R" 2>/dev/null && \
-                    printf '%s\n' "$REASON" > "$STATE_DIR_R/restart-reason-${LABEL}.txt"
-                if wait_runtime_idle "$LABEL"; then
-                    launchctl kickstart -k "gui/$UID/$LABEL" && echo "launchd kickstarted: $LABEL"
-                fi
+            LABELS=$(running_launchd_labels)
+            if [ -z "$LABELS" ]; then
+                echo "WARNING: no running ${LABEL_PREFIX}* agents, nothing to restart"
+            else
+                for label in $LABELS; do
+                    if [ "$label" != "com.${PROJECT_NAMESPACE}.weixin" ]; then
+                        mkdir -p "$STATE_DIR_R" 2>/dev/null && \
+                            printf '%s\n' "$REASON" > "$STATE_DIR_R/restart-reason-${label}.txt"
+                    fi
+                    if wait_runtime_idle "$label"; then
+                        launchctl kickstart -k "gui/$UID/$label" && echo "launchd kickstarted: $label"
+                    fi
+                done
             fi
             ;;
     esac
 fi
 
-echo "done. (code=$CODE_CHANGED deps=$DEPS_CHANGED cli=$CLI_CHANGED)"
+echo "done. (code=$CODE_CHANGED deps=$DEPS_CHANGED cli=$CLI_CHANGED sdk=$SDK_CHANGED)"

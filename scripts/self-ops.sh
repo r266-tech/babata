@@ -25,7 +25,7 @@ runtime_file_for_label() {
     local prefix="$LABEL_PREFIX"
     local instance=""
     if [ "$label" != "$prefix" ]; then
-        instance="${label#${prefix}.}"
+        instance="${label#"$prefix".}"
     fi
     local state_dir="${PROJECT_STATE_DIR:-$REPO_DIR/state}"
     printf '%s/runtime-status-%s.json\n' "$state_dir" "$instance"
@@ -82,7 +82,7 @@ restart() {
     # Skip wx label: weixin_bot has no TG alert consumer for the restart-reason
     # channel — writing the file would be unread + stale-on-first-consume hazard
     # if a wx alert is added later. Same skip lives in babata-daily-restart.sh
-    # and root auto-update.sh.
+    # and scripts/auto-update.sh.
     if [ "$label" != "${LABEL_PREFIX}.weixin" ]; then
         local state_dir="${PROJECT_STATE_DIR:-$REPO_DIR/state}"
         {
@@ -197,10 +197,10 @@ bootstrap_plist() {
 }
 
 update_claude() {
-    # 走 auto-update.sh 而非 `claude update` — 前者含 npm 防护 / symlink 自愈 / 变更时 kickstart.
-    nohup "$REPO_DIR/auto-update.sh" >/dev/null 2>&1 &
+    # 走 canonical auto-update 脚本而非 `claude update`; install.sh 也注册这一路径.
+    nohup "$REPO_DIR/scripts/auto-update.sh" --upgrade-sdk >/dev/null 2>&1 &
     disown
-    echo "已排队: auto-update.sh"
+    echo "已排队: scripts/auto-update.sh"
 }
 
 case "${1:-}" in
