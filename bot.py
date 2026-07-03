@@ -1571,6 +1571,15 @@ def _plain_bubble_parts(text: str) -> list[str]:
     return _split(text) or [text[:_MAX_TG]]
 
 
+def _pending_response_bubbles(content: str, streamed_count: int) -> tuple[list[str], bool]:
+    bubbles = re.split(r"\n{3,}", content)
+    while bubbles and not bubbles[-1].strip():
+        bubbles.pop()
+    while bubbles and not bubbles[0].strip():
+        bubbles.pop(0)
+    return bubbles[streamed_count:], bool(bubbles or streamed_count)
+
+
 def _parse_kwargs(parse_mode: str | None) -> dict[str, str]:
     return {"parse_mode": parse_mode} if parse_mode else {}
 
@@ -2643,6 +2652,25 @@ class ChannelWorker:
             except Exception:
                 pass
 
+    async def _send_response_bubble(self, msg: Any, bubble: str) -> bool:
+        bubble = bubble.strip()
+        if not bubble:
+            return True
+        parts, parse_mode = _format_bubble_parts(bubble)
+        for part in parts:
+            try:
+                await msg.reply_text(part, **_parse_kwargs(parse_mode))
+            except Exception:
+                if parse_mode:
+                    try:
+                        for pp in _plain_bubble_parts(bubble):
+                            await msg.reply_text(pp)
+                        return True
+                    except Exception:
+                        return False
+                return False
+        return True
+
     async def _deliver_response(self, payload: Payload, resp: Response) -> bool:
         msg = payload.update.effective_message
         if msg is None:
@@ -2674,39 +2702,14 @@ class ChannelWorker:
             await msg.reply_text("(no response)")
             return True
 
-        # Streaming has already shipped `_streamed_bubble_count` bubbles via
-        # reply_text in _handle_text_delta; _text_message (if any) holds the
-        # trailing partial. Compute what's still pending from the final.
-        bubbles = re.split(r"\n{3,}", resp.content)
-        # Drop leading + trailing empty bubbles (LLM may bracket with markers).
-        while bubbles and not bubbles[-1].strip():
-            bubbles.pop()
-        while bubbles and not bubbles[0].strip():
-            bubbles.pop(0)
-        pending = bubbles[self._streamed_bubble_count:]
+        pending, has_bubbles = _pending_response_bubbles(
+            resp.content,
+            self._streamed_bubble_count,
+        )
         if not pending:
-            if bubbles or self._streamed_bubble_count:
+            if has_bubbles:
                 return True
             await msg.reply_text("(no response)")
-            return True
-
-        async def _send_bubble(bubble: str) -> bool:
-            bubble = bubble.strip()
-            if not bubble:
-                return True
-            parts, parse_mode = _format_bubble_parts(bubble)
-            for part in parts:
-                try:
-                    await msg.reply_text(part, **_parse_kwargs(parse_mode))
-                except Exception:
-                    if parse_mode:
-                        try:
-                            for pp in _plain_bubble_parts(bubble):
-                                await msg.reply_text(pp)
-                            return True
-                        except Exception:
-                            return False
-                    return False
             return True
 
         if self._text_message:
@@ -2732,7 +2735,7 @@ class ChannelWorker:
                     except Exception:
                         self._stale_text_messages.append(self._text_message)
                 if not first_delivered:
-                    if not await _send_bubble(target_text):
+                    if not await self._send_response_bubble(msg, target_text):
                         return False
                     parts = []
                 for part in parts[1:]:
@@ -2747,11 +2750,11 @@ class ChannelWorker:
                         else:
                             return False
             for bubble in pending[1:]:
-                if not await _send_bubble(bubble):
+                if not await self._send_response_bubble(msg, bubble):
                     return False
         else:
             for bubble in pending:
-                if not await _send_bubble(bubble):
+                if not await self._send_response_bubble(msg, bubble):
                     return False
         return True
 

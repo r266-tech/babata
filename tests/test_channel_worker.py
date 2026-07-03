@@ -652,6 +652,26 @@ def test_stream_display_text_keeps_short_text_and_truncates_tail():
     assert display.endswith("x" * (bot._MAX_TG - 1))
 
 
+def test_pending_response_bubbles_drops_empty_edges_and_skips_streamed():
+    pending, has_bubbles = bot._pending_response_bubbles(
+        "\n\n\none\n\n\ntwo\n\n\n",
+        streamed_count=1,
+    )
+
+    assert pending == ["two"]
+    assert has_bubbles is True
+
+
+def test_pending_response_bubbles_reports_streamed_empty_final_as_done():
+    pending, has_bubbles = bot._pending_response_bubbles(
+        "\n\n\n",
+        streamed_count=1,
+    )
+
+    assert pending == []
+    assert has_bubbles is True
+
+
 def test_channel_worker_reply_anchor_prefers_active_payload(monkeypatch, tmp_path):
     reset_bot_globals(monkeypatch, tmp_path)
     worker = bot.ChannelWorker(FakeSession(), instance_label="test")
@@ -752,6 +772,22 @@ def test_channel_worker_text_delta_closes_multiple_stream_bubbles(monkeypatch, t
         assert worker._streamed_bubble_count == 2
         assert worker._text_buffer == "three"
         assert worker._text_message is message.replies[-1]
+
+    asyncio.run(run())
+
+
+def test_channel_worker_response_bubble_plain_fallback_on_reply_reject(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        worker = bot.ChannelWorker(FakeSession(), instance_label="test")
+        message = HtmlRejectingMessage(1, "hello")
+
+        sent = await worker._send_response_bubble(message, "**done**")
+
+        assert sent is True
+        assert len(message.replies) == 1
+        assert message.replies[0].text == "**done**"
+        assert message.replies[0].parse_mode is None
 
     asyncio.run(run())
 
