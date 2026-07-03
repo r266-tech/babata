@@ -3345,6 +3345,68 @@ def _normalize_codex_rate_limits_response(result: Any) -> dict[str, Any] | None:
     return _normalize_codex_rate_limit_snapshot(snapshot)
 
 
+def _codex_turn_context_model_effort(
+    payload: Any,
+    model: str,
+    effort: str,
+) -> tuple[str, str]:
+    if not isinstance(payload, dict):
+        return model, effort
+    model = str(payload.get("model") or model)
+    effort = str(payload.get("effort") or effort)
+    collab = payload.get("collaboration_mode") or {}
+    settings = collab.get("settings") if isinstance(collab, dict) else {}
+    if isinstance(settings, dict):
+        model = str(settings.get("model") or model)
+        effort = str(settings.get("reasoning_effort") or effort)
+    return model, effort
+
+
+def _codex_token_count_status(
+    event: dict[str, Any],
+    info: dict[str, Any],
+    rate_limits: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    payload = event.get("payload") if isinstance(event, dict) else {}
+    if not isinstance(payload, dict) or payload.get("type") != "token_count":
+        return info, rate_limits
+    event_info = payload.get("info")
+    if isinstance(event_info, dict):
+        info = event_info
+    event_rl = _codex_event_rate_limits(event)
+    if isinstance(event_rl, dict):
+        rate_limits = event_rl
+    return info, rate_limits
+
+
+def _codex_session_status_from_file(
+    fp: Path,
+    model: str,
+    effort: str,
+) -> tuple[str, str, dict[str, Any], dict[str, Any] | None]:
+    info: dict[str, Any] = {}
+    rate_limits: dict[str, Any] | None = None
+    try:
+        with fp.open() as f:
+            for line in f:
+                has_turn_context = '"turn_context"' in line
+                has_token_count = '"token_count"' in line
+                if not has_turn_context and not has_token_count:
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                if has_turn_context:
+                    payload = event.get("payload") if isinstance(event, dict) else {}
+                    model, effort = _codex_turn_context_model_effort(payload, model, effort)
+                elif has_token_count:
+                    info, rate_limits = _codex_token_count_status(event, info, rate_limits)
+    except Exception:
+        pass
+    return model, effort, info, rate_limits
+
+
 async def _fetch_codex_app_rate_limits() -> dict[str, Any] | None:
     """Read current Codex quota from the local app-server account API.
 
@@ -3437,39 +3499,7 @@ def _codex_status_snapshot(sid: str | None) -> dict[str, Any]:
 
     fp = _codex_session_file(sid)
     if fp:
-        try:
-            with fp.open() as f:
-                for line in f:
-                    if '"turn_context"' in line:
-                        try:
-                            d = json.loads(line)
-                        except Exception:
-                            continue
-                        payload = d.get("payload") if isinstance(d, dict) else {}
-                        if isinstance(payload, dict):
-                            model = str(payload.get("model") or model)
-                            effort = str(payload.get("effort") or effort)
-                            collab = payload.get("collaboration_mode") or {}
-                            settings = collab.get("settings") if isinstance(collab, dict) else {}
-                            if isinstance(settings, dict):
-                                model = str(settings.get("model") or model)
-                                effort = str(settings.get("reasoning_effort") or effort)
-                    elif '"token_count"' in line:
-                        try:
-                            d = json.loads(line)
-                        except Exception:
-                            continue
-                        payload = d.get("payload") if isinstance(d, dict) else {}
-                        if not isinstance(payload, dict) or payload.get("type") != "token_count":
-                            continue
-                        event_info = payload.get("info")
-                        if isinstance(event_info, dict):
-                            info = event_info
-                        event_rl = _codex_event_rate_limits(d)
-                        if isinstance(event_rl, dict):
-                            rate_limits = event_rl
-        except Exception:
-            pass
+        model, effort, info, rate_limits = _codex_session_status_from_file(fp, model, effort)
 
     last = info.get("last_token_usage") if isinstance(info, dict) else {}
     if not isinstance(last, dict):

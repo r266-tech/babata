@@ -527,6 +527,55 @@ def test_codex_status_prefers_live_app_server_limits(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
+def test_codex_status_snapshot_reads_collaboration_settings(monkeypatch, tmp_path):
+    session_file = tmp_path / "rollout-sid-2.jsonl"
+    session_file.write_text("\n".join([
+        "not json",
+        json.dumps({
+            "type": "turn_context",
+            "payload": {
+                "model": "base-model",
+                "effort": "low",
+                "collaboration_mode": {
+                    "settings": {
+                        "model": "gpt-5.5",
+                        "reasoning_effort": "xhigh",
+                    },
+                },
+            },
+        }),
+        json.dumps({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {"input_tokens": 1234},
+                    "model_context_window": 4096,
+                },
+            },
+            "rate_limits": {
+                "primary": {"used_percent": 10, "window_minutes": 300},
+            },
+        }),
+    ]))
+    monkeypatch.setattr(bot, "_codex_session_file", lambda sid: session_file)
+    monkeypatch.setattr(
+        bot,
+        "_codex_config",
+        lambda: {"model": "configured-model", "model_reasoning_effort": "medium"},
+    )
+
+    snap = bot._codex_status_snapshot("sid-2")
+
+    assert snap["model"] == "gpt-5.5"
+    assert snap["effort"] == "xhigh"
+    assert snap["configured_model"] == "configured-model"
+    assert snap["configured_effort"] == "medium"
+    assert snap["context_window"] == 4096
+    assert snap["context_used"] == 1234
+    assert snap["rate_limits"]["primary"]["used_percent"] == 10
+
+
 def test_claude_status_renders_provider_usage_snapshot(monkeypatch, tmp_path):
     async def run():
         reset_bot_globals(monkeypatch, tmp_path)
