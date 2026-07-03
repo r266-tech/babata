@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import sys
+from copy import deepcopy
 
 sys.dont_write_bytecode = True
 
@@ -27,81 +28,92 @@ SOCKET_PATH = "/tmp/babata-weixin-bridge.sock"
 server = Server("weixin")
 
 
+def _tool(
+    name: str,
+    description: str,
+    properties: dict,
+    required: list[str],
+) -> Tool:
+    return Tool(
+        name=name,
+        description=description,
+        inputSchema={
+            "type": "object",
+            "properties": deepcopy(properties),
+            "required": list(required),
+        },
+    )
+
+
+_WX_TOOL_SPECS = (
+    (
+        "wx_send_text",
+        (
+            "Send text to WeChat. Final-turn WeChat replies are auto-delivered; "
+            "use this additive tool only for mid-turn pushes, long-running "
+            "progress, or proactive sends."
+        ),
+        {"text": {"type": "string"}},
+        ["text"],
+    ),
+    (
+        "wx_send_image",
+        (
+            "Send a local image (jpg/png/gif/webp/bmp) to the user's WeChat. "
+            "Optional caption is sent as a separate TEXT message first."
+        ),
+        {
+            "path": {
+                "type": "string",
+                "description": "Absolute or ~-relative file path",
+            },
+            "caption": {"type": "string"},
+        },
+        ["path"],
+    ),
+    (
+        "wx_send_video",
+        "Send a local video file (mp4/mov/webm) to the user's WeChat.",
+        {
+            "path": {"type": "string"},
+            "caption": {"type": "string"},
+        },
+        ["path"],
+    ),
+    (
+        "wx_send_file",
+        (
+            "Send a local file as a WeChat file attachment (any type). "
+            "If file_name is omitted, the local file's basename is used."
+        ),
+        {
+            "path": {"type": "string"},
+            "file_name": {"type": "string"},
+            "caption": {"type": "string"},
+        },
+        ["path"],
+    ),
+    # wx_send_voice stays absent: iLink filters bot->user voice.
+    (
+        "wx_send_typing",
+        "Show/cancel WeChat typing indicator.",
+        {
+            "status": {
+                "type": "integer",
+                "enum": [1, 2],
+                "description": "1 = typing on, 2 = typing off",
+            },
+        },
+        ["status"],
+    ),
+)
+
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
-        Tool(
-            name="wx_send_text",
-            description=(
-                "Send text to WeChat. Final-turn WeChat replies are auto-delivered; "
-                "use this additive tool only for mid-turn pushes, long-running "
-                "progress, or proactive sends."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {"text": {"type": "string"}},
-                "required": ["text"],
-            },
-        ),
-        Tool(
-            name="wx_send_image",
-            description=(
-                "Send a local image (jpg/png/gif/webp/bmp) to the user's WeChat. "
-                "Optional caption is sent as a separate TEXT message first."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute or ~-relative file path"},
-                    "caption": {"type": "string"},
-                },
-                "required": ["path"],
-            },
-        ),
-        Tool(
-            name="wx_send_video",
-            description="Send a local video file (mp4/mov/webm) to the user's WeChat.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "caption": {"type": "string"},
-                },
-                "required": ["path"],
-            },
-        ),
-        Tool(
-            name="wx_send_file",
-            description=(
-                "Send a local file as a WeChat file attachment (any type). "
-                "If file_name is omitted, the local file's basename is used."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "file_name": {"type": "string"},
-                    "caption": {"type": "string"},
-                },
-                "required": ["path"],
-            },
-        ),
-        # wx_send_voice stays absent: iLink filters bot→user voice; bridge returns the verdict if called directly.
-        Tool(
-            name="wx_send_typing",
-            description="Show/cancel WeChat typing indicator.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "status": {
-                        "type": "integer",
-                        "enum": [1, 2],
-                        "description": "1 = typing on, 2 = typing off",
-                    },
-                },
-                "required": ["status"],
-            },
-        ),
+        _tool(name, description, properties, required)
+        for name, description, properties, required in _WX_TOOL_SPECS
     ]
 
 
