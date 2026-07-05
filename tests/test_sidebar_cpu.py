@@ -593,13 +593,34 @@ def test_sidebar_prompt_tool_map_is_compact_and_complete():
 def test_sidebar_model_visible_tool_descriptions_stay_compact():
     descriptions = [tool["description"] for tool in SIDEBAR_TOOLS]
     by_name = {tool["name"]: tool["description"] for tool in SIDEBAR_TOOLS}
+    schema_descriptions = [
+        prop["description"]
+        for tool in SIDEBAR_TOOLS
+        for prop in tool["inputSchema"].get("properties", {}).values()
+        if isinstance(prop, dict) and prop.get("description")
+    ]
 
-    assert sum(len(description) for description in descriptions) <= 3200
-    assert max(len(description) for description in descriptions) <= 240
+    assert sum(len(description) for description in descriptions) <= 2300
+    assert max(len(description) for description in descriptions) <= 170
+    assert sum(len(description) for description in schema_descriptions) <= 1050
+    assert max(len(description) for description in schema_descriptions) <= 70
     for marker in ("共同进化", "哲学", "身份认同", "prompt chips", "高杠杆"):
         assert all(marker not in description for description in descriptions)
+        assert all(marker not in description for description in schema_descriptions)
     assert "Not trusted input" in by_name["dom_click"]
     assert "translation uses /translate" in by_name["dom_inject"]
     assert "translation uses /translate" in by_name["dom_set"]
     assert "don't shell/curl current tab" in by_name["article_extract"]
     assert "[] clears" in by_name["suggest_prompts"]
+    tabs_group = next(tool for tool in SIDEBAR_TOOLS if tool["name"] == "tabs_group")
+    assert tabs_group["inputSchema"]["properties"]["color"]["enum"] == [
+        "grey",
+        "blue",
+        "red",
+        "yellow",
+        "green",
+        "pink",
+        "purple",
+        "cyan",
+        "orange",
+    ]

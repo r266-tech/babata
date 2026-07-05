@@ -9,11 +9,11 @@ from typing import Any
 _TARGET_FIELDS: dict[str, dict[str, Any]] = {
     "tab_id": {
         "type": "integer",
-        "description": "Target browser tab id from page_context. Prefer passing this for page tools.",
+        "description": "Target tab id from page_context.",
     },
     "window_id": {
         "type": "integer",
-        "description": "Target browser window id from page_context. Fallback when tab_id is unavailable.",
+        "description": "Fallback window id from page_context.",
     },
 }
 
@@ -27,9 +27,8 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "tab_metadata",
         "dispatch": "bridge",
         "description": (
-            "Read active/target tab meta: url, title, selection, scrollY, "
-            "docHeight, lang. No DOM text. Use first to confirm V's page; pass "
-            "tab_id/window_id to avoid active-tab races."
+            "Read tab meta only: url, title, selection, scroll/lang. No DOM "
+            "text. Use first to confirm V's page; pass tab_id/window_id."
         ),
         "inputSchema": {"type": "object", "properties": _target_props()},
     },
@@ -37,10 +36,9 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "dom_query",
         "dispatch": "bridge",
         "description": (
-            "querySelectorAll on target tab. Defaults: selector body, props "
-            "tag/text, limit 50; text cap 1500, html cap 2000. props: tag, id, "
-            "class, text, html, href, value, name, type, placeholder, rect, "
-            "attrs. root scopes inside an ancestor."
+            "querySelectorAll on target tab. Defaults selector=body, "
+            "props=tag/text, limit=50. Use props/root to narrow output; "
+            "text/html caps apply."
         ),
         "inputSchema": {
             "type": "object",
@@ -60,9 +58,8 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "dom_inject",
         "dispatch": "bridge",
         "description": (
-            "insertAdjacentHTML into matches. position: beforebegin, afterbegin, "
-            "beforeend default, afterend. Use only for V-requested annotations/UI "
-            "helpers; translation uses /translate. Returns {count}."
+            "insertAdjacentHTML into matches. Use only for V-requested "
+            "annotations/UI helpers; translation uses /translate. Returns {count}."
         ),
         "inputSchema": {
             "type": "object",
@@ -81,8 +78,8 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "dom_set",
         "dispatch": "bridge",
         "description": (
-            "Set input value, textContent, or attribute on matches; inputs fire "
-            "input/change. Use for form filling or explicit page edits; "
+            "Set input value, textContent, or attribute; inputs fire input/change. "
+            "Use for forms or explicit page edits; "
             "translation uses /translate. Returns {count}."
         ),
         "inputSchema": {
@@ -99,9 +96,8 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "dom_click",
         "dispatch": "bridge",
         "description": (
-            "Synthetic .click() on first match. Returns {ok}. Not trusted input; "
-            "captcha/OAuth buttons may refuse. Report that limit instead of "
-            "claiming real user input."
+            "Synthetic .click() on first match. Not trusted input; captcha/OAuth "
+            "may refuse. Report that limit instead of claiming real user input."
         ),
         "inputSchema": {
             "type": "object",
@@ -113,9 +109,8 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "page_snapshot",
         "dispatch": "bridge",
         "description": (
-            "Compact visible-page map for target tab: {snapshot_id, tab_id, "
-            "window_id, url, title, items, lines}. Items include ref, role, name, "
-            "selector, rect, is_new. Use before UI reasoning/clicking."
+            "Visible-page map: refs, roles, names, selectors, rects, lines. "
+            "Use before UI reasoning/clicking."
         ),
         "inputSchema": {
             "type": "object",
@@ -128,10 +123,8 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "article_extract",
         "dispatch": "bridge",
         "description": (
-            "Extract main readable content from current tab. Returns metadata, "
-            "paragraph ids, plain text with [pN], markdown, char_count, "
-            "extraction_method. Use for original page text; don't shell/curl "
-            "current tab."
+            "Extract readable article text from current tab: metadata, paragraph "
+            "ids, markdown/text. Use original page text; don't shell/curl current tab."
         ),
         "inputSchema": {"type": "object", "properties": _target_props()},
     },
@@ -139,9 +132,8 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "page_click_ref",
         "dispatch": "bridge",
         "description": (
-            "Click ref from page_snapshot on the same tab. Requires snapshot_id "
-            "and ref. Reuses stored selector, scrolls/focuses if possible, then "
-            "synthetic click. Returns {ok, selector, rect} or stale-ref."
+            "Click page_snapshot ref on the same tab. Requires snapshot_id/ref; "
+            "uses stored selector and returns stale-ref when invalid."
         ),
         "inputSchema": {
             "type": "object",
@@ -167,8 +159,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "dispatch": "translate",
         "description": (
             "Translate plain text to target_lang (default zh). Pure text: no DOM "
-            "read/inject/page side effect. Use for text translation or before "
-            "deciding how to answer."
+            "read/inject/page side effect."
         ),
         "inputSchema": {
             "type": "object",
@@ -183,8 +174,8 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "suggest_prompts",
         "dispatch": "notify",
         "description": (
-            "Push 1-2 short follow-up chips to sidepanel after reading/answering. "
-            "Use only when you can predict V's next move; [] clears."
+            "Push 1-2 short follow-up chips when V's next move is predictable; "
+            "[] clears."
         ),
         "inputSchema": {
             "type": "object",
@@ -192,7 +183,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
                 "prompts": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "1–2 high-leverage short prompts (under 20 chars each ideal)",
+                    "description": "1-2 short prompts; under 20 chars ideal",
                 },
             },
             "required": ["prompts"],
@@ -202,10 +193,8 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "mascot_speak",
         "dispatch": "notify",
         "description": (
-            "Show a short babata speech bubble on V's page. Interrupt only for a "
-            "real opinion, heads-up, or invitation. Keep <=40 zh chars; "
-            "auto-dismiss 30s; click opens sidebar. Pass tab_id/window_id when "
-            "known."
+            "Show <=40 zh char babata bubble for a real opinion, heads-up, or "
+            "invitation. Auto-dismiss 30s; pass tab_id/window_id when known."
         ),
         "inputSchema": {
             "type": "object",
@@ -219,8 +208,8 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "bookmarks_search",
         "dispatch": "bridge",
         "description": (
-            "Search V's bookmarks by free-text query (matches title/url). "
-            "Returns array of {id, title, url, parent_id, date_added}."
+            "Search V's bookmarks by title/url text. Returns id, title, url, "
+            "parent_id, date_added."
         ),
         "inputSchema": {
             "type": "object",
@@ -235,8 +224,8 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "bookmarks_tree",
         "dispatch": "bridge",
         "description": (
-            "Return bookmark folder tree (folders only, no leaf bookmarks). "
-            "Use to find an appropriate parent_id before bookmarks_create."
+            "Return bookmark folders only. Use before bookmarks_create when "
+            "choosing parent_id."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
@@ -244,8 +233,8 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "bookmarks_create",
         "dispatch": "bridge",
         "description": (
-            "Create a new bookmark. parent_id optional — defaults to top-level. "
-            "Use bookmarks_tree first to find a sensible folder."
+            "Create a bookmark. parent_id optional, top-level by default; use "
+            "bookmarks_tree when folder choice matters."
         ),
         "inputSchema": {
             "type": "object",
@@ -261,9 +250,8 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "tabs_query",
         "dispatch": "bridge",
         "description": (
-            "Query open tabs. Optional filters: active, audible, pinned, "
-            "current_window, url pattern. Returns {id, url, title, active, "
-            "audible, pinned, group_id, window_id, last_accessed}."
+            "Query open tabs with optional active/audible/pinned/current_window/"
+            "url filters. Returns tab identity, state, group, and last_accessed."
         ),
         "inputSchema": {
             "type": "object",
@@ -280,8 +268,8 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "tabs_close",
         "dispatch": "bridge",
         "description": (
-            "Close tabs by id list. Destructive — use after V's clear ask "
-            "('关掉所有包含关键词的 tabs') or after asking. Returns {closed: n}."
+            "Close tabs by id list. Destructive: use after V's clear ask or "
+            "after asking. Returns {closed: n}."
         ),
         "inputSchema": {
             "type": "object",
@@ -298,8 +286,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "tabs_group",
         "dispatch": "bridge",
         "description": (
-            "Group tabs into a (possibly named/colored) tab group. color enum: "
-            "grey/blue/red/yellow/green/pink/purple/cyan/orange. "
+            "Group tabs, optionally named/colored. color enum is in schema docs. "
             "Returns {group_id, count}."
         ),
         "inputSchema": {
@@ -310,7 +297,21 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
                     "items": {"type": "integer"},
                 },
                 "group_title": {"type": "string"},
-                "color": {"type": "string"},
+                "color": {
+                    "type": "string",
+                    "enum": [
+                        "grey",
+                        "blue",
+                        "red",
+                        "yellow",
+                        "green",
+                        "pink",
+                        "purple",
+                        "cyan",
+                        "orange",
+                    ],
+                    "description": "Tab group color",
+                },
             },
             "required": ["tab_ids"],
         },
@@ -320,8 +321,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "dispatch": "bridge",
         "description": (
             "Search browsing history by url/title text. start_ms/end_ms are unix "
-            "epoch ms (default 0..now). Returns {id, url, title, last_visit, "
-            "visit_count}."
+            "epoch ms; returns url, title, last_visit, visit_count."
         ),
         "inputSchema": {
             "type": "object",
