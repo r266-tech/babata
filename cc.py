@@ -984,8 +984,7 @@ class CC:
             if not turns:
                 continue
             recent = turns[-(2 * _RESUME_INJECT_PAIRS):]
-            lines = [f"{'V' if r == 'user' else 'CC'}: {t[:_RESUME_INJECT_CHARS]}"
-                     for r, t in recent]
+            lines = [f"{r}: {t[:_RESUME_INJECT_CHARS]}" for r, t in recent]
             return "会话从历史归档恢复, 最近几轮:\n" + "\n".join(lines)
         return ""
 

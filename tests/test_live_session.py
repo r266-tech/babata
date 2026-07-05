@@ -405,6 +405,10 @@ def test_live_session_resume_failure_reconnects_and_replays(monkeypatch, tmp_pat
         await wait_for(lambda: len(second.sent) == 1)
         assert second.options.resume is None
         assert "会话从历史归档恢复" in second.options.system_prompt
+        assert "user: old question" in second.options.system_prompt
+        assert "assistant: old answer" in second.options.system_prompt
+        assert "V: old question" not in second.options.system_prompt
+        assert "CC: old answer" not in second.options.system_prompt
         assert second.sent[0]["message"]["content"] == "new question"
 
         second.receive_queue.put_nowait(result("fresh-session", "fresh answer"))
