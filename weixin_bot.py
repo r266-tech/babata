@@ -860,6 +860,12 @@ async def _query_wx_turn_with_recovery(
 
 
 async def _replay_wx_final_if_needed(coalescer: WxStreamCoalescer, final: str) -> bool:
+    """Ensure final content is visible when streaming did not deliver it safely.
+
+    WeChat has no edit-message. If streaming already sent clean bubbles, keep
+    them. If streaming sent nothing or lost chunks mid-stream, replay
+    resp.content as the fallback visible answer.
+    """
     if not coalescer.had_send_failure and coalescer.sent_any:
         return True
     if final:
@@ -906,16 +912,9 @@ async def _process_combined_msgs(
     if resp is None:
         return False
 
-    # End-of-stream drain — allow_hard_cut=True ships everything still in
-    # buf even if no safe boundary exists (rare: nothing more is coming).
+    # End-of-stream drain: ship any held tail now that nothing more is coming.
     await coalescer.drain(allow_hard_cut=True)
 
-    # Rebroadcast resp.content when:
-    # - had_send_failure: chunks were permanently lost mid-stream; resending
-    #   is the only path V sees them (wx has no edit-message). May dup
-    #   already-shipped bubbles but visible > missing.
-    # - not sent_any: streaming produced no chunks (CC output came only via
-    #   resp.content, not deltas).
     if not await _replay_wx_final_if_needed(coalescer, resp.content or ""):
         return False
 

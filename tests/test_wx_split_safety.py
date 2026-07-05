@@ -357,6 +357,60 @@ def test_wx_stream_coalescer_tracks_send_failure():
     asyncio.run(run())
 
 
+def test_wx_final_replay_skips_when_stream_already_sent_cleanly():
+    sent: list[str] = []
+
+    async def send_bubble(text):
+        sent.append(text)
+        return wb.WxBubbleSendResult(sent_any=bool(text), ok=True)
+
+    async def run():
+        coalescer = wb.WxStreamCoalescer(send_bubble)
+        coalescer.sent_any = True
+        coalescer.had_send_failure = False
+
+        ok = await wb._replay_wx_final_if_needed(coalescer, "final")
+
+        assert ok is True
+        assert sent == []
+
+    asyncio.run(run())
+
+
+def test_wx_final_replay_sends_final_when_stream_was_empty():
+    sent: list[str] = []
+
+    async def send_bubble(text):
+        sent.append(text)
+        return wb.WxBubbleSendResult(sent_any=bool(text), ok=True)
+
+    async def run():
+        coalescer = wb.WxStreamCoalescer(send_bubble)
+
+        ok = await wb._replay_wx_final_if_needed(coalescer, "first\n\n\nsecond")
+
+        assert ok is True
+        assert sent == ["first", "second"]
+        assert coalescer.had_send_failure is False
+
+    asyncio.run(run())
+
+
+def test_wx_final_replay_reports_unrecoverable_send_failure_without_final():
+    async def send_bubble(_text):
+        raise AssertionError("should not send without final")
+
+    async def run():
+        coalescer = wb.WxStreamCoalescer(send_bubble)
+        coalescer.had_send_failure = True
+
+        ok = await wb._replay_wx_final_if_needed(coalescer, "")
+
+        assert ok is False
+
+    asyncio.run(run())
+
+
 # ── strip_markdown: fenced code body must survive ───────────────────
 
 
