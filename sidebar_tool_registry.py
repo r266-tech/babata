@@ -28,7 +28,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "dispatch": "bridge",
         "description": (
             "Read tab meta only: url, title, selection, scroll/lang. No DOM "
-            "text. Use first to confirm V's page; pass tab_id/window_id."
+            "text. Use first to confirm target page; pass tab_id/window_id."
         ),
         "inputSchema": {"type": "object", "properties": _target_props()},
     },
@@ -58,7 +58,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "dom_inject",
         "dispatch": "bridge",
         "description": (
-            "insertAdjacentHTML into matches. Use only for V-requested "
+            "insertAdjacentHTML into matches. Use only for explicitly requested "
             "annotations/UI helpers; translation uses /translate. Returns {count}."
         ),
         "inputSchema": {
@@ -174,7 +174,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "suggest_prompts",
         "dispatch": "notify",
         "description": (
-            "Push 1-2 short follow-up chips when V's next move is predictable; "
+            "Push 1-2 short follow-up chips when the next move is predictable; "
             "[] clears."
         ),
         "inputSchema": {
@@ -208,7 +208,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "bookmarks_search",
         "dispatch": "bridge",
         "description": (
-            "Search V's bookmarks by title/url text. Returns id, title, url, "
+            "Search bookmarks by title/url text. Returns id, title, url, "
             "parent_id, date_added."
         ),
         "inputSchema": {
@@ -268,7 +268,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "tabs_close",
         "dispatch": "bridge",
         "description": (
-            "Close tabs by id list. Destructive: use after V's clear ask or "
+            "Close tabs by id list. Destructive: use after explicit clear ask or "
             "after asking. Returns {closed: n}."
         ),
         "inputSchema": {

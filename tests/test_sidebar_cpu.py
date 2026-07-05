@@ -604,7 +604,15 @@ def test_sidebar_model_visible_tool_descriptions_stay_compact():
     assert max(len(description) for description in descriptions) <= 170
     assert sum(len(description) for description in schema_descriptions) <= 1050
     assert max(len(description) for description in schema_descriptions) <= 70
-    for marker in ("共同进化", "哲学", "身份认同", "prompt chips", "高杠杆"):
+    for marker in (
+        "共同进化",
+        "哲学",
+        "身份认同",
+        "prompt chips",
+        "高杠杆",
+        "V's",
+        "V-requested",
+    ):
         assert all(marker not in description for description in descriptions)
         assert all(marker not in description for description in schema_descriptions)
     assert "Not trusted input" in by_name["dom_click"]
