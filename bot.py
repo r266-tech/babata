@@ -4989,6 +4989,41 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _process(update, ctx, update.message.text)
 
 
+def _consume_voice_clone_pending(file_id: str) -> Path | None:
+    """Atomically consume a pending voice-clone request and return a WAV target."""
+    pending = STATE_DIR / f"voice-clone-pending-{INSTANCE}.json"
+    try:
+        meta = json.loads(pending.read_text())
+    except FileNotFoundError:
+        return None
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("voice-clone state malformed: %s", e)
+        return None
+
+    if meta.get("expires_at", 0) <= time.time():
+        try:
+            pending.unlink(missing_ok=True)
+        except OSError as e:
+            log.warning("voice-clone stale state cleanup failed: %s", e)
+        return None
+
+    consumed = pending.with_suffix(".json.consumed")
+    try:
+        pending.rename(consumed)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        log.warning("voice-clone state consume failed: %s", e)
+        return None
+
+    keep_wav = Path(f"/tmp/voice-clone-{INSTANCE}-{file_id}.wav")
+    try:
+        consumed.unlink(missing_ok=True)
+    except OSError as e:
+        log.warning("voice-clone consumed state cleanup failed: %s", e)
+    return keep_wav
+
+
 async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
         return
@@ -5000,28 +5035,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     path = Path(f"/tmp/voice_{voice.file_id}.ogg")
     await file.download_to_drive(path)
 
-    # voice-clone skill: 检测 pending state, 让 CC 拿到 wav 路径做声音克隆.
-    # state 文件按 BABATA_INSTANCE 隔离 (4 launchd 实例不串). 含 expires_at
-    # TTL + atomic rename consume 防 race + JSON 校验防 partial state.
-    voice_clone_state = STATE_DIR / f"voice-clone-pending-{INSTANCE}.json"
-    keep_wav: Path | None = None
-    if voice_clone_state.exists():
-        try:
-            import json as _json
-            meta = _json.loads(voice_clone_state.read_text())
-            if meta.get("expires_at", 0) > time.time():
-                # atomic consume: rename → 仅一个 handler 拿到 wav (FileNotFoundError = race lose)
-                consumed = voice_clone_state.with_suffix(".json.consumed")
-                try:
-                    voice_clone_state.rename(consumed)
-                    keep_wav = Path(f"/tmp/voice-clone-{INSTANCE}-{voice.file_id}.wav")
-                    consumed.unlink(missing_ok=True)
-                except FileNotFoundError:
-                    pass  # 别的 handler 抢到了
-            else:
-                voice_clone_state.unlink(missing_ok=True)  # stale, 自清
-        except (_json.JSONDecodeError, OSError) as _e:
-            log.warning("voice-clone state malformed: %s", _e)
+    keep_wav = _consume_voice_clone_pending(voice.file_id)
 
     try:
         text = await transcribe_voice(path, keep_wav=keep_wav)

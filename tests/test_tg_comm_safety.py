@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import inspect
 import json
 import os
 import sys
@@ -18,6 +19,80 @@ os.environ.setdefault("ALLOWED_USER_ID", "0")
 import bot
 import bridge as tg_bridge
 import tg_mcp
+
+
+def test_tg_voice_clone_pending_consumes_valid_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(bot, "INSTANCE", "test")
+    monkeypatch.setattr(bot.time, "time", lambda: 10)
+    state_file = tmp_path / "voice-clone-pending-test.json"
+    state_file.write_text(json.dumps({"expires_at": 20}), encoding="utf-8")
+
+    keep_wav = bot._consume_voice_clone_pending("voice-file")
+
+    assert keep_wav == Path("/tmp/voice-clone-test-voice-file.wav")
+    assert not state_file.exists()
+    assert not state_file.with_suffix(".json.consumed").exists()
+
+
+def test_tg_voice_clone_pending_drops_stale_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(bot, "INSTANCE", "test")
+    monkeypatch.setattr(bot.time, "time", lambda: 10)
+    state_file = tmp_path / "voice-clone-pending-test.json"
+    state_file.write_text(json.dumps({"expires_at": 9}), encoding="utf-8")
+
+    keep_wav = bot._consume_voice_clone_pending("voice-file")
+
+    assert keep_wav is None
+    assert not state_file.exists()
+
+
+def test_tg_voice_clone_pending_ignores_missing_or_malformed_state(tmp_path, caplog, monkeypatch):
+    monkeypatch.setattr(bot, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(bot, "INSTANCE", "test")
+    monkeypatch.setattr(bot.time, "time", lambda: 10)
+    assert bot._consume_voice_clone_pending("voice-file") is None
+
+    malformed = tmp_path / "voice-clone-pending-test.json"
+    malformed.write_text("{", encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        keep_wav = bot._consume_voice_clone_pending("voice-file")
+
+    assert keep_wav is None
+    assert malformed.exists()
+    assert "voice-clone state malformed" in caplog.text
+
+
+def test_tg_voice_clone_pending_consume_failure_is_soft(tmp_path, caplog, monkeypatch):
+    monkeypatch.setattr(bot, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(bot, "INSTANCE", "test")
+    monkeypatch.setattr(bot.time, "time", lambda: 10)
+    state_file = tmp_path / "voice-clone-pending-test.json"
+    state_file.write_text(json.dumps({"expires_at": 20}), encoding="utf-8")
+
+    def fail_rename(self: Path, target: Path):
+        if self == state_file:
+            raise OSError("rename failed")
+        return original_rename(self, target)
+
+    original_rename = Path.rename
+    monkeypatch.setattr(Path, "rename", fail_rename)
+
+    with caplog.at_level("WARNING"):
+        keep_wav = bot._consume_voice_clone_pending("voice-file")
+
+    assert keep_wav is None
+    assert state_file.exists()
+    assert "voice-clone state consume failed" in caplog.text
+
+
+def test_tg_voice_clone_pending_logic_stays_out_of_handler():
+    source = inspect.getsource(bot.on_voice)
+
+    assert "_consume_voice_clone_pending" in source
+    assert "json.loads" not in source
+    assert "voice-clone-pending" not in source
 
 
 def _split_bodies(parts: list[str]) -> list[str]:
