@@ -27,6 +27,49 @@ def test_default_memory_source_uses_env_not_prompt(monkeypatch):
     assert memory_runtime.default_memory_source() == "terminal"
 
 
+def test_memory_inject_enabled_is_owned_by_runtime(monkeypatch):
+    for name in (
+        "BABATA_CC_MEMORY_INJECT",
+        "BABATA_CODEX_MEMORY_INJECT",
+        "BABATA_CRON_AGENT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert memory_runtime.memory_inject_enabled("claude") is True
+    assert memory_runtime.memory_inject_enabled("codex") is True
+
+    monkeypatch.setenv("BABATA_CC_MEMORY_INJECT", "0")
+    assert memory_runtime.memory_inject_enabled("claude") is False
+    assert memory_runtime.memory_inject_enabled("codex") is True
+
+    monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "0")
+    assert memory_runtime.memory_inject_enabled("codex") is False
+
+    monkeypatch.setenv("BABATA_CRON_AGENT", "1")
+    assert memory_runtime.memory_inject_enabled("claude") is False
+    assert memory_runtime.memory_inject_enabled("codex") is False
+
+
+def test_memory_inject_timeout_is_owned_by_runtime(monkeypatch):
+    for name in (
+        "BABATA_CC_MEMORY_INJECT_TIMEOUT",
+        "BABATA_CODEX_MEMORY_INJECT_TIMEOUT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert memory_runtime.memory_inject_timeout("claude") == 5.0
+    assert memory_runtime.memory_inject_timeout("codex") == 5.0
+
+    monkeypatch.setenv("BABATA_CC_MEMORY_INJECT_TIMEOUT", "2.5")
+    monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT_TIMEOUT", "0")
+
+    assert memory_runtime.memory_inject_timeout("claude") == 2.5
+    assert memory_runtime.memory_inject_timeout("codex") == 0.1
+
+    monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT_TIMEOUT", "bad")
+    assert memory_runtime.memory_inject_timeout("codex") == 5.0
+
+
 def test_memory_reflex_is_opt_in(monkeypatch):
     monkeypatch.delenv("BABATA_MEMORY_REFLEX", raising=False)
     monkeypatch.setenv("BABATA_MEMORY_REFLEX_MODE", "enforce")
@@ -290,6 +333,9 @@ def test_memory_runtime_owns_shared_reflex_helpers():
     cc_source = Path(cc.__file__).read_text(encoding="utf-8")
     codex_source = Path(codex_engine.__file__).read_text(encoding="utf-8")
     forbidden = (
+        "def _cc_memory_inject_enabled",
+        "def _codex_memory_inject_enabled",
+        "def _memory_inject_timeout",
         "_DEFAULT_MEMORY_REFLEX_LOG",
         "def _memory_source_from_prompt",
         "def _memory_reflex_for_prompt",

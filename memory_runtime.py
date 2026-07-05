@@ -16,6 +16,14 @@ log = logging.getLogger(__name__)
 _DEFAULT_MEMORY_INJECT_SCRIPT = Path.home() / "cc-workspace/scripts/memory-inject.sh"
 _DEFAULT_MEMORY_REFLEX_SCRIPT = Path.home() / "cc-workspace/bin/babata-memory-reflex"
 _DEFAULT_MEMORY_REFLEX_LOG = Path.home() / "cc-workspace/state/memory-reflex/events.jsonl"
+_MEMORY_INJECT_FLAGS = {
+    "claude": "BABATA_CC_MEMORY_INJECT",
+    "codex": "BABATA_CODEX_MEMORY_INJECT",
+}
+_MEMORY_INJECT_TIMEOUTS = {
+    "claude": "BABATA_CC_MEMORY_INJECT_TIMEOUT",
+    "codex": "BABATA_CODEX_MEMORY_INJECT_TIMEOUT",
+}
 
 
 def memory_inject_script() -> Path:
@@ -49,6 +57,22 @@ def memory_reflex_timeout() -> float:
 
 def default_memory_source() -> str:
     return os.environ.get("BABATA_MEMORY_SOURCE") or "unknown"
+
+
+def memory_inject_enabled(cpu: str) -> bool:
+    if os.environ.get("BABATA_CRON_AGENT") == "1":
+        return False
+    env_name = _MEMORY_INJECT_FLAGS[cpu]
+    return os.environ.get(env_name, "1") != "0"
+
+
+def memory_inject_timeout(cpu: str) -> float:
+    env_name = _MEMORY_INJECT_TIMEOUTS[cpu]
+    raw = os.environ.get(env_name, "5")
+    try:
+        return max(0.1, float(raw))
+    except ValueError:
+        return 5.0
 
 
 def memory_reflex_for_prompt(

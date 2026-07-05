@@ -30,6 +30,8 @@ from cc import CC, Event, Response, StreamCB, _record_session_metadata
 from memory_runtime import (
     log_memory_reflex_preflight_only,
     log_memory_reflex_post_answer,
+    memory_inject_enabled,
+    memory_inject_timeout,
     memory_reflex_mode,
     render_babata_memory_context_event,
 )
@@ -137,30 +139,18 @@ def _codex_cwd(source: str | None = None) -> str:
     return str(Path(__file__).parent)
 
 
-def _codex_memory_inject_enabled() -> bool:
-    return os.environ.get("BABATA_CODEX_MEMORY_INJECT", "1") != "0"
-
-
-def _memory_inject_timeout() -> float:
-    raw = os.environ.get("BABATA_CODEX_MEMORY_INJECT_TIMEOUT", "5")
-    try:
-        return max(0.1, float(raw))
-    except ValueError:
-        return 5.0
-
-
 def _render_babata_memory_context_event(
     source: str | None = None,
     user_prompt: str | None = None,
 ) -> tuple[str, str | None]:
     source_name = source or "unknown"
     return render_babata_memory_context_event(
-        enabled=_codex_memory_inject_enabled(),
+        enabled=memory_inject_enabled("codex"),
         source=source_name,
         user_prompt=user_prompt,
         cpu="codex",
         cwd=_codex_cwd(source_name),
-        timeout=_memory_inject_timeout(),
+        timeout=memory_inject_timeout("codex"),
     )
 
 
@@ -641,9 +631,7 @@ class CodexEngine(CC):
         return "\n\n".join(parts)
 
     def _should_inject_codex_memory(self) -> bool:
-        if not _codex_memory_inject_enabled():
-            return False
-        if os.environ.get("BABATA_CRON_AGENT") == "1":
+        if not memory_inject_enabled("codex"):
             return False
         if memory_reflex_mode() == "enforce":
             return True

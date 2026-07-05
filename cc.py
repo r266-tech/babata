@@ -62,6 +62,8 @@ from constants import (
 from memory_runtime import (
     default_memory_source,
     log_memory_reflex_post_answer,
+    memory_inject_enabled,
+    memory_inject_timeout,
     render_babata_memory_context_event,
 )
 from skill_evolve_nudge import notify_skill_evolve_turn
@@ -520,31 +522,17 @@ def _record_session_metadata(
     state["recent_sids"] = hist[:recent_limit]
 
 
-def _cc_memory_inject_enabled() -> bool:
-    if os.environ.get("BABATA_CRON_AGENT") == "1":
-        return False
-    return os.environ.get("BABATA_CC_MEMORY_INJECT", "1") != "0"
-
-
-def _memory_inject_timeout() -> float:
-    raw = os.environ.get("BABATA_CC_MEMORY_INJECT_TIMEOUT", "5")
-    try:
-        return max(0.1, float(raw))
-    except ValueError:
-        return 5.0
-
-
 def _render_babata_memory_context_event(
     source: str,
     user_prompt: str | None = None,
 ) -> tuple[str, str | None]:
     return render_babata_memory_context_event(
-        enabled=_cc_memory_inject_enabled(),
+        enabled=memory_inject_enabled("claude"),
         source=source,
         user_prompt=user_prompt,
         cpu="claude",
         cwd=_DEFAULT_CWD,
-        timeout=_memory_inject_timeout(),
+        timeout=memory_inject_timeout("claude"),
     )
 
 
