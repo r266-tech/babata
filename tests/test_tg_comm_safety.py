@@ -232,7 +232,14 @@ def test_tg_mcp_schema_helper_keeps_tool_contracts():
         "tg_send_page",
     ]
     assert sum(len(description) for description in descriptions) <= 730
-    assert sum(len(description) for description in schema_descriptions) <= 600
+    assert sum(len(description) for description in schema_descriptions) <= 420
+    assert max(len(description) for description in schema_descriptions) <= 45
+    voice = tools["tg_send_voice"].inputSchema["properties"]
+    page = tools["tg_send_page"].inputSchema["properties"]
+    assert voice["text"]["description"] == "Text to speak"
+    assert voice["voice"]["description"] == "Optional backend voice id"
+    assert page["content_md"]["description"] == "Markdown body; do NOT repeat title"
+    assert page["caption"]["description"] == "Optional text above URL"
     for marker in ("the user's", "to the user"):
         assert all(marker not in description for description in descriptions)
     required = {

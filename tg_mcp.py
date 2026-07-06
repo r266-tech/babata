@@ -171,10 +171,10 @@ _TG_TOOL_SPECS = (
         "tg_send_voice",
         _voice_description,
         {
-            "text": {"type": "string", "description": "Text to speak (with optional markup)"},
+            "text": {"type": "string", "description": "Text to speak"},
             "voice": {
                 "type": "string",
-                "description": "Optional voice identifier (backend-specific, e.g. nova/mimo_default/zh-CN-XiaoxiaoNeural)",
+                "description": "Optional backend voice id",
             },
             "instance": INSTANCE_SCHEMA,
         },
@@ -203,11 +203,11 @@ _TG_TOOL_SPECS = (
             },
             "content_md": {
                 "type": "string",
-                "description": "Markdown body. Do NOT repeat the title inside; the page already shows it.",
+                "description": "Markdown body; do NOT repeat title",
             },
             "caption": {
                 "type": "string",
-                "description": "Optional short text placed above the URL in the TG message (e.g. a one-line summary)",
+                "description": "Optional text above URL",
             },
             "instance": INSTANCE_SCHEMA,
         },
