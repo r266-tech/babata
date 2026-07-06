@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Block local private strings from reaching the public repo.
-# Two modes — chosen by explicit flag, NOT stdin TTY heuristics (CI shells
+# Modes are chosen by explicit flag, NOT stdin TTY heuristics (CI shells
 # also lack a TTY, which would silently put us in range-mode reading empty
 # stdin and pass everything):
 #   - default: scan tracked files in working tree (CI / manual run)
 #   - --pre-push: read git pre-push protocol from stdin, patch-scan each
 #     commit in the push range. Catches "add PII → commit → delete from
 #     worktree → push" — the added line lives in the bad commit's patch.
+#   - --history: patch-scan all reachable commits; run before publishing a
+#     repository whose history may be exposed.
 #
 # Forks: keep generic patterns here. Put machine-private regexes in
 # .git/info/babata-leak-patterns or set BABATA_LEAK_GUARD_PATTERNS to another
@@ -15,13 +17,19 @@
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO_DIR"
+cd "$REPO_DIR" || exit 1
 
 SCAN_MODE="tree"
-if [ "${1:-}" = "--pre-push" ]; then
-    SCAN_MODE="range"
-    shift
-fi
+case "${1:-}" in
+    --pre-push)
+        SCAN_MODE="range"
+        shift
+        ;;
+    --history)
+        SCAN_MODE="history"
+        shift
+        ;;
+esac
 
 FIXED_BLACKLIST=()
 REGEX_BLACKLIST=()
@@ -66,22 +74,22 @@ scan_revs() {
     [ -z "$added" ] && return
 
     [ ${#FIXED_BLACKLIST[@]} -eq 0 ] && [ ${#REGEX_BLACKLIST[@]} -eq 0 ] && return
-    local p
-    for p in "${FIXED_BLACKLIST[@]}"; do
-        local matches
+    local i p matches
+    for i in "${!FIXED_BLACKLIST[@]}"; do
+        p="${FIXED_BLACKLIST[$i]}"
         matches=$(echo "$added" | grep -nF -- "$p" || true)
         if [ -n "$matches" ]; then
-            echo "✗ leak: '$p' [$context]"
-            echo "$matches" | sed 's/^/    /'
+            echo "✗ leak: fixed pattern #$((i + 1)) [$context]"
+            echo "$matches" | sed -E 's/^([0-9]+):.*$/    patch-line \1: <redacted>/'
             HITS=$((HITS + 1))
         fi
     done
-    for p in "${REGEX_BLACKLIST[@]}"; do
-        local matches
+    for i in "${!REGEX_BLACKLIST[@]}"; do
+        p="${REGEX_BLACKLIST[$i]}"
         matches=$(echo "$added" | grep -nE -- "$p" || true)
         if [ -n "$matches" ]; then
-            echo "✗ leak: '$p' [$context]"
-            echo "$matches" | sed 's/^/    /'
+            echo "✗ leak: regex pattern #$((i + 1)) [$context]"
+            echo "$matches" | sed -E 's/^([0-9]+):.*$/    patch-line \1: <redacted>/'
             HITS=$((HITS + 1))
         fi
     done
@@ -89,29 +97,29 @@ scan_revs() {
 
 scan_tree() {
     [ ${#FIXED_BLACKLIST[@]} -eq 0 ] && [ ${#REGEX_BLACKLIST[@]} -eq 0 ] && return
-    local p
-    for p in "${FIXED_BLACKLIST[@]}"; do
-        local matches
+    local i p matches
+    for i in "${!FIXED_BLACKLIST[@]}"; do
+        p="${FIXED_BLACKLIST[$i]}"
         matches=$(git grep -n -I -F -e "$p" -- "${PATHSPEC[@]}" 2>/dev/null || true)
         if [ -n "$matches" ]; then
-            echo "✗ leak: '$p'"
-            echo "$matches" | sed 's/^/    /'
+            echo "✗ leak: fixed pattern #$((i + 1))"
+            echo "$matches" | sed -E 's/^([^:]+:[0-9]+):.*$/    \1: <redacted>/'
             HITS=$((HITS + 1))
         fi
     done
-    for p in "${REGEX_BLACKLIST[@]}"; do
-        local matches
+    for i in "${!REGEX_BLACKLIST[@]}"; do
+        p="${REGEX_BLACKLIST[$i]}"
         matches=$(git grep -n -I -E -e "$p" -- "${PATHSPEC[@]}" 2>/dev/null || true)
         if [ -n "$matches" ]; then
-            echo "✗ leak: '$p'"
-            echo "$matches" | sed 's/^/    /'
+            echo "✗ leak: regex pattern #$((i + 1))"
+            echo "$matches" | sed -E 's/^([^:]+:[0-9]+):.*$/    \1: <redacted>/'
             HITS=$((HITS + 1))
         fi
     done
 }
 
 if [ "$SCAN_MODE" = "range" ]; then
-    while read -r local_ref local_sha remote_ref remote_sha; do
+    while read -r local_ref local_sha _remote_ref remote_sha; do
         # Empty line / branch deletion (local_sha == zero) → skip
         [ -z "${local_sha:-}" ] && continue
         [ "$local_sha" = "$ZERO_SHA" ] && continue
@@ -127,6 +135,11 @@ if [ "$SCAN_MODE" = "range" ]; then
         for c in $commits; do
             scan_revs "$c" "${c:0:7} on ${local_ref##refs/heads/}"
         done
+    done
+elif [ "$SCAN_MODE" = "history" ]; then
+    commits=$(git rev-list --all 2>/dev/null)
+    for c in $commits; do
+        scan_revs "$c" "${c:0:7} history"
     done
 else
     scan_tree
