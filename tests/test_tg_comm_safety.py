@@ -149,9 +149,14 @@ def test_tg_handler_registration_keeps_transcript_sources_centralized():
 
 def test_tg_mcp_tool_descriptions_stay_operational():
     tools = {tool.name: tool for tool in asyncio.run(tg_mcp.list_tools())}
+    buttons = tools["tg_send_buttons"]
     text = tools["tg_send_text"]
     page = tools["tg_send_page"]
     voice = tools["tg_send_voice"]
+
+    assert len(buttons.description) <= 125
+    for marker in ("interactive buttons", "string callback", "{label,url}", "Links sent"):
+        assert marker in buttons.description
 
     assert len(text.description) <= 180
     for marker in ("Telegram", "auto-delivered", "mid-turn pushes", "long-running progress", "proactive sends"):
@@ -164,7 +169,7 @@ def test_tg_mcp_tool_descriptions_stay_operational():
     ):
         assert marker not in text.description
 
-    assert len(page.description) <= 240
+    assert len(page.description) <= 135
     for marker in ("Telegraph", "markdown", "long structured", "TG inline HTML", "returns the Telegraph URL"):
         assert marker in page.description
     for marker in ("Instant View card", "syntax-highlighted", "<ul>/<ol>", "h3/h4", "unsupported elements"):
@@ -226,6 +231,7 @@ def test_tg_mcp_schema_helper_keeps_tool_contracts():
         "tg_send_video",
         "tg_send_page",
     ]
+    assert sum(len(description) for description in descriptions) <= 730
     assert sum(len(description) for description in schema_descriptions) <= 600
     for marker in ("the user's", "to the user"):
         assert all(marker not in description for description in descriptions)

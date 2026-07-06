@@ -91,9 +91,8 @@ _TG_TOOL_SPECS = (
     (
         "tg_send_buttons",
         (
-            "Present interactive buttons. Each option is either a label string "
-            "(callback) or {label, url} (opens link). Returns the callback label "
-            "clicked, or 'Links sent' if all are URL buttons."
+            "Send interactive buttons: string callback or {label,url} link. "
+            "Returns clicked label, or 'Links sent' for URL-only."
         ),
         {
             "text": {"type": "string", "description": "Message above buttons"},
@@ -194,9 +193,8 @@ _TG_TOOL_SPECS = (
     (
         "tg_send_page",
         (
-            "Publish a Telegraph page from markdown and send its URL to TG. "
-            "Use for long structured replies, code-heavy content, or output that TG inline HTML "
-            "cannot render cleanly. content_md accepts standard markdown; returns the Telegraph URL."
+            "Publish Telegraph page from markdown for long structured/code-heavy "
+            "content TG inline HTML cannot render; returns the Telegraph URL."
         ),
         {
             "title": {
