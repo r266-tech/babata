@@ -41,7 +41,7 @@ TG_INSTANCES = [k for k in INSTANCE_LABELS if k != "weixin"]
 INSTANCE_SCHEMA = {
     "type": "string",
     "enum": TG_INSTANCES,
-    "description": "Optional TG bot selector. Omit to send via this MCP server's bound channel.",
+    "description": "Optional TG bot selector.",
 }
 
 
