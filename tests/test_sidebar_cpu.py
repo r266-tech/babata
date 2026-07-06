@@ -1,12 +1,15 @@
 import asyncio
 import base64
+import hashlib
 import json
 import os
+import time
 import uuid
 from pathlib import Path
 
 import cc as cc_module
 import sidebar_bot
+import sidebar_events
 from sidebar_tool_registry import SIDEBAR_TOOLS, prompt_tool_lines
 
 
@@ -402,8 +405,10 @@ def test_sidebar_user_turn_records_event_history_and_boundary(monkeypatch):
     sidebar_bot._record_sidebar_user_turn("/new", chat_input)
 
     assert events == [
-        (("https://x.test", "chat_turn"), {"message": "hello"}),
-        (("https://x.test", "chat_turn"), {"message": "/new"}),
+        (("https://x.test", "chat_turn"), {
+            "message_sha256": hashlib.sha256(b"hello").hexdigest(),
+            "message_bytes": 5,
+        }),
     ]
     assert history == [
         (("user", "hello"), {
@@ -414,6 +419,26 @@ def test_sidebar_user_turn_records_event_history_and_boundary(monkeypatch):
         }),
     ]
     assert boundaries == ["boundary"]
+
+
+def test_sidebar_page_memory_omits_user_message_preview():
+    now = int(time.time())
+    line = sidebar_events._format_page_memory(
+        [
+            {
+                "ts": now,
+                "kind": "chat_turn",
+                "message_sha256": hashlib.sha256("secret question".encode()).hexdigest(),
+                "message_bytes": len("secret question".encode()),
+            },
+        ],
+        now,
+    )
+
+    assert "1 chat turns" in line
+    assert "15 bytes" not in line
+    assert "secret question" not in line
+    assert "last said" not in line
 
 
 def test_sidebar_assistant_turn_records_only_completed_response(monkeypatch):

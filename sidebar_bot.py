@@ -18,6 +18,7 @@ Shared identity, philosophy, and memory stay in the shared runtime context.
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import os
@@ -1353,15 +1354,17 @@ async def _build_sidebar_chat_input(data: dict[str, Any], message: str) -> Sideb
 
 
 def _record_sidebar_user_turn(message: str, chat_input: SidebarChatInput) -> None:
-    if chat_input.chat_url:
-        sidebar_events.append(
-            chat_input.chat_url,
-            "chat_turn",
-            message=message[:500],
-        )
     if message.strip() == "/new":
         sidebar_history.boundary()
         return
+    if chat_input.chat_url:
+        message_bytes = len(message.encode("utf-8"))
+        sidebar_events.append(
+            chat_input.chat_url,
+            "chat_turn",
+            message_sha256=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+            message_bytes=message_bytes,
+        )
     sidebar_history.append(
         "user",
         message,

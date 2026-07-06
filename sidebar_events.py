@@ -139,18 +139,11 @@ def _format_page_memory(events: list[dict], now: int) -> str:
     n_chat = sum(1 for e in events if e.get("kind") == "chat_turn")
     n_proactive = sum(1 for e in events if e.get("kind") == "proactive_run")
 
-    last_chat = next(
-        (e for e in reversed(events) if e.get("kind") == "chat_turn"), None,
-    )
-
     parts = [f"last activity {age_label} ago"]
     if n_translate:
         parts.append(f"{n_translate} translate events")
     if n_chat:
         parts.append(f"{n_chat} chat turns")
-        if last_chat and last_chat.get("message"):
-            preview = str(last_chat["message"])[:80].replace("\n", " ")
-            parts.append(f'last said: "{preview}"')
     if n_proactive:
         parts.append(f"{n_proactive} proactive runs")
 
