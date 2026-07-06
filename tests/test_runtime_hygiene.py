@@ -33,6 +33,14 @@ def test_auto_update_has_single_canonical_implementation():
     assert 'addopts = "-p no:cacheprovider"' in pyproject_text
 
 
+def test_pytest_hygiene_removes_local_cache_artifacts():
+    repo = Path(__file__).resolve().parents[1]
+    conftest_text = (repo / "tests" / "conftest.py").read_text(encoding="utf-8")
+    assert "sys.dont_write_bytecode = True" in conftest_text
+    assert "def pytest_sessionfinish" in conftest_text
+    assert "shutil.rmtree(path, ignore_errors=True)" in conftest_text
+
+
 def test_sidebar_translate_private_helpers_have_call_sites():
     path = Path(__file__).resolve().parents[1] / "sidebar_translate.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))

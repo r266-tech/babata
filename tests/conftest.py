@@ -1,12 +1,25 @@
 from __future__ import annotations
 
+import shutil
 import sys
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+sys.dont_write_bytecode = True
+
 import pytest
+
+
+def pytest_sessionfinish(session, exitstatus):
+    repo = Path(__file__).resolve().parents[1]
+    for path in (
+        Path(__file__).resolve().parent / "__pycache__",
+        repo / "__pycache__",
+        repo / ".pytest_cache",
+    ):
+        shutil.rmtree(path, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)
