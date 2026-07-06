@@ -9,11 +9,9 @@ from typing import Any
 _TARGET_FIELDS: dict[str, dict[str, Any]] = {
     "tab_id": {
         "type": "integer",
-        "description": "page_context tab_id",
     },
     "window_id": {
         "type": "integer",
-        "description": "page_context window_id",
     },
 }
 

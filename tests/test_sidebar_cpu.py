@@ -602,18 +602,16 @@ def test_sidebar_model_visible_tool_descriptions_stay_compact():
 
     assert sum(len(description) for description in descriptions) <= 2300
     assert max(len(description) for description in descriptions) <= 170
-    assert sum(len(description) for description in schema_descriptions) <= 760
+    assert sum(len(description) for description in schema_descriptions) <= 320
     assert max(len(description) for description in schema_descriptions) <= 70
-    target_descriptions = {
-        prop["description"]
+    target_fields = [
+        prop
         for tool in SIDEBAR_TOOLS
         for name, prop in tool["inputSchema"].get("properties", {}).items()
         if name in ("tab_id", "window_id")
-    }
-    assert target_descriptions == {
-        "page_context tab_id",
-        "page_context window_id",
-    }
+    ]
+    assert target_fields
+    assert all("description" not in prop for prop in target_fields)
     for marker in (
         "共同进化",
         "哲学",
