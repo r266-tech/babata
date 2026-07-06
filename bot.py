@@ -5405,8 +5405,7 @@ async def on_resume_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     if turns:
         blocks = []
         for role, text in turns:
-            who = "V" if role == "user" else "CC"
-            blocks.append(f"<b>{who}:</b> {html.escape(text)}")
+            blocks.append(f"<b>{role}:</b> {html.escape(text)}")
         preview = "\n\n".join(blocks)
         body = (
             f"{head}\n\n"

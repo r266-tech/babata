@@ -234,6 +234,7 @@ class FakeCpuSession:
         self._babata_engine_name = name
         self._state_file = state_file
         self._session_id = sid
+        self.turns: list[tuple[str, str]] = []
 
     def _load_state(self):
         if self._state_file is None:
@@ -268,6 +269,9 @@ class FakeCpuSession:
         engine_sids[self._babata_engine_name] = self._session_id or ""
         state["engine_session_ids"] = engine_sids
         self._state_file.write_text(json.dumps(state))
+
+    def get_recent_turns(self, sid: str, pairs: int = 2):
+        return list(self.turns)
 
 
 class FakeCpuWorker:
@@ -412,6 +416,40 @@ def test_codex_resume_picker_only_shows_current_channel(monkeypatch, tmp_path):
     button = buttons[0][0]
     assert button[0][0] == "当前 Codex"
     assert button[1]["callback_data"] == "resume-ch:tg"
+
+
+def test_resume_click_preview_uses_raw_roles(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        monkeypatch.setattr(bot, "ALLOWED_USER", 7)
+        session = FakeCpuSession("claude", sid="sid-12345678")
+        session.turns = [
+            ("user", "old <question>"),
+            ("assistant", "old answer"),
+        ]
+        monkeypatch.setattr(bot, "cc", session)
+
+        class ResumeWorker:
+            async def resume(self, sid: str) -> bool:
+                self.resumed = sid
+                return True
+
+        worker = ResumeWorker()
+        monkeypatch.setattr(bot, "_channel_worker", worker)
+        query = FakeCallbackQuery(user_id=7, data="resume:sid-12345678")
+
+        await bot.on_resume_click(FakeCallbackUpdate(query), FakeCtx())
+
+        assert query.answers == [(None, {})]
+        assert worker.resumed == "sid-12345678"
+        text, kwargs = query.edits[-1]
+        assert kwargs["parse_mode"] == "HTML"
+        assert "<b>user:</b> old &lt;question&gt;" in text
+        assert "<b>assistant:</b> old answer" in text
+        assert "<b>V:</b>" not in text
+        assert "<b>CC:</b>" not in text
+
+    asyncio.run(run())
 
 
 def test_codex_status_reads_session_usage(monkeypatch, tmp_path):
