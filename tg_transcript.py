@@ -153,19 +153,21 @@ def _media_summary(msg: Any) -> list[dict[str, Any]]:
     return media
 
 
-def _message_ref(msg: Any) -> dict[str, Any]:
-    return {
+def _message_ref(msg: Any, *, include_content: bool = True) -> dict[str, Any]:
+    ref = {
         "message_id": getattr(msg, "message_id", None),
-        "text": _truncate(getattr(msg, "text", None)),
-        "caption": _truncate(getattr(msg, "caption", None)),
         "media": _media_summary(msg),
     }
+    if include_content:
+        ref["text"] = _truncate(getattr(msg, "text", None))
+        ref["caption"] = _truncate(getattr(msg, "caption", None))
+    return ref
 
 
-def _message_summary(msg: Any) -> dict[str, Any] | None:
+def _message_summary(msg: Any, *, include_content: bool = True) -> dict[str, Any] | None:
     if not msg:
         return None
-    summary = _message_ref(msg)
+    summary = _message_ref(msg, include_content=include_content)
     summary.update(
         {
             "chat": _chat_summary(getattr(msg, "chat", None)),
@@ -176,7 +178,7 @@ def _message_summary(msg: Any) -> dict[str, Any] | None:
     )
     reply = getattr(msg, "reply_to_message", None)
     if reply:
-        summary["reply_to"] = _message_ref(reply)
+        summary["reply_to"] = _message_ref(reply, include_content=False)
     return summary
 
 
@@ -197,7 +199,7 @@ def record_update(update: Any, source: str) -> None:
                 "id": getattr(query, "id", None),
                 "data": getattr(query, "data", None),
                 "from_user": _user_summary(getattr(query, "from_user", None)),
-                "message": _message_summary(getattr(query, "message", None)),
+                "message": _message_summary(getattr(query, "message", None), include_content=False),
             }
     except Exception as e:
         log.warning("tg transcript inbound summary failed: %s", e)
@@ -281,7 +283,7 @@ def _request_summary(method: str, args: tuple[Any, ...], kwargs: dict[str, Any])
 def _result_summary(result: Any) -> Any:
     if isinstance(result, (list, tuple)):
         return [_result_summary(item) for item in result]
-    msg = _message_summary(result)
+    msg = _message_summary(result, include_content=False)
     if msg and msg.get("message_id") is not None:
         return msg
     if isinstance(result, bool | int | float | str) or result is None:

@@ -72,6 +72,14 @@ class FakeUpdate:
         self.callback_query = None
 
 
+class FakeCallbackQuery:
+    def __init__(self, message: FakeMessage):
+        self.id = "cb-1"
+        self.data = "action:ok"
+        self.from_user = FakeUser(43)
+        self.message = message
+
+
 def _read_one(path: Path) -> dict:
     return json.loads(path.read_text().splitlines()[0])
 
@@ -80,7 +88,7 @@ def _read_all(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
-def test_record_update_keeps_text_reply_and_media(tmp_path, monkeypatch):
+def test_record_update_keeps_primary_text_but_not_reply_text(tmp_path, monkeypatch):
     transcript = tmp_path / "tg.jsonl"
     monkeypatch.setattr(tg_transcript, "TRANSCRIPT_FILE", transcript)
     msg = FakeMessage(10, "hello")
@@ -94,10 +102,28 @@ def test_record_update_keeps_text_reply_and_media(tmp_path, monkeypatch):
     assert event["source"] == "text"
     assert event["update_id"] == 99
     assert event["message"]["text"] == "hello"
-    assert event["message"]["reply_to"]["text"] == "older"
+    assert event["message"]["reply_to"]["message_id"] == 9
+    assert "text" not in event["message"]["reply_to"]
+    assert "older" not in transcript.read_text(encoding="utf-8")
     assert event["message"]["media"][0]["kind"] == "photo"
     assert event["message"]["media"][0]["file_id"] == "large"
     assert event["message"]["media"][0]["photo_count"] == 2
+
+
+def test_record_update_keeps_callback_data_but_not_callback_message_text(tmp_path, monkeypatch):
+    transcript = tmp_path / "tg.jsonl"
+    monkeypatch.setattr(tg_transcript, "TRANSCRIPT_FILE", transcript)
+    msg = FakeMessage(10, "button context")
+    update = FakeUpdate(msg)
+    update.callback_query = FakeCallbackQuery(msg)
+
+    tg_transcript.record_update(update, "callback")
+
+    event = _read_one(transcript)
+    assert event["callback_query"]["data"] == "action:ok"
+    assert event["callback_query"]["message"]["message_id"] == 10
+    assert "text" not in event["callback_query"]["message"]
+    assert transcript.read_text(encoding="utf-8").count("button context") == 1
 
 
 def test_record_update_summary_failure_does_not_raise(tmp_path, monkeypatch):
@@ -153,6 +179,7 @@ def test_install_bot_transcript_logs_outbound_even_for_slot_bot(tmp_path, monkey
     assert result["phase"] == "result"
     assert result["event_id"] == attempt["event_id"]
     assert result["result"]["message_id"] == 44
+    assert "text" not in result["result"]
 
 
 def test_install_bot_transcript_summary_failure_still_sends(tmp_path, monkeypatch):
