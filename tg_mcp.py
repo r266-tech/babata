@@ -122,7 +122,7 @@ _TG_TOOL_SPECS = (
     (
         "tg_send_text",
         (
-            "Send plain text to the user's Telegram. "
+            "Send plain text to Telegram. "
             "Final-turn TG replies are auto-delivered; use this additive tool only for "
             "mid-turn pushes, long-running progress, or proactive sends."
         ),
@@ -134,7 +134,7 @@ _TG_TOOL_SPECS = (
     ),
     (
         "tg_send_file",
-        "Send a local file to the user as a TG document.",
+        "Send a local file as a TG document.",
         {
             "path": {"type": "string", "description": "Absolute or ~-relative file path"},
             "caption": {"type": "string"},
@@ -159,7 +159,7 @@ _TG_TOOL_SPECS = (
     ),
     (
         "tg_send_location",
-        "Send a pinpoint location to the user. Attaches an Amap open-link button.",
+        "Send a pinpoint location. Attaches an Amap open-link button.",
         {
             "latitude": {"type": "number"},
             "longitude": {"type": "number"},
@@ -183,7 +183,7 @@ _TG_TOOL_SPECS = (
     ),
     (
         "tg_send_video",
-        "Send a local video file (mp4/mov) to the user as a TG video message.",
+        "Send a local video file (mp4/mov) as a TG video message.",
         {
             "path": {"type": "string"},
             "caption": {"type": "string"},

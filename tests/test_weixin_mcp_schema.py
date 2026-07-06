@@ -33,6 +33,8 @@ def test_wx_tool_descriptions_stay_compact_and_schema_owned():
     descriptions = [tool.description for tool in tools.values()]
 
     assert max(len(description) for description in descriptions) <= 180
+    for marker in ("the user's", "to the user"):
+        assert all(marker not in description for description in descriptions)
     typing = tools["wx_send_typing"]
     assert typing.description == "Show/cancel WeChat typing indicator."
     assert typing.inputSchema["properties"]["status"]["description"] == "1 = typing on, 2 = typing off"

@@ -156,7 +156,12 @@ def test_tg_mcp_tool_descriptions_stay_operational():
     assert len(text.description) <= 180
     for marker in ("Telegram", "auto-delivered", "mid-turn pushes", "long-running progress", "proactive sends"):
         assert marker in text.description
-    for marker in ("TG bot channel", "terminal/scheduled callers", "final turn text is already"):
+    for marker in (
+        "TG bot channel",
+        "terminal/scheduled callers",
+        "final turn text is already",
+        "the user's",
+    ):
         assert marker not in text.description
 
     assert len(page.description) <= 240
@@ -203,6 +208,7 @@ def test_tg_instance_schema_stays_compact_without_losing_route_values():
 
 def test_tg_mcp_schema_helper_keeps_tool_contracts():
     tools = {tool.name: tool for tool in asyncio.run(tg_mcp.list_tools())}
+    descriptions = [tool.description for tool in tools.values()]
 
     assert list(tools) == [
         "tg_send_buttons",
@@ -214,6 +220,8 @@ def test_tg_mcp_schema_helper_keeps_tool_contracts():
         "tg_send_video",
         "tg_send_page",
     ]
+    for marker in ("the user's", "to the user"):
+        assert all(marker not in description for description in descriptions)
     required = {
         "tg_send_buttons": ["text", "options"],
         "tg_send_text": ["text"],

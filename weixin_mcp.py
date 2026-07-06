@@ -59,7 +59,7 @@ _WX_TOOL_SPECS = (
     (
         "wx_send_image",
         (
-            "Send a local image (jpg/png/gif/webp/bmp) to the user's WeChat. "
+            "Send a local image (jpg/png/gif/webp/bmp) to WeChat. "
             "Optional caption is sent as a separate TEXT message first."
         ),
         {
@@ -73,7 +73,7 @@ _WX_TOOL_SPECS = (
     ),
     (
         "wx_send_video",
-        "Send a local video file (mp4/mov/webm) to the user's WeChat.",
+        "Send a local video file (mp4/mov/webm) to WeChat.",
         {
             "path": {"type": "string"},
             "caption": {"type": "string"},
