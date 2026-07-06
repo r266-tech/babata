@@ -55,6 +55,9 @@ _CODEX_SPLIT_ERRORS = (
 _CODEX_STREAM_LIMIT = 64 * 1024 * 1024
 _CODEX_TOOL_RESULT_MAX_CHARS = 4000
 _CODEX_MEMORY_INJECTED_KEY = "codex_memory_injected_sids"
+# session.json is a resume picker/cache, not the raw transcript authority.
+_CODEX_STATE_TURN_LIMIT = 8
+_CODEX_STATE_TEXT_CHARS = 300
 
 
 def _codex_stall_timeout() -> float:
@@ -70,6 +73,27 @@ def _is_codex_split_error(message: str | None) -> bool:
     if not message:
         return False
     return any(marker in message for marker in _CODEX_SPLIT_ERRORS)
+
+
+def _cap_codex_state_text(value: object, cap: int = _CODEX_STATE_TEXT_CHARS) -> str:
+    text = str(value or "")
+    if len(text) <= cap:
+        return text
+    return text[:cap].rstrip() + "..."
+
+
+def _cap_codex_state_turns(turns: object) -> list[list[str]]:
+    if not isinstance(turns, list):
+        return []
+    out: list[list[str]] = []
+    for item in turns:
+        if not isinstance(item, list) or len(item) != 2:
+            continue
+        role = str(item[0])
+        if role not in ("user", "assistant"):
+            continue
+        out.append([role, _cap_codex_state_text(item[1])])
+    return out[-_CODEX_STATE_TURN_LIMIT:]
 
 
 def _split_error_content(content: str) -> str:
@@ -738,16 +762,18 @@ class CodexEngine(CC):
             sessions = {}
         now = time.time()
         rec = sessions.get(sid) if isinstance(sessions.get(sid), dict) else {}
-        first_user = rec.get("first_user") or prompt
-        turns = rec.get("turns") if isinstance(rec.get("turns"), list) else []
-        turns.append(["user", prompt])
+        user_text = _cap_codex_state_text(prompt)
+        assistant_text = _cap_codex_state_text(content)
+        first_user = _cap_codex_state_text(rec.get("first_user") or user_text)
+        turns = _cap_codex_state_turns(rec.get("turns"))
+        turns.append(["user", user_text])
         if content:
-            turns.append(["assistant", content])
+            turns.append(["assistant", assistant_text])
         rec.update({
             "first_user": first_user,
-            "preview": content or prompt,
+            "preview": assistant_text or user_text,
             "mtime": now,
-            "turns": turns[-8:],
+            "turns": turns[-_CODEX_STATE_TURN_LIMIT:],
         })
         sessions[sid] = rec
         state[_CODEX_SESSIONS_KEY] = sessions

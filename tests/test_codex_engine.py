@@ -229,6 +229,62 @@ def test_codex_record_turn_reuses_clean_session_metadata(tmp_path):
     assert state["codex_sessions"]["sid-1"]["turns"] == [["user", "hello"], ["assistant", "OK"]]
 
 
+def test_codex_record_turn_caps_state_text(tmp_path):
+    state_file = tmp_path / "session.json"
+    state_file.write_text(json.dumps({
+        "codex_sessions": {
+            "sid-1": {
+                "first_user": "old-" + ("u" * 350) + "-OLD-TAIL",
+                "turns": [
+                    ["user", "old-" + ("p" * 350) + "-OLD-PROMPT-TAIL"],
+                    ["tool", "ignore"],
+                    ["assistant", "old-" + ("a" * 350) + "-OLD-ANSWER-TAIL"],
+                ],
+            },
+        },
+    }))
+    session = codex_engine.CodexEngine(
+        state_file=state_file,
+        source_prompt="Source: test.",
+    )
+
+    session._record_codex_turn(
+        "sid-1",
+        "new-" + ("q" * 350) + "-NEW-PROMPT-TAIL",
+        "reply-" + ("r" * 350) + "-NEW-ANSWER-TAIL",
+    )
+
+    raw = state_file.read_text()
+    for tail in (
+        "OLD-TAIL",
+        "OLD-PROMPT-TAIL",
+        "OLD-ANSWER-TAIL",
+        "NEW-PROMPT-TAIL",
+        "NEW-ANSWER-TAIL",
+    ):
+        assert tail not in raw
+
+    state = json.loads(raw)
+    rec = state["codex_sessions"]["sid-1"]
+    assert rec["first_user"].endswith("...")
+    assert rec["preview"].endswith("...")
+    assert all(len(text) <= codex_engine._CODEX_STATE_TEXT_CHARS + 3 for _, text in rec["turns"])
+    assert rec["turns"][-2][0] == "user"
+    assert rec["turns"][-1][0] == "assistant"
+    rows = session.list_recent_sessions(limit=1)
+    assert rows[0]["sid"] == "sid-1"
+    assert rows[0]["first_user"] == rec["first_user"]
+    assert rows[0]["preview"] == rec["preview"]
+    assert "OLD-TAIL" not in rows[0]["first_user"]
+    assert "NEW-ANSWER-TAIL" not in rows[0]["preview"]
+    assert session.get_recent_turns("sid-1", pairs=1, char_cap=1000) == [
+        ("user", rec["turns"][-2][1]),
+        ("assistant", rec["turns"][-1][1]),
+    ]
+    setattr(session, "_fire_hook", lambda *_: None)
+    assert session.resume("sid-1") is True
+
+
 def test_codex_engine_injects_babata_memory_once_per_session(monkeypatch, tmp_path):
     monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "1")
     seen_sources: list[str | None] = []
