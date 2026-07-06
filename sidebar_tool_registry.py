@@ -335,11 +335,11 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
 ]
 
 _PROMPT_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("page read", ("tab_metadata", "page_snapshot", "article_extract", "dom_query")),
-    ("page act", ("page_click_ref", "dom_click", "dom_set", "dom_inject", "tab_navigate")),
-    ("ui notify", ("suggest_prompts", "mascot_speak")),
+    ("read", ("tab_metadata", "page_snapshot", "article_extract", "dom_query")),
+    ("act", ("page_click_ref", "dom_click", "dom_set", "dom_inject", "tab_navigate")),
+    ("ui", ("suggest_prompts", "mascot_speak")),
     ("text", ("translate",)),
-    ("browser data", ("bookmarks_search", "bookmarks_tree", "bookmarks_create", "tabs_query", "tabs_group", "tabs_close", "history_search")),
+    ("data", ("bookmarks_search", "bookmarks_tree", "bookmarks_create", "tabs_query", "tabs_group", "tabs_close", "history_search")),
 )
 
 
@@ -363,5 +363,5 @@ def prompt_tool_lines() -> str:
     for label, names in _PROMPT_GROUPS:
         present = [name for name in names if name in available]
         if present:
-            lines.append(f"- {label}: {', '.join(present)}")
+            lines.append(f"- {label}: {','.join(present)}")
     return "\n".join(lines)

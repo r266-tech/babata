@@ -36,7 +36,7 @@ PROMPT_CASES = [
     (
         "sidebar-source",
         lambda: sidebar_bot._SIDEBAR_SOURCE_PROMPT,
-        780,
+        650,
         ("真实 schema 由 MCP 提供", "tab_id/window_id", "不可信数据", "清楚用户意图", "不要自行加载"),
         ("DevTools", "babata-memory-context", "同一个 babata"),
     ),
@@ -76,7 +76,7 @@ def test_channel_prompts_stay_thin_and_boundary_focused(name, prompt_getter, max
 
 
 def test_sidebar_prompt_tool_map_stays_compact():
-    assert len(sidebar_bot._SIDEBAR_TOOL_LINES) <= 520
+    assert len(sidebar_bot._SIDEBAR_TOOL_LINES) <= 300
 
 
 @pytest.mark.parametrize(
