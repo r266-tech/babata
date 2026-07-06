@@ -213,7 +213,6 @@ def test_render_memory_context_event_logs_enforced_reflex(monkeypatch, tmp_path)
             "id": event_id,
             "memory_injected": True,
             "message_sha256": events[0]["message_sha256"],
-            "message_summary": "hello memory",
             "mode": "enforce",
             "post_answer_observation": "pending",
             "router": {"profile": "deep", "reasons": ["need detail"], "routes": ["deep"]},
@@ -222,12 +221,18 @@ def test_render_memory_context_event_logs_enforced_reflex(monkeypatch, tmp_path)
             "ts": events[0]["ts"],
         }
     ]
+    assert len(events[0]["message_sha256"]) == 64
+    assert "hello memory" not in reflex_log.read_text(encoding="utf-8")
+    assert "message_summary" not in events[0]
 
     memory_runtime.log_memory_reflex_post_answer(event_id, "没有找到")
     events = [json.loads(line) for line in reflex_log.read_text().splitlines()]
     assert events[1]["event"] == "post_answer"
     assert events[1]["id"] == event_id
+    assert len(events[1]["answer_sha256"]) == 64
     assert events[1]["observation"]["memory_miss_marker"] is True
+    assert "answer_summary" not in events[1]
+    assert "没有找到" not in reflex_log.read_text(encoding="utf-8")
 
 
 def test_render_memory_context_event_preserves_explicit_profile_and_include_top(monkeypatch, tmp_path):
@@ -318,7 +323,6 @@ def test_log_memory_reflex_preflight_only_records_router_without_inject(monkeypa
             "id": event_id,
             "memory_injected": False,
             "message_sha256": events[0]["message_sha256"],
-            "message_summary": "look up yesterday",
             "mode": "dry-run",
             "post_answer_observation": "pending",
             "router": {"profile": "recent", "reasons": ["history"], "routes": ["recent"]},
@@ -327,6 +331,9 @@ def test_log_memory_reflex_preflight_only_records_router_without_inject(monkeypa
             "ts": events[0]["ts"],
         }
     ]
+    assert len(events[0]["message_sha256"]) == 64
+    assert "message_summary" not in events[0]
+    assert "look up yesterday" not in reflex_log.read_text(encoding="utf-8")
 
 
 def test_memory_runtime_owns_shared_reflex_helpers():
@@ -346,7 +353,6 @@ def test_memory_runtime_owns_shared_reflex_helpers():
         "def _format_memory_reflex_hint",
         "def _render_babata_memory_context(",
         "def _memory_reflex_log_path",
-        "def _message_summary",
         "def _append_memory_reflex_event",
         "def _log_memory_reflex_preflight_only",
         "def _answer_memory_observation",

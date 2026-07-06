@@ -140,11 +140,6 @@ def _memory_reflex_log_path() -> Path:
     return Path(configured).expanduser() if configured else _DEFAULT_MEMORY_REFLEX_LOG
 
 
-def _message_summary(text: str | None, limit: int = 180) -> str:
-    compact = " ".join((text or "").split())
-    return compact[:limit].rstrip()
-
-
 def _append_memory_reflex_event(payload: dict[str, Any]) -> None:
     try:
         path = _memory_reflex_log_path()
@@ -179,7 +174,6 @@ def log_memory_reflex_preflight(
         "cpu": cpu,
         "mode": mode,
         "message_sha256": digest,
-        "message_summary": _message_summary(user_prompt),
         "router": reflex,
         "actual_profile": actual_profile,
         "memory_injected": memory_injected,
@@ -234,7 +228,6 @@ def log_memory_reflex_post_answer(event_id: str | None, content: str) -> None:
         "id": event_id,
         "ts": time.time(),
         "answer_sha256": hashlib.sha256((content or "").encode("utf-8")).hexdigest(),
-        "answer_summary": _message_summary(content),
         "observation": _answer_memory_observation(content or ""),
     })
 
