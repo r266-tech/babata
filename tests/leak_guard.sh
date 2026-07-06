@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Block V's private strings from reaching the public repo.
+# Block local private strings from reaching the public repo.
 # Two modes — chosen by explicit flag, NOT stdin TTY heuristics (CI shells
 # also lack a TTY, which would silently put us in range-mode reading empty
 # stdin and pass everything):
@@ -8,8 +8,9 @@
 #     commit in the push range. Catches "add PII → commit → delete from
 #     worktree → push" — the added line lives in the bad commit's patch.
 #
-# Forks: edit BLACKLIST below to your own private strings, or delete this file
-# and the CI step / pre-push hook to disable entirely.
+# Forks: keep generic patterns here. Put machine-private regexes in
+# .git/info/babata-leak-patterns or set BABATA_LEAK_GUARD_PATTERNS to another
+# newline-delimited regex file.
 
 set -uo pipefail
 
@@ -22,24 +23,31 @@ if [ "${1:-}" = "--pre-push" ]; then
     shift
 fi
 
-BLACKLIST=(
-    '/Users/admin'
-    'wzrrrrrrr'
-    '13008131315'
-    '2668940489'
-    'zhongrun\.wu'
-    'r2668940489'
-    '吴中润'
-    'wuzhongrundeMacBook'
-    'SH-WuZhongRun'
-    '8229866476'
-    '\btanka\b'
-    'grandmirror'
-    'Evo26689'
-)
+FIXED_BLACKLIST=()
+REGEX_BLACKLIST=()
+if [ -n "${HOME:-}" ]; then
+    FIXED_BLACKLIST+=("$HOME")
+fi
+
+PATTERN_FILES=()
+if [ -n "${BABATA_LEAK_GUARD_PATTERNS:-}" ]; then
+    PATTERN_FILES+=("$BABATA_LEAK_GUARD_PATTERNS")
+fi
+PATTERN_FILES+=("$REPO_DIR/.git/info/babata-leak-patterns")
+
+for pattern_file in "${PATTERN_FILES[@]}"; do
+    [ -f "$pattern_file" ] || continue
+    while IFS= read -r pattern || [ -n "$pattern" ]; do
+        pattern=${pattern%$'\r'}
+        case "$pattern" in
+            ""|\#*) continue ;;
+        esac
+        REGEX_BLACKLIST+=("$pattern")
+    done < "$pattern_file"
+done
 
 ZERO_SHA="0000000000000000000000000000000000000000"
-PATHSPEC=(':!tests/leak_guard.sh')
+PATHSPEC=('.')
 
 HITS=0
 
@@ -57,8 +65,18 @@ scan_revs() {
         | grep -E '^\+[^+]' || true)
     [ -z "$added" ] && return
 
+    [ ${#FIXED_BLACKLIST[@]} -eq 0 ] && [ ${#REGEX_BLACKLIST[@]} -eq 0 ] && return
     local p
-    for p in "${BLACKLIST[@]}"; do
+    for p in "${FIXED_BLACKLIST[@]}"; do
+        local matches
+        matches=$(echo "$added" | grep -nF -- "$p" || true)
+        if [ -n "$matches" ]; then
+            echo "✗ leak: '$p' [$context]"
+            echo "$matches" | sed 's/^/    /'
+            HITS=$((HITS + 1))
+        fi
+    done
+    for p in "${REGEX_BLACKLIST[@]}"; do
         local matches
         matches=$(echo "$added" | grep -nE -- "$p" || true)
         if [ -n "$matches" ]; then
@@ -70,8 +88,18 @@ scan_revs() {
 }
 
 scan_tree() {
+    [ ${#FIXED_BLACKLIST[@]} -eq 0 ] && [ ${#REGEX_BLACKLIST[@]} -eq 0 ] && return
     local p
-    for p in "${BLACKLIST[@]}"; do
+    for p in "${FIXED_BLACKLIST[@]}"; do
+        local matches
+        matches=$(git grep -n -I -F -e "$p" -- "${PATHSPEC[@]}" 2>/dev/null || true)
+        if [ -n "$matches" ]; then
+            echo "✗ leak: '$p'"
+            echo "$matches" | sed 's/^/    /'
+            HITS=$((HITS + 1))
+        fi
+    done
+    for p in "${REGEX_BLACKLIST[@]}"; do
         local matches
         matches=$(git grep -n -I -E -e "$p" -- "${PATHSPEC[@]}" 2>/dev/null || true)
         if [ -n "$matches" ]; then
