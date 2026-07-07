@@ -429,9 +429,8 @@ async def _mark_processed(update_id: int | None) -> None:
 
 _TG_SOURCE_PROMPT = (
     "Source: Telegram. "
-    "Write Markdown; bot converts to TG HTML subset (b/i/u/s/code/pre/a/blockquote). "
-    "Headings/tables/hr unsupported. "
-    "New bubble: separate response bubbles with three newlines (\\n\\n\\n). "
+    "Markdown -> TG HTML subset (b/i/u/s/code/pre/a/blockquote). "
+    "Headings/tables/hr unsupported. New bubble: \\n\\n\\n. "
     "Max 4096 chars/message."
 )
 
