@@ -17,6 +17,7 @@ Schema (松散, 每条带 ts/url/kind, 余字段按 kind 自由):
   attention           — content script 推 visibility/sidepanel/idle
 """
 
+import hashlib
 import json
 import logging
 import time
@@ -29,6 +30,7 @@ log = logging.getLogger(__name__)
 
 EVENTS_DIR = SIDEBAR_DATA_DIR
 EVENTS_FILE = EVENTS_DIR / "events.jsonl"
+MAX_FIELD_TEXT = 512
 _lock = Lock()
 
 EVENTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -41,7 +43,7 @@ def append(url: str, kind: str, **fields: Any) -> None:
         "url": url or "",
         "kind": kind,
     }
-    rec.update(fields)
+    rec.update(_bounded_fields(fields))
     try:
         line = json.dumps(rec, ensure_ascii=False) + "\n"
     except (TypeError, ValueError):
@@ -52,6 +54,41 @@ def append(url: str, kind: str, **fields: Any) -> None:
                 f.write(line)
     except OSError as e:
         log.warning("sidebar_events.append failed (kind=%s url=%s): %s", kind, url, e)
+
+
+def _bounded_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in fields.items():
+        if isinstance(value, str):
+            out[key] = _truncate_text(value)
+            if len(value) > MAX_FIELD_TEXT:
+                out[f"{key}_sha256"] = _sha256_text(value)
+                out[f"{key}_bytes"] = len(value.encode("utf-8", errors="replace"))
+            continue
+        out[key] = _bounded_value(value)
+    return out
+
+
+def _bounded_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _truncate_text(value)
+    if isinstance(value, dict):
+        return {str(k): _bounded_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_bounded_value(v) for v in value]
+    return value
+
+
+def _truncate_text(text: str) -> str:
+    if "... [truncated " in text and text.endswith(" chars]"):
+        return text
+    if len(text) <= MAX_FIELD_TEXT:
+        return text
+    return f"{text[:MAX_FIELD_TEXT]}... [truncated {len(text) - MAX_FIELD_TEXT} chars]"
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
 def grep_url(url: str, max_records: int = 100, max_age_sec: int = 86400 * 30) -> list[dict]:
