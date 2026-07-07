@@ -145,6 +145,41 @@ def test_turn_audit_caps_error_message(monkeypatch, tmp_path):
     assert finish["error"]["message_bytes"] == len(error_message.encode("utf-8"))
 
 
+def test_turn_audit_caps_tool_command(monkeypatch, tmp_path):
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("BABATA_TURN_LEDGER", "1")
+    monkeypatch.setenv("BABATA_AUDIT_DIR", str(audit_dir))
+    monkeypatch.setenv("BABATA_REVIEW_BUS", "off")
+    command = "python3 -c " + ("'print(1); " * 80) + "COMMAND-TAIL"
+
+    summary = turn_audit.summarize_tool_use("Bash", {"command": command})
+    assert "COMMAND-TAIL" not in summary["command"]
+    assert summary["command_sha256"] == turn_audit._sha256_text(command)
+    assert summary["command_bytes"] == len(command.encode("utf-8"))
+
+    turn = turn_audit.begin_turn(
+        cpu="codex",
+        channel="test",
+        prompt="short",
+        session_id_before=None,
+        cwd=tmp_path,
+    )
+    result = turn_audit.finish_turn(
+        turn,
+        response=Response(content="done", session_id="sid-1", cost=0.0),
+        tool_uses=[{"name": "Bash", "command": command}],
+    )
+
+    assert result is not None
+    raw = (audit_dir / "babata-turn-ledger.jsonl").read_text(encoding="utf-8")
+    assert "COMMAND-TAIL" not in raw
+    tool = _jsonl(audit_dir / "babata-turn-ledger.jsonl")[-1]["tool_uses"][0]
+    assert tool["command"].endswith("...")
+    assert len(tool["command"]) <= turn_audit._MAX_COMMAND_PREVIEW + 3
+    assert tool["command_sha256"] == turn_audit._sha256_text(command)
+    assert tool["command_bytes"] == len(command.encode("utf-8"))
+
+
 def test_permission_guard_can_enforce_dangerous_commands(monkeypatch):
     monkeypatch.setenv("BABATA_DETERMINISTIC_GUARDS", "enforce")
     block, reason = turn_audit.should_block_for_permission(

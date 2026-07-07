@@ -25,7 +25,7 @@ from constants import NAMESPACE, STATE_DIR
 _MAX_PROMPT_PREVIEW = 160
 _MAX_FINAL_PREVIEW = 240
 _MAX_ERROR_PREVIEW = 240
-_MAX_COMMAND_PREVIEW = 500
+_MAX_COMMAND_PREVIEW = 240
 _MAX_CHECK_OUTPUT = 4000
 _MAX_FILE_BYTES = 512 * 1024
 _DEFAULT_CHECK_TIMEOUT_SECONDS = 180
@@ -609,7 +609,7 @@ def summarize_tool_use(name: str, tool_input: dict[str, Any] | None) -> dict[str
     tool_input = tool_input or {}
     command = tool_input.get("command") or tool_input.get("cmd")
     if isinstance(command, str):
-        out["command"] = _preview(command, _MAX_COMMAND_PREVIEW)
+        out.update(_command_record(command))
     for key in ("file_path", "path", "notebook_path"):
         value = tool_input.get(key)
         if isinstance(value, str):
@@ -892,7 +892,10 @@ def _compact_tool_uses(tool_uses: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for tool in tool_uses:
         item = dict(tool)
         if isinstance(item.get("command"), str):
-            item["command"] = _preview(item["command"], _MAX_COMMAND_PREVIEW)
+            command = item["command"]
+            item["command"] = _preview(command, _MAX_COMMAND_PREVIEW)
+            item.setdefault("command_sha256", _sha256_text(command))
+            item.setdefault("command_bytes", _text_bytes(command))
         compact.append(item)
     return compact[:100]
 
@@ -958,7 +961,7 @@ def _finding(
     if path:
         out["path"] = path
     if command:
-        out["command"] = _preview(command, _MAX_COMMAND_PREVIEW)
+        out.update(_command_record(command))
     return out
 
 
@@ -1065,6 +1068,14 @@ def _error_record(error: BaseException | None) -> dict[str, Any] | None:
         "message_preview": _preview(message, _MAX_ERROR_PREVIEW),
         "message_sha256": _sha256_text(message),
         "message_bytes": _text_bytes(message),
+    }
+
+
+def _command_record(command: str) -> dict[str, Any]:
+    return {
+        "command": _preview(command, _MAX_COMMAND_PREVIEW),
+        "command_sha256": _sha256_text(command),
+        "command_bytes": _text_bytes(command),
     }
 
 
