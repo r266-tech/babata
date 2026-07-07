@@ -609,7 +609,7 @@ def test_collect_wx_turn_inputs_preserves_prompt_contract():
         assert ctx_token == "ctx2"
         assert images == []
         assert "Multiple WeChat messages, oldest to newest" in prompt
-        assert "clarify or supersede" in prompt
+        assert "clarify or supersede" not in prompt
         assert "<user_message n=1>\nfirst\n</user_message>" in prompt
         assert "<user_message n=2>\nsecond\n</user_message>" in prompt
 
@@ -795,7 +795,7 @@ def test_weixin_poll_batch_coalesces_same_sender_messages(monkeypatch, tmp_path)
         await asyncio.wait_for(_wait_until(lambda: saved == ["new-buf"]), timeout=1)
         assert len(prompts) == 1
         assert "Multiple WeChat messages, oldest to newest" in prompts[0]
-        assert "clarify or supersede" in prompts[0]
+        assert "clarify or supersede" not in prompts[0]
         assert "previous turn" not in prompts[0]
         assert "poll checkpoint" not in prompts[0]
         assert "<user_message n=1>" in prompts[0]

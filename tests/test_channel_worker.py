@@ -1306,7 +1306,7 @@ def test_channel_worker_codex_coalesces_pending_cut_ins(monkeypatch, tmp_path):
         prompt, images = session.submitted[1]
         assert images is None
         assert "Multiple Telegram messages, oldest to newest" in prompt
-        assert "clarify or supersede" in prompt
+        assert "clarify or supersede" not in prompt
         assert "previous turn" not in prompt
         assert "<user_message n=1 update_id=102 message_id=2>" in prompt
         assert "second" in prompt

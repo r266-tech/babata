@@ -1654,8 +1654,7 @@ def _format_coalesced_tg_prompt(payloads: list[Payload]) -> str:
         return _truncate_tg_input(payloads[0].text) if payloads else ""
 
     blocks = [
-        "Multiple Telegram messages, oldest to newest; later messages may "
-        "clarify or supersede earlier ones.",
+        "Multiple Telegram messages, oldest to newest.",
         "",
     ]
     for idx, payload in enumerate(payloads, start=1):

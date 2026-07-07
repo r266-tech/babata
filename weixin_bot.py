@@ -776,8 +776,7 @@ def _format_wx_message_bodies(message_bodies: list[str]) -> str:
     if len(message_bodies) <= 1:
         return _truncate_wx_input(combined)
     blocks = [
-        "Multiple WeChat messages, oldest to newest; later messages may "
-        "clarify or supersede earlier ones.",
+        "Multiple WeChat messages, oldest to newest.",
         "",
     ]
     for idx, body in enumerate(message_bodies, start=1):
