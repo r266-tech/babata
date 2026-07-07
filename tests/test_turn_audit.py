@@ -118,6 +118,33 @@ def test_turn_audit_caps_prompt_and_final_previews(monkeypatch, tmp_path):
     assert finish["final_bytes"] == len(long_final.encode("utf-8"))
 
 
+def test_turn_audit_caps_error_message(monkeypatch, tmp_path):
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("BABATA_TURN_LEDGER", "1")
+    monkeypatch.setenv("BABATA_AUDIT_DIR", str(audit_dir))
+    monkeypatch.setenv("BABATA_REVIEW_BUS", "off")
+    error_message = "error-" + ("e" * 500) + "-ERROR-TAIL"
+
+    turn = turn_audit.begin_turn(
+        cpu="codex",
+        channel="test",
+        prompt="short",
+        session_id_before=None,
+        cwd=tmp_path,
+    )
+    summary = turn_audit.finish_turn(turn, error=RuntimeError(error_message))
+
+    assert summary is not None
+    raw = (audit_dir / "babata-turn-ledger.jsonl").read_text(encoding="utf-8")
+    assert "ERROR-TAIL" not in raw
+    finish = _jsonl(audit_dir / "babata-turn-ledger.jsonl")[-1]
+    assert finish["error"]["type"] == "RuntimeError"
+    assert finish["error"]["message_preview"].endswith("...")
+    assert len(finish["error"]["message_preview"]) <= turn_audit._MAX_ERROR_PREVIEW + 3
+    assert finish["error"]["message_sha256"] == turn_audit._sha256_text(error_message)
+    assert finish["error"]["message_bytes"] == len(error_message.encode("utf-8"))
+
+
 def test_permission_guard_can_enforce_dangerous_commands(monkeypatch):
     monkeypatch.setenv("BABATA_DETERMINISTIC_GUARDS", "enforce")
     block, reason = turn_audit.should_block_for_permission(

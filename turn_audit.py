@@ -24,6 +24,7 @@ from constants import NAMESPACE, STATE_DIR
 
 _MAX_PROMPT_PREVIEW = 160
 _MAX_FINAL_PREVIEW = 240
+_MAX_ERROR_PREVIEW = 240
 _MAX_COMMAND_PREVIEW = 500
 _MAX_CHECK_OUTPUT = 4000
 _MAX_FILE_BYTES = 512 * 1024
@@ -250,10 +251,7 @@ def finish_turn(
         "final_preview": _preview(final_content, _MAX_FINAL_PREVIEW),
         "final_sha256": _sha256_text(final_content),
         "final_bytes": _text_bytes(final_content),
-        "error": {
-            "type": type(error).__name__,
-            "message": str(error),
-        } if error else None,
+        "error": _error_record(error),
     }
     _append_jsonl(_ledger_path(), record)
     return _public_summary(record)
@@ -1056,6 +1054,18 @@ def _sha256_text(text: str) -> str:
 
 def _text_bytes(text: str) -> int:
     return len(text.encode("utf-8", errors="replace"))
+
+
+def _error_record(error: BaseException | None) -> dict[str, Any] | None:
+    if error is None:
+        return None
+    message = str(error)
+    return {
+        "type": type(error).__name__,
+        "message_preview": _preview(message, _MAX_ERROR_PREVIEW),
+        "message_sha256": _sha256_text(message),
+        "message_bytes": _text_bytes(message),
+    }
 
 
 def _preview(text: str, limit: int) -> str:
