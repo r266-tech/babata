@@ -771,10 +771,10 @@ class CodexEngine(CC):
             turns.append(["assistant", assistant_text])
         rec.update({
             "first_user": first_user,
-            "preview": assistant_text or user_text,
             "mtime": now,
             "turns": turns[-_CODEX_STATE_TURN_LIMIT:],
         })
+        rec.pop("preview", None)
         sessions[sid] = rec
         state[_CODEX_SESSIONS_KEY] = sessions
         self._remember_engine_sid(state, sid)
@@ -801,10 +801,15 @@ class CodexEngine(CC):
             first_user = str(rec.get("first_user") or "")
             if not first_user:
                 continue
+            turns = _cap_codex_state_turns(rec.get("turns"))
+            if turns:
+                preview = turns[-1][1] or first_user
+            else:
+                preview = str(rec.get("preview") or first_user)
             out.append({
                 "sid": sid,
                 "first_user": first_user,
-                "preview": str(rec.get("preview") or first_user),
+                "preview": preview,
                 "mtime": float(rec.get("mtime") or 0.0),
                 "is_current": sid == self._session_id,
                 "channel": own_channel,

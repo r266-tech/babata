@@ -226,7 +226,9 @@ def test_codex_record_turn_reuses_clean_session_metadata(tmp_path):
     assert state["engine_session_ids"] == {"claude": "claude-sid", "codex": "sid-1"}
     assert state["recent_sids"] == ["sid-1", "old"]
     assert "last_activity_at" in state
-    assert state["codex_sessions"]["sid-1"]["turns"] == [["user", "hello"], ["assistant", "OK"]]
+    rec = state["codex_sessions"]["sid-1"]
+    assert rec["turns"] == [["user", "hello"], ["assistant", "OK"]]
+    assert "preview" not in rec
 
 
 def test_codex_record_turn_caps_state_text(tmp_path):
@@ -267,14 +269,14 @@ def test_codex_record_turn_caps_state_text(tmp_path):
     state = json.loads(raw)
     rec = state["codex_sessions"]["sid-1"]
     assert rec["first_user"].endswith("...")
-    assert rec["preview"].endswith("...")
+    assert "preview" not in rec
     assert all(len(text) <= codex_engine._CODEX_STATE_TEXT_CHARS + 3 for _, text in rec["turns"])
     assert rec["turns"][-2][0] == "user"
     assert rec["turns"][-1][0] == "assistant"
     rows = session.list_recent_sessions(limit=1)
     assert rows[0]["sid"] == "sid-1"
     assert rows[0]["first_user"] == rec["first_user"]
-    assert rows[0]["preview"] == rec["preview"]
+    assert rows[0]["preview"] == rec["turns"][-1][1]
     assert "OLD-TAIL" not in rows[0]["first_user"]
     assert "NEW-ANSWER-TAIL" not in rows[0]["preview"]
     assert session.get_recent_turns("sid-1", pairs=1, char_cap=1000) == [
