@@ -372,7 +372,7 @@ def test_fmt_tool_marks_skill_usage_from_shell_command():
     assert "sed -n" not in line
 
 
-def test_fmt_tool_marks_memory_injection():
+def test_fmt_tool_marks_memory_context():
     line = bot._fmt_tool(
         "/bin/zsh",
         {
@@ -384,7 +384,7 @@ def test_fmt_tool_marks_memory_injection():
         },
     )
 
-    assert line == "🧠 Memory · inject lite (L0+daily-map) · codex/terminal · top force"
+    assert line == "🧠 Memory · context lite (L0+daily-map) · codex/terminal · top force"
 
 
 def test_fmt_tool_summarizes_shell_find_with_target_patterns():
