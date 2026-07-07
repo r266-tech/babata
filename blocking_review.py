@@ -123,11 +123,10 @@ def build_repair_prompt(review: dict[str, Any]) -> str:
     if not findings:
         findings = f"- {review.get('message') or review.get('reason') or 'Blocking review requested another pass.'}"
     prompt = f"""<blocking-review>
-Your previous code-changing turn did not pass babata's blocking review gate.
+Previous code-changing turn failed babata's blocking review.
 
-Fix the findings below in the same repository/session. Do not ask the user to
-confirm implementation details. After fixing, rerun the relevant checks and then
-answer the user only with the final result.
+Fix findings in the same repository/session. Do not ask implementation details.
+Rerun relevant checks, then answer only with the final result.
 
 Findings:
 {findings}
@@ -514,29 +513,23 @@ def _result(
 def _build_counterpart_review_prompt(payload: dict[str, Any], *, reviewer: str) -> str:
     source_cpu = str(payload.get("cpu") or "unknown")
     audit = payload.get("audit") if isinstance(payload.get("audit"), dict) else {}
-    changed_files = [str(path) for path in (audit.get("changed_files") or [])]
     review_context = _review_context(audit)
     instructions = f"""You are babata's synchronous blocking review gate.
 
-Review the code-changing turn from source_cpu={source_cpu}. You are reviewer={reviewer}.
-This is a bounded sidecar review only: do not edit files, do not call another CPU,
-and do not run nested delegation. The source CPU will apply any fixes in its own
-session after your verdict.
+Review source_cpu={source_cpu}; reviewer={reviewer}. Read-only sidecar: do not
+edit files, call another CPU, or delegate. Source CPU applies fixes.
 
-Return only a JSON object:
+Return JSON only:
 {{"status":"passed","findings":[]}}
 or
 {{"status":"needs_fix","findings":[{{"severity":"high","rule":"bug","path":"path","message":"specific issue"}}]}}
 
-Only block for concrete bugs, regressions, security/privacy issues, broken checks,
-or behavior that clearly violates the user's request. Do not block for style,
-speculation, missing nice-to-have tests, or preferences.
+Block only concrete bugs, regressions, security/privacy issues, broken checks,
+or clear request violations. Do not block style, speculation, nice-to-have tests,
+or preferences.
 
 Audit summary:
-{json.dumps(_compact_audit_for_prompt(audit), ensure_ascii=False, indent=2)}
-
-Changed files:
-{json.dumps(changed_files, ensure_ascii=False)}
+{json.dumps(_compact_audit_for_prompt(audit), ensure_ascii=False, separators=(",", ":"))}
 
 Response draft:
 {payload.get("response_preview") or ""}

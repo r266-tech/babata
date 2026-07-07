@@ -266,3 +266,68 @@ def test_counterpart_review_skips_when_already_inside_reviewer(monkeypatch, tmp_
     assert result["status"] == "passed"
     assert result["reviewer"] == "deterministic"
     assert result["reason"] == "counterpart review skipped inside delegated reviewer"
+
+
+def test_repair_prompt_stays_compact_without_losing_repair_boundary():
+    prompt = blocking_review.build_repair_prompt({
+        "findings": [
+            {
+                "severity": "high",
+                "rule": "unit",
+                "path": "app.py",
+                "message": "fix regression",
+            }
+        ]
+    })
+
+    assert len(prompt) <= 360
+    for marker in (
+        "<blocking-review>",
+        "same repository/session",
+        "Do not ask implementation details",
+        "Rerun relevant checks",
+        "fix regression",
+    ):
+        assert marker in prompt
+    for marker in ("previous code-changing turn did not pass", "confirm implementation details"):
+        assert marker not in prompt
+
+
+def test_counterpart_review_prompt_stays_compact_without_losing_review_boundary(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    (repo / "app.py").write_text("print('changed')\n")
+    payload = {
+        "cpu": "codex",
+        "audit": {
+            "turn_id": "turn-compact",
+            "repo_root": str(repo),
+            "changed_files": ["app.py"],
+            "declared_checks": [{"name": "unit", "status": "passed"}],
+        },
+        "response_preview": "changed app.py",
+    }
+
+    prompt = blocking_review._build_counterpart_review_prompt(payload, reviewer="claude")
+
+    assert len(prompt) <= 1400
+    for marker in (
+        "synchronous blocking review gate",
+        "Read-only sidecar",
+        "Return JSON only",
+        "Block only concrete bugs",
+        "Do not block style",
+        "Audit summary:",
+        '"changed_files":["app.py"]',
+        "Review context:",
+    ):
+        assert marker in prompt
+    for marker in (
+        "This is a bounded sidecar review only",
+        "The source CPU will apply any fixes",
+        "Return only a JSON object",
+        "Changed files:",
+        "missing nice-to-have tests",
+    ):
+        assert marker not in prompt
