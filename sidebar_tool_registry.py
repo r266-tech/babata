@@ -304,9 +304,24 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
 ]
 
 BRIDGE_TOOL_NAMES = frozenset(t["name"] for t in SIDEBAR_TOOLS if t["dispatch"] == "bridge")
+PROACTIVE_TOOL_NAMES = frozenset({
+    "tab_metadata",
+    "page_snapshot",
+    "suggest_prompts",
+    "mascot_speak",
+})
+TOOL_SCOPE_NAMES = {
+    "full": frozenset(t["name"] for t in SIDEBAR_TOOLS),
+    "proactive": PROACTIVE_TOOL_NAMES,
+}
 
 
-def tool_specs() -> list[dict[str, Any]]:
+def tool_names(scope: str | None = None) -> frozenset[str]:
+    return TOOL_SCOPE_NAMES.get((scope or "full").strip().lower(), TOOL_SCOPE_NAMES["full"])
+
+
+def tool_specs(scope: str | None = None) -> list[dict[str, Any]]:
+    allowed = tool_names(scope)
     return [
         {
             "name": tool["name"],
@@ -314,4 +329,5 @@ def tool_specs() -> list[dict[str, Any]]:
             "inputSchema": deepcopy(tool["inputSchema"]),
         }
         for tool in SIDEBAR_TOOLS
+        if tool["name"] in allowed
     ]

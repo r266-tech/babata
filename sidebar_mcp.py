@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import sys
 
 sys.dont_write_bytecode = True
@@ -24,7 +25,7 @@ sys.dont_write_bytecode = True
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
-from sidebar_tool_registry import BRIDGE_TOOL_NAMES, tool_specs
+from sidebar_tool_registry import BRIDGE_TOOL_NAMES, tool_names, tool_specs
 from sidebar_translate import translate_batch
 
 log = logging.getLogger(__name__)
@@ -34,11 +35,15 @@ SOCKET_PATH = "/tmp/babata-sidebar-bridge.sock"
 server = Server("sidebar")
 
 
+def _tool_scope() -> str:
+    return os.environ.get("BABATA_SIDEBAR_MCP_SCOPE", "full")
+
+
 # ── Tool surface ──────────────────────────────────────────────────────
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [Tool(**spec) for spec in tool_specs()]
+    return [Tool(**spec) for spec in tool_specs(_tool_scope())]
 
 
 # ── Bridge relay ──────────────────────────────────────────────────────
@@ -79,6 +84,9 @@ def _format_result(payload: dict) -> str:
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
+        if name not in tool_names(_tool_scope()):
+            return [TextContent(type="text", text=f"Tool not available in this sidebar scope: {name}")]
+
         # Direct browser-side primitives — round-trip via bridge.
         if name in BRIDGE_TOOL_NAMES:
             payload = await _bridge_call(name, args=arguments or {})

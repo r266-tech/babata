@@ -11,7 +11,7 @@ from pathlib import Path
 import cc as cc_module
 import sidebar_bot
 import sidebar_events
-from sidebar_tool_registry import SIDEBAR_TOOLS
+from sidebar_tool_registry import SIDEBAR_TOOLS, tool_specs
 
 
 def test_cc_exposes_public_session_helpers(tmp_path):
@@ -639,6 +639,23 @@ def test_sidebar_source_prompt_does_not_duplicate_tool_inventory():
     for tool in SIDEBAR_TOOLS:
         assert tool["name"] not in prompt
         assert "prompt" not in tool
+
+
+def test_proactive_sidebar_mcp_scope_stays_read_only_and_suggestive():
+    names = {tool["name"] for tool in tool_specs("proactive")}
+
+    assert names == {"tab_metadata", "page_snapshot", "suggest_prompts", "mascot_speak"}
+    assert not {
+        "dom_inject",
+        "dom_set",
+        "dom_click",
+        "page_click_ref",
+        "tab_navigate",
+        "tabs_close",
+        "bookmarks_create",
+    } & names
+    assert sidebar_bot.proactive_cc._mcp_servers["sidebar"]["env"]["BABATA_SIDEBAR_MCP_SCOPE"] == "proactive"
+    assert "BABATA_SIDEBAR_MCP_SCOPE" not in sidebar_bot.cc._mcp_servers["sidebar"].get("env", {})
 
 
 def test_sidebar_model_visible_tool_descriptions_stay_compact():

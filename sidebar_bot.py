@@ -401,13 +401,16 @@ GFM; 简短。
 
 # ── CC instance ───────────────────────────────────────────────────────
 
-def _sidebar_mcp_servers() -> dict[str, Any]:
-    return {
+def _sidebar_mcp_servers(scope: str = "full") -> dict[str, Any]:
+    cfg: dict[str, Any] = {
         "sidebar": {
             "command": VENV_PYTHON,
             "args": [_SIDEBAR_MCP_SCRIPT],
         },
     }
+    if scope != "full":
+        cfg["sidebar"]["env"] = {"BABATA_SIDEBAR_MCP_SCOPE": scope}
+    return cfg
 
 
 def _make_sidebar_engine(target: str | None = None):
@@ -425,7 +428,7 @@ def _make_proactive_engine(target: str | None = None):
         state_file=_PROACTIVE_SESSION_FILE,
         source_prompt=_PROACTIVE_PROMPT,
         memory_source="sidebar",
-        mcp_servers=_sidebar_mcp_servers(),
+        mcp_servers=_sidebar_mcp_servers("proactive"),
         engine=target,
     )
 
