@@ -22,8 +22,8 @@ from typing import Any
 from constants import NAMESPACE, STATE_DIR
 
 
-_MAX_PROMPT_PREVIEW = 500
-_MAX_FINAL_PREVIEW = 800
+_MAX_PROMPT_PREVIEW = 160
+_MAX_FINAL_PREVIEW = 240
 _MAX_COMMAND_PREVIEW = 500
 _MAX_CHECK_OUTPUT = 4000
 _MAX_FILE_BYTES = 512 * 1024
@@ -182,6 +182,8 @@ def begin_turn(
         },
         "declared_checks_config": checks_config_rel,
         "prompt_preview": _preview(prompt, _MAX_PROMPT_PREVIEW),
+        "prompt_sha256": _sha256_text(prompt),
+        "prompt_bytes": _text_bytes(prompt),
         "images_count": images_count,
     }
     _append_jsonl(_ledger_path(), turn.record)
@@ -246,6 +248,8 @@ def finish_turn(
         "review_bus_mode": review_bus_mode(),
         "review_tasks": review_tasks,
         "final_preview": _preview(final_content, _MAX_FINAL_PREVIEW),
+        "final_sha256": _sha256_text(final_content),
+        "final_bytes": _text_bytes(final_content),
         "error": {
             "type": type(error).__name__,
             "message": str(error),
@@ -1048,6 +1052,10 @@ def _ordered_unique(items: list[str]) -> list[str]:
 
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _text_bytes(text: str) -> int:
+    return len(text.encode("utf-8", errors="replace"))
 
 
 def _preview(text: str, limit: int) -> str:

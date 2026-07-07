@@ -82,6 +82,42 @@ def test_turn_audit_records_ledger_guards_checks_and_review_bus(monkeypatch, tmp
     assert review_rows[0]["source_cpu"] == "codex"
 
 
+def test_turn_audit_caps_prompt_and_final_previews(monkeypatch, tmp_path):
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("BABATA_TURN_LEDGER", "1")
+    monkeypatch.setenv("BABATA_AUDIT_DIR", str(audit_dir))
+    monkeypatch.setenv("BABATA_REVIEW_BUS", "off")
+    long_prompt = "prompt-" + ("p" * 400) + "-PROMPT-TAIL"
+    long_final = "answer-" + ("a" * 500) + "-FINAL-TAIL"
+
+    turn = turn_audit.begin_turn(
+        cpu="codex",
+        channel="test",
+        prompt=long_prompt,
+        session_id_before=None,
+        cwd=tmp_path,
+    )
+    assert turn is not None
+    summary = turn_audit.finish_turn(
+        turn,
+        response=Response(content=long_final, session_id="sid-1", cost=0.0),
+    )
+
+    assert summary is not None
+    raw = (audit_dir / "babata-turn-ledger.jsonl").read_text(encoding="utf-8")
+    assert "PROMPT-TAIL" not in raw
+    assert "FINAL-TAIL" not in raw
+    begin, finish = _jsonl(audit_dir / "babata-turn-ledger.jsonl")
+    assert begin["prompt_preview"].endswith("...")
+    assert finish["final_preview"].endswith("...")
+    assert len(begin["prompt_preview"]) <= turn_audit._MAX_PROMPT_PREVIEW + 3
+    assert len(finish["final_preview"]) <= turn_audit._MAX_FINAL_PREVIEW + 3
+    assert begin["prompt_sha256"] == turn_audit._sha256_text(long_prompt)
+    assert begin["prompt_bytes"] == len(long_prompt.encode("utf-8"))
+    assert finish["final_sha256"] == turn_audit._sha256_text(long_final)
+    assert finish["final_bytes"] == len(long_final.encode("utf-8"))
+
+
 def test_permission_guard_can_enforce_dangerous_commands(monkeypatch):
     monkeypatch.setenv("BABATA_DETERMINISTIC_GUARDS", "enforce")
     block, reason = turn_audit.should_block_for_permission(
