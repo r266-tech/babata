@@ -216,6 +216,8 @@ def test_tg_mcp_voice_description_is_resolved_when_tools_are_listed(monkeypatch)
 def test_tg_instance_schema_stays_compact_without_losing_route_values():
     assert tg_mcp.INSTANCE_SCHEMA["enum"] == tg_mcp.TG_INSTANCES
     assert "description" not in tg_mcp.INSTANCE_SCHEMA
+    assert "weixin" not in tg_mcp.TG_INSTANCES
+    assert "sidebar" not in tg_mcp.TG_INSTANCES
 
 
 def test_tg_mcp_schema_helper_keeps_tool_contracts():

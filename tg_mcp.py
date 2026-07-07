@@ -34,9 +34,9 @@ _RETRYABLE_CONNECT_ERRNOS = {
 }
 
 # TG bot instances exposed via optional `instance` tool argument. Derived from
-# INSTANCE_LABELS so OSS forks inherit the map automatically. WeChat has its
-# own MCP (weixin_mcp.py), so we exclude it here.
-TG_INSTANCES = [k for k in INSTANCE_LABELS if k != "weixin"]
+# INSTANCE_LABELS so OSS forks inherit the map automatically. WeChat and
+# Sidebar have their own MCP surfaces, so they are not TG route targets.
+TG_INSTANCES = [k for k in INSTANCE_LABELS if k not in {"weixin", "sidebar"}]
 
 INSTANCE_SCHEMA = {
     "type": "string",
