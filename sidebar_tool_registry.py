@@ -25,7 +25,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "tab_metadata",
         "dispatch": "bridge",
         "description": (
-            "Read url/title/selection/scroll/lang only; no DOM text. Use first; pass tab_id/window_id."
+            "Read url/title/selection/scroll/lang; no DOM text. Use first; pass tab_id/window_id."
         ),
         "inputSchema": {"type": "object", "properties": _target_props()},
     },
@@ -33,7 +33,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "dom_query",
         "dispatch": "bridge",
         "description": (
-            "CSS query on target tab. Defaults body, tag/text, limit 50; use root/props to narrow."
+            "CSS query target tab; default body tag/text limit 50; root/props narrow."
         ),
         "inputSchema": {
             "type": "object",
@@ -99,7 +99,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "page_snapshot",
         "dispatch": "bridge",
         "description": (
-            "Visible-page map for UI reasoning/clicking: refs, roles, names, selectors, rects."
+            "Visible UI map for clicking: refs, roles, names, selectors, rects."
         ),
         "inputSchema": {
             "type": "object",
@@ -120,7 +120,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "page_click_ref",
         "dispatch": "bridge",
         "description": (
-            "Click stored page_snapshot ref on same tab; needs snapshot_id/ref; stale refs error."
+            "Click page_snapshot ref; needs snapshot_id/ref; stale refs error."
         ),
         "inputSchema": {
             "type": "object",
@@ -145,7 +145,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "translate",
         "dispatch": "translate",
         "description": (
-            "Translate plain text to target_lang, default zh; no DOM side effect."
+            "Translate text to target_lang, default zh; no DOM side effect."
         ),
         "inputSchema": {
             "type": "object",
@@ -177,7 +177,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "mascot_speak",
         "dispatch": "notify",
         "description": (
-            "Show <=40 zh char bubble for opinion/heads-up/invitation; auto-dismiss 30s."
+            "Show <=40 zh char bubble; auto-dismiss 30s."
         ),
         "inputSchema": {
             "type": "object",
@@ -210,7 +210,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "bookmarks_create",
         "dispatch": "bridge",
         "description": (
-            "Create bookmark; parent_id optional, use bookmarks_tree when folder matters."
+            "Create bookmark; parent_id optional; use bookmarks_tree for folders."
         ),
         "inputSchema": {
             "type": "object",
@@ -226,7 +226,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "tabs_query",
         "dispatch": "bridge",
         "description": (
-            "Query tabs by active/audible/pinned/window/url; returns id/state/group/access."
+            "Query tabs by active/audible/pinned/window/url; returns id/state/group."
         ),
         "inputSchema": {
             "type": "object",
@@ -288,7 +288,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "history_search",
         "dispatch": "bridge",
         "description": (
-            "Search history by url/title; start_ms/end_ms epoch ms, default max 100."
+            "Search history by url/title; start_ms/end_ms epoch, max 100."
         ),
         "inputSchema": {
             "type": "object",
