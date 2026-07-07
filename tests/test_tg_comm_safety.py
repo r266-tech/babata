@@ -224,7 +224,16 @@ def test_tg_mcp_schema_helper_keeps_tool_contracts():
     ]
     assert sum(len(description) for description in descriptions) <= 650
     assert schema_descriptions == []
-    for marker in ("the user's", "to the user"):
+    forbidden_markers = (
+        "the user's",
+        "to the user",
+        "babata's",
+        "You are babata",
+        "你是 babata",
+        "共同进化",
+        "身份认同",
+    )
+    for marker in forbidden_markers:
         assert all(marker not in description for description in descriptions)
     required = {
         "tg_send_buttons": ["text", "options"],

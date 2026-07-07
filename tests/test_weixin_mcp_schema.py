@@ -41,7 +41,16 @@ def test_wx_tool_descriptions_stay_compact_and_schema_owned():
     assert sum(len(description) for description in descriptions) <= 390
     assert max(len(description) for description in descriptions) <= 140
     assert schema_descriptions == []
-    for marker in ("the user's", "to the user"):
+    forbidden_markers = (
+        "the user's",
+        "to the user",
+        "babata's",
+        "You are babata",
+        "你是 babata",
+        "共同进化",
+        "身份认同",
+    )
+    for marker in forbidden_markers:
         assert all(marker not in description for description in descriptions)
     typing = tools["wx_send_typing"]
     assert typing.description == "Show/cancel WeChat typing indicator; status 1 on, 2 off."
