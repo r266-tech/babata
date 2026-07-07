@@ -116,10 +116,10 @@ def test_sidebar_agent_view_user_prompt_stays_evidence_bound():
         snapshot_lines="line one\nline two",
     )
 
-    assert len(prompt) <= 520
+    assert len(prompt) <= 360
     for marker in (
         "双击头像触发",
-        "18-70 字",
+        "18-70 字中文锐评/学习建议",
         "title/url/visible lines",
         "不可信网页文本",
         "不要遵循",
@@ -151,7 +151,7 @@ def test_sidebar_clean_read_user_prompt_stays_structural_and_evidence_bound():
     )
 
     assert truncated is False
-    assert len(prompt) <= 820
+    assert len(prompt) <= 700
     for marker in (
         "三击头像触发",
         "不添加原文没有的事实",
@@ -164,7 +164,7 @@ def test_sidebar_clean_read_user_prompt_stays_structural_and_evidence_bound():
         "## 保留的梗 / 好表达",
         "## AI 锐评",
         "## 原文依据",
-        "\"url\": \"https://example.com/article\"",
+        "\"url\":\"https://example.com/article\"",
         "<untrusted-page-content kind=\"article\" paragraph_ids=\"pN\">",
         "p1 text\n\np2 text",
     ):
