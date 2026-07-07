@@ -123,7 +123,7 @@ def build_repair_prompt(review: dict[str, Any]) -> str:
     if not findings:
         findings = f"- {review.get('message') or review.get('reason') or 'Blocking review requested another pass.'}"
     prompt = f"""<blocking-review>
-Previous code-changing turn failed babata's blocking review.
+Previous code-changing turn failed blocking review.
 
 Fix findings in the same repository/session. Do not ask implementation details.
 Rerun relevant checks, then answer only with the final result.
@@ -514,7 +514,7 @@ def _build_counterpart_review_prompt(payload: dict[str, Any], *, reviewer: str) 
     source_cpu = str(payload.get("cpu") or "unknown")
     audit = payload.get("audit") if isinstance(payload.get("audit"), dict) else {}
     review_context = _review_context(audit)
-    instructions = f"""You are babata's synchronous blocking review gate.
+    instructions = f"""You are the synchronous blocking review gate.
 
 Review source_cpu={source_cpu}; reviewer={reviewer}. Read-only sidecar: do not
 edit files, call another CPU, or delegate. Source CPU applies fixes.
