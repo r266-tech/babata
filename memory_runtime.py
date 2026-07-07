@@ -125,14 +125,16 @@ def format_memory_reflex_hint(reflex: dict[str, Any]) -> str:
         return ""
     reasons = reflex.get("reasons")
     reason_text = "; ".join(str(r) for r in reasons[:3]) if isinstance(reasons, list) else ""
-    return "\n".join([
+    lines = [
         "<memory-reflex>",
         f"routes: {', '.join(routes)}",
         f"profile: {profile}",
-        "note: router signal only; retrieve deeper evidence only when useful.",
-        f"why: {reason_text}" if reason_text else "why: unspecified",
-        "</memory-reflex>",
-    ])
+        "signal: route only; drill down only if useful.",
+    ]
+    if reason_text:
+        lines.append(f"why: {reason_text}")
+    lines.append("</memory-reflex>")
+    return "\n".join(lines)
 
 
 def _memory_reflex_log_path() -> Path:
