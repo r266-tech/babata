@@ -625,10 +625,9 @@ def test_sidebar_model_visible_tool_descriptions_stay_compact():
         if isinstance(prop, dict) and prop.get("description")
     ]
 
-    assert sum(len(description) for description in descriptions) <= 2300
-    assert max(len(description) for description in descriptions) <= 170
-    assert sum(len(description) for description in schema_descriptions) <= 320
-    assert max(len(description) for description in schema_descriptions) <= 70
+    assert sum(len(description) for description in descriptions) <= 1500
+    assert max(len(description) for description in descriptions) <= 105
+    assert schema_descriptions == []
     target_fields = [
         prop
         for tool in SIDEBAR_TOOLS
