@@ -21,7 +21,6 @@ OPTIONAL_FILES = (
     "provider-slots.json",
     "models_cache.json",
     "version.json",
-    "AGENTS.md",
 )
 
 

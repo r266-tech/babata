@@ -21,17 +21,21 @@ def test_materialize_copies_required_and_optional_files_with_safe_modes(tmp_path
 
     synced = codex_home_runtime.materialize(headless_home, desktop_home)
 
-    assert synced == ["auth.json", "config.toml", "provider-slots.json", "AGENTS.md"]
+    assert synced == ["auth.json", "config.toml", "provider-slots.json"]
     assert (headless_home / "auth.json").read_text() == '{"token":"secret"}'
     assert (headless_home / "config.toml").read_text() == 'model = "gpt-5.5"\n'
     assert _mode(headless_home) == 0o700
     assert _mode(headless_home / "auth.json") == 0o600
     assert _mode(headless_home / "config.toml") == 0o644
     assert _mode(headless_home / "provider-slots.json") == 0o600
-    assert _mode(headless_home / "AGENTS.md") == 0o644
+    assert not (headless_home / "AGENTS.md").exists()
     for name in ("sessions", "log", "tmp"):
         assert (headless_home / name).is_dir()
         assert _mode(headless_home / name) == 0o700
+
+
+def test_materialize_does_not_copy_desktop_prompt_adapter():
+    assert "AGENTS.md" not in codex_home_runtime.OPTIONAL_FILES
 
 
 def test_materialize_fails_when_required_file_is_missing(tmp_path):
