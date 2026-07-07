@@ -154,11 +154,11 @@ def test_tg_mcp_tool_descriptions_stay_operational():
     page = tools["tg_send_page"]
     voice = tools["tg_send_voice"]
 
-    assert len(buttons.description) <= 125
+    assert len(buttons.description) <= 100
     for marker in ("interactive buttons", "string callback", "{label,url}", "Links sent"):
         assert marker in buttons.description
 
-    assert len(text.description) <= 180
+    assert len(text.description) <= 140
     for marker in ("Telegram", "auto-delivered", "mid-turn pushes", "long-running progress", "proactive sends"):
         assert marker in text.description
     for marker in (
@@ -174,12 +174,7 @@ def test_tg_mcp_tool_descriptions_stay_operational():
         assert marker in page.description
     for marker in ("Instant View card", "syntax-highlighted", "<ul>/<ol>", "h3/h4", "unsupported elements"):
         assert marker not in page.description
-    title_description = page.inputSchema["properties"]["title"]["description"]
-    assert title_description == "Page title"
-    for marker in ("Instant View", "preview snippet"):
-        assert marker not in title_description
-
-    assert len(voice.description) <= 150
+    assert len(voice.description) <= 120
     for marker in ("voice message",):
         assert marker in voice.description
     for marker in (
@@ -204,11 +199,7 @@ def test_tg_mcp_voice_description_is_resolved_when_tools_are_listed(monkeypatch)
 
 def test_tg_instance_schema_stays_compact_without_losing_route_values():
     assert tg_mcp.INSTANCE_SCHEMA["enum"] == tg_mcp.TG_INSTANCES
-    assert len(tg_mcp.INSTANCE_SCHEMA["description"]) <= 25
-    for marker in ("Optional", "TG bot selector"):
-        assert marker in tg_mcp.INSTANCE_SCHEMA["description"]
-    for label in (*tg_mcp.INSTANCE_LABELS.values(), "bound channel", "Omit"):
-        assert label not in tg_mcp.INSTANCE_SCHEMA["description"]
+    assert "description" not in tg_mcp.INSTANCE_SCHEMA
 
 
 def test_tg_mcp_schema_helper_keeps_tool_contracts():
@@ -231,15 +222,8 @@ def test_tg_mcp_schema_helper_keeps_tool_contracts():
         "tg_send_video",
         "tg_send_page",
     ]
-    assert sum(len(description) for description in descriptions) <= 730
-    assert sum(len(description) for description in schema_descriptions) <= 420
-    assert max(len(description) for description in schema_descriptions) <= 45
-    voice = tools["tg_send_voice"].inputSchema["properties"]
-    page = tools["tg_send_page"].inputSchema["properties"]
-    assert voice["text"]["description"] == "Text to speak"
-    assert voice["voice"]["description"] == "Optional backend voice id"
-    assert page["content_md"]["description"] == "Markdown body; do NOT repeat title"
-    assert page["caption"]["description"] == "Optional text above URL"
+    assert sum(len(description) for description in descriptions) <= 650
+    assert schema_descriptions == []
     for marker in ("the user's", "to the user"):
         assert all(marker not in description for description in descriptions)
     required = {

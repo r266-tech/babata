@@ -41,7 +41,6 @@ TG_INSTANCES = [k for k in INSTANCE_LABELS if k != "weixin"]
 INSTANCE_SCHEMA = {
     "type": "string",
     "enum": TG_INSTANCES,
-    "description": "Optional TG bot selector.",
 }
 
 
@@ -59,17 +58,15 @@ server = Server("tg")
 
 def _voice_description() -> str:
     """Facts about the actual TTS backend so CC can decide how to use markup."""
-    base = "Synthesize text to speech and send as a TG voice message."
+    base = "Synthesize text to TG voice message."
     backend = os.environ.get("TTS_BACKEND", "openai").lower()
     has_custom_url = bool(os.environ.get("TTS_URL"))
 
     if backend == "mimo" and has_custom_url:
-        return (
-            f"{base} Current Mimo backend supports <style> prefix and full-width paren cues."
-        )
+        return f"{base} Mimo supports <style> prefix and full-width paren cues."
     if has_custom_url:
-        return f"{base} Current backend is OpenAI-compatible /audio/speech (plain text, no markup)."
-    return f"{base} Current backend is edge-tts (plain text, no markup)."
+        return f"{base} OpenAI-compatible /audio/speech: plain text, no markup."
+    return f"{base} edge-tts: plain text, no markup."
 
 
 def _object_schema(properties: dict, required: list[str] | None = None) -> dict:
@@ -91,11 +88,10 @@ _TG_TOOL_SPECS = (
     (
         "tg_send_buttons",
         (
-            "Send interactive buttons: string callback or {label,url} link. "
-            "Returns clicked label, or 'Links sent' for URL-only."
+            "Send interactive buttons: string callback or {label,url} link; URL-only returns 'Links sent'."
         ),
         {
-            "text": {"type": "string", "description": "Message above buttons"},
+            "text": {"type": "string"},
             "options": {
                 "type": "array",
                 "items": {
@@ -121,8 +117,7 @@ _TG_TOOL_SPECS = (
     (
         "tg_send_text",
         (
-            "Send plain text to Telegram. "
-            "Final-turn TG replies are auto-delivered; use this additive tool only for "
+            "Send plain text to Telegram. Final replies are auto-delivered; use only for "
             "mid-turn pushes, long-running progress, or proactive sends."
         ),
         {
@@ -133,9 +128,9 @@ _TG_TOOL_SPECS = (
     ),
     (
         "tg_send_file",
-        "Send a local file as a TG document.",
+        "Send local file as TG document.",
         {
-            "path": {"type": "string", "description": "Absolute or ~-relative file path"},
+            "path": {"type": "string"},
             "caption": {"type": "string"},
             "instance": INSTANCE_SCHEMA,
         },
@@ -143,7 +138,7 @@ _TG_TOOL_SPECS = (
     ),
     (
         "tg_send_album",
-        "Send 2-10 local images as a TG media album.",
+        "Send 2-10 local images as TG album.",
         {
             "paths": {
                 "type": "array",
@@ -158,11 +153,11 @@ _TG_TOOL_SPECS = (
     ),
     (
         "tg_send_location",
-        "Send a pinpoint location. Attaches an Amap open-link button.",
+        "Send location with Amap open-link button.",
         {
             "latitude": {"type": "number"},
             "longitude": {"type": "number"},
-            "name": {"type": "string", "description": "Optional place name for the map label"},
+            "name": {"type": "string"},
             "instance": INSTANCE_SCHEMA,
         },
         ["latitude", "longitude"],
@@ -171,10 +166,9 @@ _TG_TOOL_SPECS = (
         "tg_send_voice",
         _voice_description,
         {
-            "text": {"type": "string", "description": "Text to speak"},
+            "text": {"type": "string"},
             "voice": {
                 "type": "string",
-                "description": "Optional backend voice id",
             },
             "instance": INSTANCE_SCHEMA,
         },
@@ -182,7 +176,7 @@ _TG_TOOL_SPECS = (
     ),
     (
         "tg_send_video",
-        "Send a local video file (mp4/mov) as a TG video message.",
+        "Send local mp4/mov as TG video.",
         {
             "path": {"type": "string"},
             "caption": {"type": "string"},
@@ -199,15 +193,12 @@ _TG_TOOL_SPECS = (
         {
             "title": {
                 "type": "string",
-                "description": "Page title",
             },
             "content_md": {
                 "type": "string",
-                "description": "Markdown body; do NOT repeat title",
             },
             "caption": {
                 "type": "string",
-                "description": "Optional text above URL",
             },
             "instance": INSTANCE_SCHEMA,
         },
