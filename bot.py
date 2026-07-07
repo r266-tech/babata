@@ -5246,7 +5246,7 @@ def _resume_categories_for_current_cpu() -> list[tuple[str, str, list[str], bool
     return [(cat_id, "当前 Codex", labels, scan_all)]
 
 
-def _render_resume_channel_picker() -> tuple[str, "InlineKeyboardMarkup"]:
+def _render_resume_channel_picker() -> tuple[str, Any]:
     """Build the Level-1 渠道 picker (header text + keyboard).
 
     Shared between /resume command (initial display) and resume-back callback

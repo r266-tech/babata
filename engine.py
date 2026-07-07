@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from cc import CC, LiveSession, VENV_PYTHON
+from cc import CC, LiveSession, VENV_PYTHON as VENV_PYTHON
 from codex_engine import CodexEngine, CodexLiveSession
 
 ENGINE_STATE_KEY = "assistant_engine"

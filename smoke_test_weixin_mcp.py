@@ -103,7 +103,7 @@ async def main() -> None:
 
     print()
     print("── SUMMARY ──")
-    failed = [l for l, _, ok in results if not ok]
+    failed = [label for label, _, ok in results if not ok]
     for label, result, ok in results:
         mark = "✓" if ok else "✗"
         print(f"  {mark}  {label:35s}  {result}")

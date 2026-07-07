@@ -186,7 +186,7 @@ def _probe_with_auth(base: str, headers: dict[str, str]) -> tuple[str, list[str]
     if code in (401, 403):
         return _PROBE_STATUS_AUTH, [], f"鉴权失败 HTTP {code}: {body}"
     if code == 404:
-        return _PROBE_STATUS_MISSING, [], f"endpoint 不实现 /v1/models (HTTP 404)"
+        return _PROBE_STATUS_MISSING, [], "endpoint 不实现 /v1/models (HTTP 404)"
     if code == 408 or code == 429 or 500 <= code < 600:
         return _PROBE_STATUS_TRANSIENT, [], f"服务端临时错误 HTTP {code}: {body}"
     return _PROBE_STATUS_OTHER, [], f"HTTP {code}: {body}"
@@ -708,7 +708,7 @@ def main() -> int:
     # 1. Claude auth (落盘一次)
     auth = step_model_auth()
     write_env(auth)
-    print(f"✓ .env 已写入 Claude auth")
+    print("✓ .env 已写入 Claude auth")
 
     # 2. CLAUDE_CLI_PATH (落盘一次)
     # PATH 里没找到时显式探常见安装目录 — 用户单独跑 wizard.py 没经过 install.sh
@@ -730,7 +730,7 @@ def main() -> int:
     tg = step_tg()
     if tg:
         write_env(tg)
-        print(f"✓ .env 已写入 TG channel")
+        print("✓ .env 已写入 TG channel")
         tg_configured = True
     else:
         write_env({"TELEGRAM_BOT_TOKEN": "", "ALLOWED_USER_ID": ""})
