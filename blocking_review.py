@@ -316,6 +316,20 @@ def _run_claude_counterpart_review(payload: dict[str, Any], round_index: int) ->
     result["exit_code"] = proc.returncode
     result["raw_output"] = _trim(text or raw, _MAX_RAW_OUTPUT)
     if proc.returncode != 0 or nested_exit_code not in (None, 0) or nested_timed_out:
+        if _looks_like_counterpart_infra_failure(raw or text):
+            message = _counterpart_infra_failure_message(
+                raw or text,
+                f"cc-worker exited {proc.returncode}",
+            )
+            result = _review_infra_failure(
+                "claude-counterpart",
+                message,
+                round_index,
+            )
+            result["duration_ms"] = round((time.time() - started) * 1000)
+            result["exit_code"] = proc.returncode
+            result["raw_output"] = _trim(text or raw, _MAX_RAW_OUTPUT)
+            return result
         _force_review_failure(
             result,
             "counterpart-review-failed",
@@ -382,6 +396,20 @@ def _run_codex_counterpart_review(payload: dict[str, Any], round_index: int) -> 
     result["exit_code"] = proc.returncode
     result["raw_output"] = _trim(output_text or raw, _MAX_RAW_OUTPUT)
     if proc.returncode != 0:
+        if _looks_like_counterpart_infra_failure(raw):
+            message = _counterpart_infra_failure_message(
+                raw,
+                f"codex exited {proc.returncode}",
+            )
+            result = _review_infra_failure(
+                "codex-counterpart",
+                message,
+                round_index,
+            )
+            result["duration_ms"] = round((time.time() - started) * 1000)
+            result["exit_code"] = proc.returncode
+            result["raw_output"] = _trim(output_text or raw, _MAX_RAW_OUTPUT)
+            return result
         _force_review_failure(
             result,
             "counterpart-review-failed",
@@ -731,6 +759,40 @@ def _review_infra_failure(reviewer: str, message: str, round_index: int) -> dict
             round_index=round_index,
         )
     return _result("passed", reviewer=reviewer, reason=message, round_index=round_index)
+
+
+def _looks_like_counterpart_infra_failure(output: str) -> bool:
+    text = output.lower()
+    markers = (
+        "invalid api key",
+        "incorrect api key",
+        "api_error_status\": 401",
+        "api_error_status': 401",
+        "authentication failed",
+        "unauthorized",
+        "fix external api key",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _counterpart_infra_failure_message(output: str, fallback: str) -> str:
+    data = _extract_json_object(output)
+    candidates: list[Any] = []
+    if isinstance(data, dict):
+        worker = data.get("worker")
+        if isinstance(worker, dict):
+            candidates.append(worker.get("last_error"))
+        turn = data.get("initial_turn") or data.get("turn")
+        if isinstance(turn, dict):
+            candidates.append(turn.get("text"))
+            parsed = turn.get("parsed")
+            if isinstance(parsed, dict):
+                candidates.append(parsed.get("result"))
+    candidates.append(output)
+    for candidate in candidates:
+        if isinstance(candidate, str) and _looks_like_counterpart_infra_failure(candidate):
+            return _trim(f"counterpart reviewer infrastructure unavailable: {candidate}", _MAX_FINDING_TEXT)
+    return _trim(f"counterpart reviewer infrastructure unavailable: {fallback}", _MAX_FINDING_TEXT)
 
 
 def _force_review_failure(result: dict[str, Any], rule: str, message: str) -> None:

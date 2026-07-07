@@ -277,6 +277,86 @@ def test_counterpart_review_skips_when_already_inside_reviewer(monkeypatch, tmp_
     assert result["reason"] == "counterpart review skipped inside delegated reviewer"
 
 
+def test_counterpart_auth_failure_degrades_when_not_strict(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    (repo / "app.py").write_text("print('draft')\n")
+    calls = []
+
+    class Proc:
+        returncode = 1
+        stdout = json.dumps({
+            "initial_turn": {
+                "exit_code": 1,
+                "timed_out": False,
+                "text": "Invalid API key · Fix external API key",
+                "parsed": {"api_error_status": 401},
+            }
+        })
+        stderr = ""
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return Proc()
+
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW_COUNTERPART", "1")
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW_INFRA_STRICT", "0")
+    monkeypatch.setenv("BABATA_AUDIT_DIR", str(tmp_path / "audit"))
+    monkeypatch.setattr(blocking_review, "_cc_worker_cli", lambda: Path("/bin/cc-worker"))
+    monkeypatch.setattr(blocking_review.subprocess, "run", fake_run)
+
+    result = blocking_review.run_blocking_review(
+        {"turn_id": "turn-auth", "repo_root": str(repo), "changed_files": ["app.py"]},
+        cpu="codex",
+        channel="test",
+        response_content="draft",
+        round_index=0,
+    )
+
+    assert result["status"] == "passed"
+    assert result["reviewer"] == "claude-counterpart"
+    assert "Invalid API key" in result["reason"]
+    assert result["findings"] == []
+    assert any(call[0][0] == "/bin/cc-worker" and call[0][1] == "remove" for call in calls)
+
+
+def test_counterpart_auth_failure_blocks_when_strict(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    (repo / "app.py").write_text("print('draft')\n")
+
+    class Proc:
+        returncode = 1
+        stdout = json.dumps({
+            "initial_turn": {
+                "exit_code": 1,
+                "timed_out": False,
+                "text": "Invalid API key · Fix external API key",
+            }
+        })
+        stderr = ""
+
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW_COUNTERPART", "1")
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW_INFRA_STRICT", "1")
+    monkeypatch.setenv("BABATA_AUDIT_DIR", str(tmp_path / "audit"))
+    monkeypatch.setattr(blocking_review, "_cc_worker_cli", lambda: Path("/bin/cc-worker"))
+    monkeypatch.setattr(blocking_review.subprocess, "run", lambda *_args, **_kwargs: Proc())
+
+    result = blocking_review.run_blocking_review(
+        {"turn_id": "turn-auth", "repo_root": str(repo), "changed_files": ["app.py"]},
+        cpu="codex",
+        channel="test",
+        response_content="draft",
+        round_index=0,
+    )
+
+    assert result["status"] == "needs_fix"
+    assert result["reviewer"] == "claude-counterpart"
+    assert result["findings"][0]["rule"] == "review-infra"
+
+
 def test_repair_prompt_stays_compact_without_losing_repair_boundary():
     prompt = blocking_review.build_repair_prompt({
         "findings": [
