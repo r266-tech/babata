@@ -88,6 +88,13 @@ def _read_all(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
+def test_truncate_is_idempotent(monkeypatch):
+    monkeypatch.setattr(tg_transcript, "_MAX_TEXT", 8)
+    truncated = tg_transcript._truncate("abcdefghijk")
+
+    assert tg_transcript._truncate(truncated) == truncated
+
+
 def test_record_update_keeps_primary_text_but_not_reply_text(tmp_path, monkeypatch):
     transcript = tmp_path / "tg.jsonl"
     monkeypatch.setattr(tg_transcript, "TRANSCRIPT_FILE", transcript)
@@ -108,6 +115,22 @@ def test_record_update_keeps_primary_text_but_not_reply_text(tmp_path, monkeypat
     assert event["message"]["media"][0]["kind"] == "photo"
     assert event["message"]["media"][0]["file_id"] == "large"
     assert event["message"]["media"][0]["photo_count"] == 2
+
+
+def test_record_update_caps_primary_text_with_hash(tmp_path, monkeypatch):
+    transcript = tmp_path / "tg.jsonl"
+    monkeypatch.setattr(tg_transcript, "TRANSCRIPT_FILE", transcript)
+    monkeypatch.setattr(tg_transcript, "_MAX_TEXT", 32)
+    text = "hello-" + ("x" * 80) + "-TEXT-TAIL"
+
+    tg_transcript.record_update(FakeUpdate(FakeMessage(10, text)), "text")
+
+    raw = transcript.read_text(encoding="utf-8")
+    assert "TEXT-TAIL" not in raw
+    event = _read_one(transcript)
+    assert event["message"]["text"].endswith("chars]")
+    assert event["message"]["text_sha256"] == tg_transcript._sha256_text(text)
+    assert event["message"]["text_bytes"] == len(text.encode("utf-8"))
 
 
 def test_record_update_keeps_callback_data_but_not_callback_message_text(tmp_path, monkeypatch):
@@ -182,6 +205,35 @@ def test_install_bot_transcript_logs_outbound_even_for_slot_bot(tmp_path, monkey
     assert "text" not in result["result"]
 
 
+def test_install_bot_transcript_caps_outbound_text_with_hash(tmp_path, monkeypatch):
+    transcript = tmp_path / "tg.jsonl"
+    monkeypatch.setattr(tg_transcript, "TRANSCRIPT_FILE", transcript)
+    monkeypatch.setattr(tg_transcript, "_MAX_TEXT", 32)
+    text = "reply-" + ("r" * 80) + "-OUTBOUND-TAIL"
+
+    class SlotBot:
+        __slots__ = ()
+
+        async def send_message(self, chat_id, text, **kwargs):
+            msg = FakeMessage(44, text)
+            msg.chat = FakeChat(chat_id)
+            return msg
+
+    async def run():
+        bot = SlotBot()
+        tg_transcript.install_bot_transcript(bot)
+        await bot.send_message(chat_id=123, text=text)
+
+    asyncio.run(run())
+
+    raw = transcript.read_text(encoding="utf-8")
+    assert "OUTBOUND-TAIL" not in raw
+    attempt, _result = _read_all(transcript)
+    assert attempt["request"]["text"].endswith("chars]")
+    assert attempt["request"]["text_sha256"] == tg_transcript._sha256_text(text)
+    assert attempt["request"]["text_bytes"] == len(text.encode("utf-8"))
+
+
 def test_install_bot_transcript_summary_failure_still_sends(tmp_path, monkeypatch):
     transcript = tmp_path / "tg.jsonl"
     monkeypatch.setattr(tg_transcript, "TRANSCRIPT_FILE", transcript)
@@ -213,12 +265,14 @@ def test_install_bot_transcript_summary_failure_still_sends(tmp_path, monkeypatc
 def test_install_bot_transcript_logs_outbound_error_after_attempt(tmp_path, monkeypatch):
     transcript = tmp_path / "tg.jsonl"
     monkeypatch.setattr(tg_transcript, "TRANSCRIPT_FILE", transcript)
+    monkeypatch.setattr(tg_transcript, "_MAX_TEXT", 32)
+    error_message = "telegram-" + ("e" * 80) + "-ERROR-TAIL"
 
     class FailingBot:
         __slots__ = ()
 
         async def send_message(self, chat_id, text, **kwargs):
-            raise RuntimeError("telegram down")
+            raise RuntimeError(error_message)
 
     async def run():
         bot = FailingBot()
@@ -238,3 +292,7 @@ def test_install_bot_transcript_logs_outbound_error_after_attempt(tmp_path, monk
     assert error["phase"] == "error"
     assert error["event_id"] == attempt["event_id"]
     assert error["error"]["type"] == "RuntimeError"
+    assert "ERROR-TAIL" not in transcript.read_text(encoding="utf-8")
+    assert error["error"]["message_preview"].endswith("chars]")
+    assert error["error"]["message_sha256"] == tg_transcript._sha256_text(error_message)
+    assert error["error"]["message_bytes"] == len(error_message.encode("utf-8"))

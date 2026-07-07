@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import hashlib
 import inspect
 import json
 import logging
@@ -24,7 +25,7 @@ TRANSCRIPT_FILE = Path(
         str(STATE_DIR / f"tg-transcript-{_INSTANCE_NAME}.jsonl"),
     )
 )
-_MAX_TEXT = int(os.environ.get("BABATA_TG_TRANSCRIPT_MAX_TEXT", "20000"))
+_MAX_TEXT = int(os.environ.get("BABATA_TG_TRANSCRIPT_MAX_TEXT", "4096"))
 _SOURCE = contextvars.ContextVar("tg_transcript_source", default="bot")
 
 _BOT_METHODS = (
@@ -65,9 +66,40 @@ def _now() -> str:
 def _truncate(text: Any) -> Any:
     if not isinstance(text, str):
         return text
+    if "... [truncated " in text and text.endswith(" chars]"):
+        return text
     if len(text) <= _MAX_TEXT:
         return text
     return f"{text[:_MAX_TEXT]}... [truncated {len(text) - _MAX_TEXT} chars]"
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _text_bytes(text: str) -> int:
+    return len(text.encode("utf-8", errors="replace"))
+
+
+def _put_text_field(out: dict[str, Any], key: str, value: Any) -> None:
+    if value is None:
+        return
+    if isinstance(value, str):
+        out[key] = _truncate(value)
+        out[f"{key}_sha256"] = _sha256_text(value)
+        out[f"{key}_bytes"] = _text_bytes(value)
+    else:
+        out[key] = value
+
+
+def _error_summary(error: BaseException) -> dict[str, Any]:
+    message = str(error)
+    return {
+        "type": type(error).__name__,
+        "message_preview": _truncate(message),
+        "message_sha256": _sha256_text(message),
+        "message_bytes": _text_bytes(message),
+    }
 
 
 def _json_safe(value: Any, depth: int = 0) -> Any:
@@ -80,11 +112,16 @@ def _json_safe(value: Any, depth: int = 0) -> Any:
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, dict):
-        return {
-            str(_truncate(k)): _json_safe(v, depth + 1)
-            for k, v in value.items()
-            if not str(k).startswith("_")
-        }
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            text_key = str(key)
+            if text_key.startswith("_"):
+                continue
+            if text_key.endswith("_sha256") and isinstance(item, str):
+                out[text_key] = item
+            else:
+                out[str(_truncate(text_key))] = _json_safe(item, depth + 1)
+        return out
     if isinstance(value, (list, tuple, set)):
         return [_json_safe(v, depth + 1) for v in value]
     return repr(value)
@@ -159,8 +196,8 @@ def _message_ref(msg: Any, *, include_content: bool = True) -> dict[str, Any]:
         "media": _media_summary(msg),
     }
     if include_content:
-        ref["text"] = _truncate(getattr(msg, "text", None))
-        ref["caption"] = _truncate(getattr(msg, "caption", None))
+        _put_text_field(ref, "text", getattr(msg, "text", None))
+        _put_text_field(ref, "caption", getattr(msg, "caption", None))
     return ref
 
 
@@ -210,7 +247,7 @@ def record_update(update: Any, source: str) -> None:
             "direction": "in",
             "source": source,
             "update_id": update_id,
-            "summary_error": {"type": type(e).__name__, "message": str(e)},
+            "summary_error": _error_summary(e),
         }
     _write(event)
 
@@ -220,11 +257,12 @@ def _arg(args: tuple[Any, ...], idx: int) -> Any:
 
 
 def _media_item_summary(item: Any) -> dict[str, Any]:
-    return {
+    out = {
         "type": type(item).__name__,
-        "caption": _truncate(getattr(item, "caption", None)),
         "media": repr(getattr(item, "media", None)),
     }
+    _put_text_field(out, "caption", getattr(item, "caption", None))
+    return out
 
 
 def _request_summary(method: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -236,9 +274,9 @@ def _request_summary(method: str, args: tuple[Any, ...], kwargs: dict[str, Any])
     }
     if method == "send_message":
         req["chat_id"] = kwargs.get("chat_id", _arg(args, 0))
-        req["text"] = kwargs.get("text", _arg(args, 1))
+        _put_text_field(req, "text", kwargs.get("text", _arg(args, 1)))
     elif method == "edit_message_text":
-        req["text"] = kwargs.get("text", _arg(args, 0))
+        _put_text_field(req, "text", kwargs.get("text", _arg(args, 0)))
         req["chat_id"] = kwargs.get("chat_id", _arg(args, 1))
         req["message_id"] = kwargs.get("message_id", _arg(args, 2))
         req["inline_message_id"] = kwargs.get("inline_message_id")
@@ -254,7 +292,7 @@ def _request_summary(method: str, args: tuple[Any, ...], kwargs: dict[str, Any])
         req["reaction"] = kwargs.get("reaction", _arg(args, 2))
     elif method in {"send_document", "send_video", "send_voice", "send_photo", "send_audio", "send_animation", "send_video_note"}:
         req["chat_id"] = kwargs.get("chat_id", _arg(args, 0))
-        req["caption"] = kwargs.get("caption")
+        _put_text_field(req, "caption", kwargs.get("caption"))
         req["filename"] = kwargs.get("filename")
         for key in ("document", "video", "voice", "photo", "audio", "animation", "video_note"):
             if key in kwargs:
@@ -270,7 +308,7 @@ def _request_summary(method: str, args: tuple[Any, ...], kwargs: dict[str, Any])
         req["longitude"] = kwargs.get("longitude", _arg(args, 2))
     elif method == "answer_callback_query":
         req["callback_query_id"] = kwargs.get("callback_query_id", _arg(args, 0))
-        req["text"] = kwargs.get("text")
+        _put_text_field(req, "text", kwargs.get("text"))
     elif method == "set_my_commands":
         commands = kwargs.get("commands", _arg(args, 0)) or []
         req["commands"] = [repr(cmd) for cmd in commands]
@@ -314,14 +352,14 @@ def install_bot_transcript(bot: Any) -> None:
                 event["request"] = _request_summary(__method, args, kwargs)
             except Exception as e:
                 log.warning("tg transcript outbound summary failed: %s", e)
-                event["summary_error"] = {"type": type(e).__name__, "message": str(e)}
+                event["summary_error"] = _error_summary(e)
             _write(event | {"phase": "attempt"})
             try:
                 result = __original(self, *args, **kwargs)
                 if inspect.isawaitable(result):
                     result = await result
             except Exception as e:
-                _write(event | {"phase": "error", "error": {"type": type(e).__name__, "message": str(e)}})
+                _write(event | {"phase": "error", "error": _error_summary(e)})
                 raise
             _write(event | {"phase": "result", "result": _result_summary(result)})
             return result
