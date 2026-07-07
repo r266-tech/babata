@@ -337,11 +337,7 @@ def _spawn_summary_generation(sid: str, source_mtime: float) -> None:
             text = _extract_session_text_for_summary(jsonl)
             if not text:
                 return
-            prompt = (
-                "用一句话 (不超过 20 个中文字) 总结下面这段 CC session 的核心主题, "
-                "让用户一眼认出是哪个对话. 只输出一句话, 不加任何前缀 / 引号 / 解释.\n\n"
-                + text
-            )
+            prompt = "20字内概括会话主题，只输出一句中文。\n\n" + text
             cli = os.environ.get("CLAUDE_CLI_PATH") or "claude"
             # Model 不写死, 跟随 ~/.claude/settings.json 全局默认:
             # CC 模型会升级, 代码里写死 'haiku' 将来可能指向弃用 tier.

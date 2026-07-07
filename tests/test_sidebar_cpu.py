@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import hashlib
+import inspect
 import json
 import os
 import time
@@ -50,6 +51,9 @@ def test_recent_session_files_scans_buckets_and_excludes_summary_sandbox(monkeyp
 
     assert cc_module._recent_session_files(scan_all_buckets=False) == [own_file]
     assert cc_module._recent_session_files(scan_all_buckets=True) == [other_file, own_file]
+    source = inspect.getsource(cc_module._spawn_summary_generation)
+    assert "20字内概括会话主题，只输出一句中文。" in source
+    assert "不加任何前缀" not in source
 
 
 def test_first_real_user_and_entrypoint_skips_synthetic_user_records(tmp_path):
