@@ -589,7 +589,7 @@ def _preview_text(value: Any, max_chars: int) -> str:
 def _origin_allowed(origin: str) -> bool:
     if (
         origin.startswith("chrome-extension://")
-        and os.environ.get("BABATA_SIDEBAR_ALLOW_ANY_EXTENSION_ORIGIN", "1") != "0"
+        and os.environ.get("BABATA_SIDEBAR_ALLOW_ANY_EXTENSION_ORIGIN", "0") == "1"
     ):
         return True
     return origin in _ALLOWED_ORIGINS

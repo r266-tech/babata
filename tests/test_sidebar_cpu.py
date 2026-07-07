@@ -535,6 +535,19 @@ def test_sidebar_sse_headers_include_no_buffer_and_cors(monkeypatch):
     }
 
 
+def test_sidebar_rejects_arbitrary_extension_origin_by_default(monkeypatch):
+    monkeypatch.delenv("BABATA_SIDEBAR_ALLOW_ANY_EXTENSION_ORIGIN", raising=False)
+
+    assert sidebar_bot._origin_allowed(f"chrome-extension://{sidebar_bot._DEFAULT_EXTENSION_ID}")
+    assert not sidebar_bot._origin_allowed("chrome-extension://not-the-babata-extension")
+
+
+def test_sidebar_allows_arbitrary_extension_origin_only_when_opted_in(monkeypatch):
+    monkeypatch.setenv("BABATA_SIDEBAR_ALLOW_ANY_EXTENSION_ORIGIN", "1")
+
+    assert sidebar_bot._origin_allowed("chrome-extension://not-the-babata-extension")
+
+
 def test_sidebar_process_attachments_routes_images_files_and_video(monkeypatch, tmp_path):
     async def fake_understand_video(path):
         assert path.read_bytes() == b"video bytes"
