@@ -29,9 +29,9 @@ PROMPT_CASES = [
     (
         "wx-source",
         lambda: wb._WX_SOURCE_PROMPT,
-        165,
+        125,
         ("Source: WeChat", "\\n\\n\\n", "No edit-message", "Max 4000", "bare URLs", "[text](url)"),
-        ("code-fence-with-syntax-highlight", "nested markdown supported"),
+        ("code-fence-with-syntax-highlight", "nested markdown supported", "HTML/task", "entities literal"),
     ),
     (
         "sidebar-source",

@@ -97,8 +97,8 @@ _WEIXIN_MCP_SCRIPT = str(Path(__file__).parent / "weixin_mcp.py")
 
 _WX_SOURCE_PROMPT = (
     "Source: WeChat. "
-    "Markdown native; bare URLs visible, [text](url) hides URL; "
-    "HTML/task lists/entities literal. New bubble: \\n\\n\\n. "
+    "Markdown ok; bare URLs visible, [text](url) hides URL. "
+    "New bubble: \\n\\n\\n. "
     "No edit-message; "
     "Max 4000."
 )
