@@ -22,14 +22,14 @@ PROMPT_CASES = [
     (
         "tg-source",
         lambda: bot._TG_SOURCE_PROMPT,
-        170,
-        ("Source: Telegram", "\\n\\n\\n", "Max 4096", "TG HTML subset", "Headings/tables/hr unsupported"),
+        145,
+        ("Source: Telegram", "\\n\\n\\n", "Max 4096", "TG HTML subset", "No headings/tables/hr"),
         ("Images/files", "user-provided context", "Progress bars", "▓", "iOS"),
     ),
     (
         "wx-source",
         lambda: wb._WX_SOURCE_PROMPT,
-        210,
+        165,
         ("Source: WeChat", "\\n\\n\\n", "No edit-message", "Max 4000", "bare URLs", "[text](url)"),
         ("code-fence-with-syntax-highlight", "nested markdown supported"),
     ),
