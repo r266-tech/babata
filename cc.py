@@ -918,7 +918,7 @@ class CC:
         Idle reset ≠ /new: fires only the babata-local session-end hook for the
         old sid. Skips skill-evolve session-start (V didn't actively reset) and
         skips the "会话已重置" reply. Next turn starts fresh and picks up the
-        standard SessionStart memory inject.
+        standard startup memory context.
 
         Default 24h, parity with hermes idle_minutes. Migration: state files
         without last_activity_at fall back to file mtime so an already-stale

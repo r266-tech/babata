@@ -1,4 +1,4 @@
-"""Shared babata memory inject/reflex runtime helpers."""
+"""Shared babata memory context/reflex runtime helpers."""
 
 from __future__ import annotations
 
@@ -259,11 +259,11 @@ def _run_memory_inject(script: Path, env: dict[str, str], timeout: float) -> str
             check=False,
         )
     except Exception as exc:
-        log.warning("babata memory inject failed: %s", exc)
+        log.warning("babata memory context render failed: %s", exc)
         return ""
     if result.returncode != 0:
         log.warning(
-            "babata memory inject exited %s: %s",
+            "babata memory context render exited %s: %s",
             result.returncode,
             result.stderr.strip()[:500],
         )
@@ -284,7 +284,7 @@ def render_babata_memory_context_event(
         return "", None
     script = memory_inject_script()
     if not script.is_file():
-        log.warning("babata memory inject script missing: %s", script)
+        log.warning("babata memory context script missing: %s", script)
         return "", None
     reflex = memory_reflex_for_prompt(
         source=source,
