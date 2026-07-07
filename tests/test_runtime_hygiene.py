@@ -24,6 +24,10 @@ def test_auto_update_has_single_canonical_implementation():
     assert "running_launchd_labels()" in canonical_text
     assert "launchctl list" in canonical_text
     assert "for label in $LABELS" in canonical_text
+    assert '"$SELF_OPS" restart "$label" "$REASON"' in canonical_text
+    assert ("launchctl " + "kickstart") not in canonical_text
+    assert "wait_runtime_idle()" not in canonical_text
+    assert "runtime_file_for_label()" not in canonical_text
     assert "--delay-restart" not in canonical_text
 
     self_ops_text = self_ops.read_text(encoding="utf-8")

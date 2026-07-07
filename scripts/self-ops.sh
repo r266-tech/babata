@@ -82,7 +82,7 @@ restart() {
     # Skip wx label: weixin_bot has no TG alert consumer for the restart-reason
     # channel — writing the file would be unread + stale-on-first-consume hazard
     # if a wx alert is added later. Same skip lives in babata-daily-restart.sh
-    # and scripts/auto-update.sh.
+    # and babata-daily-restart.sh.
     if [ "$label" != "${LABEL_PREFIX}.weixin" ]; then
         local state_dir="${PROJECT_STATE_DIR:-$REPO_DIR/state}"
         {

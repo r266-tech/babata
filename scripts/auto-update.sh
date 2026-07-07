@@ -29,7 +29,6 @@ fi
 PROJECT_NAMESPACE="${PROJECT_NAMESPACE:-babata}"
 LABEL_PREFIX="com.${PROJECT_NAMESPACE}"
 SERVICE="${PROJECT_NAMESPACE}.service"
-STATE_DIR_R="${PROJECT_STATE_DIR:-$SCRIPT_DIR/state}"
 RESTART_IDLE_WAIT_SECONDS="${RESTART_IDLE_WAIT_SECONDS:-3600}"
 
 LOG="$SCRIPT_DIR/logs/auto-update.log"
@@ -53,45 +52,10 @@ DEPS_CHANGED=0
 CLI_CHANGED=0
 SDK_CHANGED=0
 
-runtime_file_for_label() {
-    local label="$1"
-    local instance=""
-    if [ "$label" != "$LABEL_PREFIX" ]; then
-        instance="${label#"$LABEL_PREFIX".}"
-    fi
-    printf '%s/runtime-status-%s.json\n' "$STATE_DIR_R" "$instance"
-}
-
 running_launchd_labels() {
     launchctl list | awk -v prefix="$LABEL_PREFIX" '
         $1 ~ /^[0-9]+$/ && $3 ~ ("^" prefix "($|[.])") {print $3}
     '
-}
-
-wait_runtime_idle() {
-    local label="$1"
-    local runtime_file
-    runtime_file="$(runtime_file_for_label "$label")"
-    local deadline=$(( $(date +%s) + RESTART_IDLE_WAIT_SECONDS ))
-    while [ -f "$runtime_file" ]; do
-        busy=$(python3 - "$runtime_file" <<'PY' 2>/dev/null || echo 0
-import json, sys, time
-try:
-    data=json.load(open(sys.argv[1]))
-    fresh=time.time()-float(data.get("ts", 0)) < 120
-    print(1 if fresh and int(data.get("in_flight") or 0) > 0 and not data.get("shutdown_requested") else 0)
-except Exception:
-    print(0)
-PY
-)
-        [ "$busy" != "1" ] && return 0
-        if [ "$(date +%s)" -ge "$deadline" ]; then
-            echo "runtime busy for ${RESTART_IDLE_WAIT_SECONDS}s; skip restart: $label"
-            return 1
-        fi
-        sleep 1
-    done
-    return 0
 }
 
 # 1) git pull (ff-only, 本地有 modify 时 skip 避冲突)
@@ -178,14 +142,15 @@ if [ "$CODE_CHANGED" = "1" ] || [ "$DEPS_CHANGED" = "1" ] || [ "$CLI_CHANGED" = 
             if [ -z "$LABELS" ]; then
                 echo "WARNING: no running ${LABEL_PREFIX}* agents, nothing to restart"
             else
+                SELF_OPS="$SCRIPT_DIR/scripts/self-ops.sh"
+                if [ ! -x "$SELF_OPS" ]; then
+                    echo "WARNING: self-ops helper missing or not executable: $SELF_OPS"
+                    exit 1
+                fi
                 for label in $LABELS; do
-                    if [ "$label" != "com.${PROJECT_NAMESPACE}.weixin" ]; then
-                        mkdir -p "$STATE_DIR_R" 2>/dev/null && \
-                            printf '%s\n' "$REASON" > "$STATE_DIR_R/restart-reason-${label}.txt"
-                    fi
-                    if wait_runtime_idle "$label"; then
-                        launchctl kickstart -k "gui/$UID/$label" && echo "launchd kickstarted: $label"
-                    fi
+                    DELAY=0 RESTART_IDLE_WAIT_SECONDS="$RESTART_IDLE_WAIT_SECONDS" \
+                        "$SELF_OPS" restart "$label" "$REASON"
+                    echo "launchd restart queued via self-ops: $label"
                 done
             fi
             ;;
