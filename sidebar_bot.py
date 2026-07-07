@@ -719,6 +719,10 @@ def _format_page_memory(ctx: Any) -> str:
         return ""
 
 
+def _should_include_page_memory(message: str) -> bool:
+    return any(marker in message for marker in ("继续", "上次", "之前", "刚才", "历史", "记录", "前面"))
+
+
 # ── attachment ingestion (image / video / file) ──────────────────────
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._一-鿿-]+")
@@ -1298,7 +1302,7 @@ async def _build_sidebar_chat_input(data: dict[str, Any], message: str) -> Sideb
     page_context = data.get("page_context")
     _remember_page_context(page_context)
     page_ctx_line = _format_page_context(page_context)
-    page_memory_line = _format_page_memory(page_context)
+    page_memory_line = _format_page_memory(page_context) if _should_include_page_memory(message) else ""
     images, attach_lines, cleanup_paths = await _process_attachments(
         data.get("attachments")
     )

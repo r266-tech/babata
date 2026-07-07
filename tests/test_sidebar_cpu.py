@@ -378,7 +378,11 @@ def test_sidebar_chat_input_builds_prompt_boundary(monkeypatch, tmp_path):
 
     monkeypatch.setattr(sidebar_bot, "_remember_page_context", remembered.append)
     monkeypatch.setattr(sidebar_bot, "_format_page_context", lambda _ctx: "[page ctx]")
-    monkeypatch.setattr(sidebar_bot, "_format_page_memory", lambda _ctx: "[page memory]")
+    monkeypatch.setattr(
+        sidebar_bot,
+        "_format_page_memory",
+        lambda _ctx: (_ for _ in ()).throw(AssertionError("page memory should stay opt-in")),
+    )
     monkeypatch.setattr(sidebar_bot, "_page_context_bound_meta", lambda _ctx: ("https://x.test", "X"))
     monkeypatch.setattr(sidebar_bot, "_process_attachments", process_attachments)
 
@@ -391,12 +395,27 @@ def test_sidebar_chat_input_builds_prompt_boundary(monkeypatch, tmp_path):
     ))
 
     assert remembered == [{"url": "https://x.test", "title": "X"}]
-    assert chat_input.prompt == "[page ctx]\n\n[page memory]\n\n[image attached: a.png]\n\nhello"
+    assert chat_input.prompt == "[page ctx]\n\n[image attached: a.png]\n\nhello"
     assert chat_input.images == [{"media_type": "image/png", "data": "abc"}]
     assert chat_input.cleanup_paths == [cleanup_path]
     assert chat_input.chat_url == "https://x.test"
     assert chat_input.chat_title == "X"
     assert chat_input.has_attach is True
+
+
+def test_sidebar_chat_input_includes_page_memory_for_continuation(monkeypatch):
+    monkeypatch.setattr(sidebar_bot, "_remember_page_context", lambda _ctx: None)
+    monkeypatch.setattr(sidebar_bot, "_format_page_context", lambda _ctx: "[page ctx]")
+    monkeypatch.setattr(sidebar_bot, "_format_page_memory", lambda _ctx: "[page memory]")
+    monkeypatch.setattr(sidebar_bot, "_page_context_bound_meta", lambda _ctx: ("https://x.test", "X"))
+    monkeypatch.setattr(sidebar_bot, "_process_attachments", lambda _raw: asyncio.sleep(0, result=([], [], [])))
+
+    chat_input = asyncio.run(sidebar_bot._build_sidebar_chat_input(
+        {"page_context": {"url": "https://x.test", "title": "X"}},
+        "继续刚才这个页面",
+    ))
+
+    assert chat_input.prompt == "[page ctx]\n\n[page memory]\n\n继续刚才这个页面"
 
 
 def test_sidebar_user_turn_records_event_history_and_boundary(monkeypatch):
