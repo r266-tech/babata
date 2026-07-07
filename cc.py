@@ -831,10 +831,12 @@ class CC:
         mcp_servers: dict[str, Any] | None = None,
         model: str | None = None,
         memory_source: str | None = None,
+        memory_enabled: bool = True,
     ) -> None:
         self._state_file = state_file
         self._source_prompt = source_prompt
         self._memory_source = memory_source or default_memory_source()
+        self._memory_enabled = memory_enabled
         self._mcp_servers = mcp_servers_without_repo_bytecode(mcp_servers)
         self._model = model
         self._session_id: str | None = self._load_state().get("session_id")
@@ -847,10 +849,12 @@ class CC:
         user_prompt: str | None = None,
     ) -> str:
         parts = [self._source_prompt]
-        memory_context, event_id = _render_babata_memory_context_event(self._memory_source, user_prompt)
-        self._memory_reflex_event_id = event_id
-        if memory_context:
-            parts.append(memory_context)
+        self._memory_reflex_event_id = None
+        if self._memory_enabled:
+            memory_context, event_id = _render_babata_memory_context_event(self._memory_source, user_prompt)
+            self._memory_reflex_event_id = event_id
+            if memory_context:
+                parts.append(memory_context)
         if extra_context:
             parts.append(extra_context)
         return "\n\n".join(parts)
@@ -1464,6 +1468,7 @@ class LiveSession(CC):
         mcp_servers: dict[str, Any] | None = None,
         model: str | None = None,
         memory_source: str | None = None,
+        memory_enabled: bool = True,
     ) -> None:
         super().__init__(
             state_file=state_file,
@@ -1471,6 +1476,7 @@ class LiveSession(CC):
             mcp_servers=mcp_servers,
             model=model,
             memory_source=memory_source,
+            memory_enabled=memory_enabled,
         )
         self._client: ClaudeSDKClient | None = None
         self._inbox: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()

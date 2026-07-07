@@ -90,6 +90,7 @@ def make_engine(
     engine: str | None = None,
     model: str | None = None,
     memory_source: str | None = None,
+    memory_enabled: bool = True,
 ) -> CC | LiveSession | CodexEngine | CodexLiveSession:
     name = engine_name(state_file, override=engine)
     if name == "claude":
@@ -100,6 +101,7 @@ def make_engine(
             mcp_servers=mcp_servers,
             model=model,
             memory_source=memory_source,
+            memory_enabled=memory_enabled,
         )
     elif name == "codex":
         cls = CodexLiveSession if live else CodexEngine
@@ -108,6 +110,7 @@ def make_engine(
             source_prompt=source_prompt,
             mcp_servers=mcp_servers,
             memory_source=memory_source,
+            memory_enabled=memory_enabled,
         )
     else:
         raise ValueError(f"unsupported assistant engine: {name!r}")

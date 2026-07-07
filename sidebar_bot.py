@@ -439,6 +439,7 @@ agent_view_cc = make_engine(
     state_file=STATE_DIR / f"{PROJECT}-sidebar-agent-view-session.json",
     source_prompt=_AGENT_VIEW_SOURCE_PROMPT,
     memory_source="sidebar",
+    memory_enabled=False,
     engine="claude",
     model=_AVATAR_CLAUDE_MODEL,
 )
@@ -447,6 +448,7 @@ clean_read_cc = make_engine(
     state_file=STATE_DIR / f"{PROJECT}-sidebar-clean-read-session.json",
     source_prompt=_CLEAN_READ_SOURCE_PROMPT,
     memory_source="sidebar",
+    memory_enabled=False,
     engine="claude",
     model=_AVATAR_CLAUDE_MODEL,
 )

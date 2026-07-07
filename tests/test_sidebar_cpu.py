@@ -30,6 +30,28 @@ def test_cc_exposes_public_session_helpers(tmp_path):
     assert "last_activity_at" in state
 
 
+def test_sidebar_evidence_bound_helpers_opt_out_of_memory():
+    assert sidebar_bot.agent_view_cc._memory_enabled is False
+    assert sidebar_bot.clean_read_cc._memory_enabled is False
+    assert sidebar_bot.cc._memory_enabled is True
+    assert sidebar_bot.proactive_cc._memory_enabled is True
+
+
+def test_cc_memory_opt_out_skips_context_render(monkeypatch, tmp_path):
+    def fail_render(*_args, **_kwargs):
+        raise AssertionError("memory context should not render")
+
+    monkeypatch.setattr(cc_module, "_render_babata_memory_context_event", fail_render)
+    session = cc_module.CC(
+        state_file=tmp_path / "session.json",
+        source_prompt="Source: evidence-bound.",
+        memory_source="sidebar",
+        memory_enabled=False,
+    )
+
+    assert session._source_prompt_with_memory(user_prompt="hello") == "Source: evidence-bound."
+
+
 def test_recent_session_files_scans_buckets_and_excludes_summary_sandbox(monkeypatch, tmp_path):
     projects_root = tmp_path / "projects"
     own_bucket = projects_root / "own-cwd"

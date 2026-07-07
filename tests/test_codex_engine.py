@@ -731,6 +731,42 @@ def test_make_engine_accepts_explicit_memory_source(tmp_path):
     assert made._memory_source == "tg"
 
 
+def test_make_engine_accepts_explicit_memory_opt_out(tmp_path):
+    made = engine.make_engine(
+        state_file=tmp_path / "session.json",
+        source_prompt="Source: evidence-bound task.",
+        memory_source="sidebar",
+        memory_enabled=False,
+    )
+
+    assert made._memory_source == "sidebar"
+    assert made._memory_enabled is False
+
+
+def test_codex_memory_opt_out_skips_inject_and_reflex(monkeypatch, tmp_path):
+    monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "1")
+
+    def fail_inject(*_args, **_kwargs):
+        raise AssertionError("memory inject should not run")
+
+    def fail_reflex(*_args, **_kwargs):
+        raise AssertionError("memory reflex should not run")
+
+    monkeypatch.setattr(codex_engine, "_render_babata_memory_context_event", fail_inject)
+    monkeypatch.setattr(codex_engine, "log_memory_reflex_preflight_only", fail_reflex)
+    session = codex_engine.CodexEngine(
+        state_file=tmp_path / "session.json",
+        source_prompt="Source: evidence-bound.",
+        memory_source="sidebar",
+        memory_enabled=False,
+    )
+
+    _cmd, prompt_stdin, memory_injected = session._build_command("hello", [], tmp_path / "last.txt")
+
+    assert memory_injected is False
+    assert prompt_stdin == "Source: evidence-bound.\n\nhello"
+
+
 def test_codex_without_engine_specific_sid_does_not_resume_claude_sid(tmp_path):
     state_file = tmp_path / "session.json"
     state_file.write_text(json.dumps({

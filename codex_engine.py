@@ -413,12 +413,14 @@ class CodexEngine(CC):
         source_prompt: str,
         mcp_servers: dict[str, Any] | None = None,
         memory_source: str | None = None,
+        memory_enabled: bool = True,
     ) -> None:
         super().__init__(
             state_file=state_file,
             source_prompt=source_prompt,
             mcp_servers=mcp_servers,
             memory_source=memory_source,
+            memory_enabled=memory_enabled,
         )
         self._memory_reflex_event_id: str | None = None
 
@@ -628,7 +630,9 @@ class CodexEngine(CC):
     def _build_prompt_stdin(self, prompt: str) -> tuple[str, bool]:
         memory_context = ""
         source = self._memory_source
-        if self._should_inject_codex_memory():
+        if not self._memory_enabled:
+            self._memory_reflex_event_id = None
+        elif self._should_inject_codex_memory():
             memory_context, event_id = _render_babata_memory_context_event(
                 source,
                 prompt,
@@ -875,12 +879,14 @@ class CodexLiveSession(CodexEngine):
         source_prompt: str,
         mcp_servers: dict[str, Any] | None = None,
         memory_source: str | None = None,
+        memory_enabled: bool = True,
     ) -> None:
         super().__init__(
             state_file=state_file,
             source_prompt=source_prompt,
             mcp_servers=mcp_servers,
             memory_source=memory_source,
+            memory_enabled=memory_enabled,
         )
         self._events: asyncio.Queue[Event | None] = asyncio.Queue()
         self._turn_task: asyncio.Task[None] | None = None
