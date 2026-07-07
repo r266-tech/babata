@@ -11,7 +11,7 @@ from pathlib import Path
 import cc as cc_module
 import sidebar_bot
 import sidebar_events
-from sidebar_tool_registry import SIDEBAR_TOOLS, prompt_tool_lines
+from sidebar_tool_registry import SIDEBAR_TOOLS
 
 
 def test_cc_exposes_public_session_helpers(tmp_path):
@@ -609,13 +609,13 @@ def test_sidebar_stream_trace_records_explicit_tool_result(monkeypatch):
     }
 
 
-def test_sidebar_prompt_tool_map_is_compact_and_complete():
-    tool_lines = prompt_tool_lines()
+def test_sidebar_source_prompt_does_not_duplicate_tool_inventory():
+    prompt = sidebar_bot._SIDEBAR_SOURCE_PROMPT
 
-    assert tool_lines == sidebar_bot._SIDEBAR_TOOL_LINES
-    assert len(tool_lines.splitlines()) <= 6
+    assert "MCP schema 为准" in prompt
+    assert len(prompt) <= 260
     for tool in SIDEBAR_TOOLS:
-        assert tool["name"] in tool_lines
+        assert tool["name"] not in prompt
         assert "prompt" not in tool
 
 

@@ -36,7 +36,7 @@ PROMPT_CASES = [
     (
         "sidebar-source",
         lambda: sidebar_bot._SIDEBAR_SOURCE_PROMPT,
-        525,
+        260,
         ("MCP schema 为准", "tab_id/window_id", "不可信数据", "明确用户意图", "不要自行加载"),
         ("DevTools", "babata-memory-context", "同一个 babata"),
     ),
@@ -75,8 +75,9 @@ def test_channel_prompts_stay_thin_and_boundary_focused(name, prompt_getter, max
         assert marker not in prompt, name
 
 
-def test_sidebar_prompt_tool_map_stays_compact():
-    assert len(sidebar_bot._SIDEBAR_TOOL_LINES) <= 300
+def test_sidebar_source_prompt_omits_tool_inventory():
+    for marker in ("dom_query", "page_snapshot", "bookmarks_search", "tabs_group"):
+        assert marker not in sidebar_bot._SIDEBAR_SOURCE_PROMPT
 
 
 @pytest.mark.parametrize(
