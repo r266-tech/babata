@@ -310,14 +310,26 @@ PROACTIVE_TOOL_NAMES = frozenset({
     "suggest_prompts",
     "mascot_speak",
 })
+READ_TOOL_NAMES = frozenset({
+    "tab_metadata",
+    "dom_query",
+    "page_snapshot",
+    "article_extract",
+    "translate",
+    "bookmarks_search",
+    "bookmarks_tree",
+    "tabs_query",
+    "history_search",
+})
 TOOL_SCOPE_NAMES = {
     "full": frozenset(t["name"] for t in SIDEBAR_TOOLS),
+    "read": READ_TOOL_NAMES,
     "proactive": PROACTIVE_TOOL_NAMES,
 }
 
 
 def tool_names(scope: str | None = None) -> frozenset[str]:
-    return TOOL_SCOPE_NAMES.get((scope or "full").strip().lower(), TOOL_SCOPE_NAMES["full"])
+    return TOOL_SCOPE_NAMES.get((scope or "read").strip().lower(), TOOL_SCOPE_NAMES["read"])
 
 
 def tool_specs(scope: str | None = None) -> list[dict[str, Any]]:

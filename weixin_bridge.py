@@ -22,6 +22,8 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 SOCKET_PATH = "/tmp/babata-weixin-bridge.sock"
+_PROACTIVE_PEER_ENV = "BABATA_WEIXIN_PROACTIVE_PEER"
+_PROACTIVE_MEDIA_ENV = "BABATA_WEIXIN_ALLOW_PROACTIVE_MEDIA"
 
 
 class WeixinBridge:
@@ -38,6 +40,7 @@ class WeixinBridge:
         self.to: str | None = None  # target user_id, e.g. xxx@im.wechat
         self.context_token: str | None = None
         self.account_id: str | None = None
+        self._restored_context = False
         self._server: asyncio.Server | None = None
 
     def set_context(
@@ -51,6 +54,7 @@ class WeixinBridge:
         self.to = to
         self.context_token = context_token
         self.account_id = account_id
+        self._restored_context = False
 
     async def start(self) -> None:
         try:
@@ -60,6 +64,7 @@ class WeixinBridge:
         self._server = await asyncio.start_unix_server(
             self._handle_connection, path=SOCKET_PATH
         )
+        os.chmod(SOCKET_PATH, 0o600)
         log.info("weixin bridge listening at %s", SOCKET_PATH)
 
     async def stop(self) -> None:
@@ -75,7 +80,19 @@ class WeixinBridge:
         try:
             data = await asyncio.wait_for(reader.readline(), timeout=10)
             request = json.loads(data.decode())
-            action = request.get("action", "send_text")
+            action = request.get("action", "")
+
+            handlers = {
+                "send_text": self._handle_send_text,
+                "send_image": self._handle_send_image,
+                "send_video": self._handle_send_video,
+                "send_file": self._handle_send_file,
+                "send_typing": self._handle_send_typing,
+            }
+            handler = handlers.get(action)
+            if not handler:
+                await self._respond(writer, f"Unknown action: {action or '<missing>'}")
+                return
 
             if not self.client:
                 await self._respond(writer, "Error: weixin client not logged in")
@@ -91,18 +108,6 @@ class WeixinBridge:
 
             if not self.to:
                 await self._respond(writer, "Error: no weixin conversation context")
-                return
-
-            handlers = {
-                "send_text": self._handle_send_text,
-                "send_image": self._handle_send_image,
-                "send_video": self._handle_send_video,
-                "send_file": self._handle_send_file,
-                "send_typing": self._handle_send_typing,
-            }
-            handler = handlers.get(action)
-            if not handler:
-                await self._respond(writer, f"Unknown action: {action}")
                 return
 
             await handler(request, writer)
@@ -122,11 +127,12 @@ class WeixinBridge:
     def _restore_peer_from_disk(self) -> None:
         """Recover (account_id, to, context_token) from persistent state.
 
-        Lets proactive cron pushes (e.g. codex2api-grabber) work without
-        requiring the user to text the bot first after each bot restart.
-        Prefers an account whose allowFrom list yields a peer with a saved
-        context_token. Silent no-op if persistence is empty.
+        Proactive sends need an explicit peer. This avoids choosing the first
+        allowFrom entry after restart and sending to a stale or unintended chat.
         """
+        target_peer = os.environ.get(_PROACTIVE_PEER_ENV, "").strip()
+        if not target_peer:
+            return
         try:
             from weixin_account import (
                 list_account_ids, load_allow_from, get_context_token,
@@ -137,24 +143,26 @@ class WeixinBridge:
         try:
             for aid in list_account_ids():
                 allowed = load_allow_from(aid)
-                for uid in allowed:
-                    if not uid:
-                        continue
-                    ctx = get_context_token(aid, uid)
-                    if ctx:
-                        self.to = uid
-                        self.context_token = ctx
-                        self.account_id = aid
-                        log.info("bridge: restored peer from disk account=%s peer=%s", aid, uid[:8] + "…")
-                        return
-                # No saved ctx but allowed user exists — try without ctx
-                if allowed and allowed[0]:
-                    self.to = allowed[0]
+                if target_peer in allowed:
+                    self.to = target_peer
+                    self.context_token = get_context_token(aid, target_peer)
                     self.account_id = aid
-                    log.info("bridge: restored peer (no ctx) account=%s peer=%s", aid, allowed[0][:8] + "…")
+                    self._restored_context = True
+                    log.info("bridge: restored configured peer from disk account=%s peer=%s", aid, target_peer[:8] + "…")
                     return
         except Exception as e:
             log.warning("restore_peer failed: %s", e)
+
+    async def _reject_restored_media_context(self, writer) -> bool:
+        if not self._restored_context:
+            return False
+        if os.environ.get(_PROACTIVE_MEDIA_ENV) == "1":
+            return False
+        await self._respond(
+            writer,
+            f"Error: proactive WeChat media/file sends require fresh conversation context or {_PROACTIVE_MEDIA_ENV}=1",
+        )
+        return True
 
     # ── handlers ──────────────────────────────────────────────────────
 
@@ -204,6 +212,8 @@ class WeixinBridge:
     async def _handle_send_image(self, request, writer) -> None:
         from weixin_ilink import MEDIA_IMAGE, image_item
 
+        if await self._reject_restored_media_context(writer):
+            return
         path = Path(request["path"]).expanduser()
         if not path.exists():
             await self._respond(writer, f"Error: file not found: {path}")
@@ -218,6 +228,8 @@ class WeixinBridge:
     async def _handle_send_video(self, request, writer) -> None:
         from weixin_ilink import MEDIA_VIDEO, video_item
 
+        if await self._reject_restored_media_context(writer):
+            return
         path = Path(request["path"]).expanduser()
         if not path.exists():
             await self._respond(writer, f"Error: file not found: {path}")
@@ -232,6 +244,8 @@ class WeixinBridge:
     async def _handle_send_file(self, request, writer) -> None:
         from weixin_ilink import MEDIA_FILE, file_item
 
+        if await self._reject_restored_media_context(writer):
+            return
         path = Path(request["path"]).expanduser()
         if not path.exists():
             await self._respond(writer, f"Error: file not found: {path}")

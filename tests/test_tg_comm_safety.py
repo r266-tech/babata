@@ -163,7 +163,8 @@ def test_tg_handler_registration_keeps_transcript_sources_centralized():
     assert sum(1 for node in calls if isinstance(node.func, ast.Name) and node.func.id == "_with_transcript") == 3
 
 
-def test_tg_mcp_tool_descriptions_stay_operational():
+def test_tg_mcp_tool_descriptions_stay_operational(monkeypatch):
+    monkeypatch.setenv("BABATA_TG_ENABLE_PUBLIC_PAGE", "1")
     tools = {tool.name: tool for tool in asyncio.run(tg_mcp.list_tools())}
     buttons = tools["tg_send_buttons"]
     text = tools["tg_send_text"]
@@ -220,7 +221,8 @@ def test_tg_instance_schema_stays_compact_without_losing_route_values():
     assert "sidebar" not in tg_mcp.TG_INSTANCES
 
 
-def test_tg_mcp_schema_helper_keeps_tool_contracts():
+def test_tg_mcp_schema_helper_keeps_tool_contracts(monkeypatch):
+    monkeypatch.setenv("BABATA_TG_ENABLE_PUBLIC_PAGE", "1")
     tools = {tool.name: tool for tool in asyncio.run(tg_mcp.list_tools())}
     descriptions = [tool.description for tool in tools.values()]
     schema_descriptions = [
@@ -268,6 +270,28 @@ def test_tg_mcp_schema_helper_keeps_tool_contracts():
         assert schema["type"] == "object"
         assert schema["required"] == required[name]
         assert schema["properties"]["instance"] is tg_mcp.INSTANCE_SCHEMA
+
+
+def test_tg_public_page_tool_is_hidden_by_default(monkeypatch):
+    monkeypatch.delenv("BABATA_TG_ENABLE_PUBLIC_PAGE", raising=False)
+
+    tools = {tool.name for tool in asyncio.run(tg_mcp.list_tools())}
+
+    assert "tg_send_page" not in tools
+
+
+def test_tg_bridge_rejects_public_page_publish_without_opt_in(monkeypatch):
+    async def run():
+        monkeypatch.delenv("BABATA_TG_ENABLE_PUBLIC_PAGE", raising=False)
+        br = tg_bridge.TGBridge()
+        writer = FakeWriter()
+
+        await br._handle_send_page({"title": "T", "content_md": "body"}, writer)
+
+        response = json.loads(writer.data.decode())
+        assert "public page publishing disabled" in response["result"]
+
+    asyncio.run(run())
 
 
 def test_short_bubble_uses_html_parse_mode():

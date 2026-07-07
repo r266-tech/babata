@@ -401,15 +401,15 @@ GFM; 简短。
 
 # ── CC instance ───────────────────────────────────────────────────────
 
-def _sidebar_mcp_servers(scope: str = "full") -> dict[str, Any]:
+def _sidebar_mcp_servers(scope: str | None = None) -> dict[str, Any]:
+    actual_scope = (scope or os.environ.get("BABATA_SIDEBAR_MCP_SCOPE") or "read").strip().lower()
     cfg: dict[str, Any] = {
         "sidebar": {
             "command": VENV_PYTHON,
             "args": [_SIDEBAR_MCP_SCRIPT],
+            "env": {"BABATA_SIDEBAR_MCP_SCOPE": actual_scope},
         },
     }
-    if scope != "full":
-        cfg["sidebar"]["env"] = {"BABATA_SIDEBAR_MCP_SCOPE": scope}
     return cfg
 
 

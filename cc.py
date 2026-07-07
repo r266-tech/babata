@@ -1258,7 +1258,7 @@ class CC:
             return Response(content="会话已重置。", session_id="", cost=0.0)
 
         # Silent idle reset (default 24h, hermes parity). V didn't ask for it,
-        # don't reply "会话已重置" — fresh session + memory inject takes over.
+        # don't reply "会话已重置" — fresh session + memory context takes over.
         # Override via BABATA_IDLE_RESET_MINUTES env (0 disables).
         self._check_idle_reset()
 

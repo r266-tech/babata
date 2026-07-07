@@ -36,7 +36,7 @@ server = Server("sidebar")
 
 
 def _tool_scope() -> str:
-    return os.environ.get("BABATA_SIDEBAR_MCP_SCOPE", "full")
+    return os.environ.get("BABATA_SIDEBAR_MCP_SCOPE", "read")
 
 
 # ── Tool surface ──────────────────────────────────────────────────────

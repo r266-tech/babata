@@ -687,7 +687,7 @@ def test_proactive_sidebar_mcp_scope_stays_read_only_and_suggestive():
         "bookmarks_create",
     } & names
     assert sidebar_bot.proactive_cc._mcp_servers["sidebar"]["env"]["BABATA_SIDEBAR_MCP_SCOPE"] == "proactive"
-    assert "BABATA_SIDEBAR_MCP_SCOPE" not in sidebar_bot.cc._mcp_servers["sidebar"].get("env", {})
+    assert sidebar_bot.cc._mcp_servers["sidebar"]["env"]["BABATA_SIDEBAR_MCP_SCOPE"] == "read"
 
 
 def test_sidebar_model_visible_tool_descriptions_stay_compact():

@@ -1,5 +1,7 @@
 import asyncio
+import json
 import sys
+import types
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -11,6 +13,29 @@ sys.path.insert(0, str(_REPO))
 import weixin_mcp
 import weixin_ilink
 import weixin_bridge
+
+
+class FakeReader:
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def readline(self):
+        return json.dumps(self.payload).encode() + b"\n"
+
+
+class FakeWriter:
+    def __init__(self):
+        self.data = b""
+        self.closed = False
+
+    def write(self, data: bytes):
+        self.data += data
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        self.closed = True
 
 
 def _tools():
@@ -98,3 +123,62 @@ def test_wx_voice_tool_stays_absent_from_model_visible_schema():
     assert "wx_send_voice" not in tools
     assert not hasattr(weixin_ilink, "voice_item")
     assert not hasattr(weixin_bridge.WeixinBridge, "_handle_send_voice")
+
+
+def test_weixin_bridge_rejects_missing_action_before_write_context():
+    async def run():
+        br = weixin_bridge.WeixinBridge()
+        writer = FakeWriter()
+
+        await br._handle_connection(FakeReader({"text": "hello"}), writer)
+
+        response = json.loads(writer.data.decode())
+        assert response["result"] == "Unknown action: <missing>"
+        assert writer.closed is True
+
+    asyncio.run(run())
+
+
+def test_weixin_bridge_restores_only_configured_proactive_peer(monkeypatch):
+    fake_accounts = types.SimpleNamespace(
+        list_account_ids=lambda: ["acct-1"],
+        load_allow_from=lambda _aid: ["peer-a", "peer-b"],
+        get_context_token=lambda _aid, uid: "ctx-b" if uid == "peer-b" else "",
+    )
+    monkeypatch.setitem(sys.modules, "weixin_account", fake_accounts)
+    monkeypatch.delenv("BABATA_WEIXIN_PROACTIVE_PEER", raising=False)
+    br = weixin_bridge.WeixinBridge()
+
+    br._restore_peer_from_disk()
+
+    assert br.to is None
+    assert br._restored_context is False
+
+    monkeypatch.setenv("BABATA_WEIXIN_PROACTIVE_PEER", "peer-b")
+    br._restore_peer_from_disk()
+
+    assert br.to == "peer-b"
+    assert br.context_token == "ctx-b"
+    assert br.account_id == "acct-1"
+    assert br._restored_context is True
+
+
+def test_weixin_bridge_rejects_restored_media_without_media_opt_in(monkeypatch):
+    async def run():
+        br = weixin_bridge.WeixinBridge()
+        br._restored_context = True
+        writer = FakeWriter()
+
+        rejected = await br._reject_restored_media_context(writer)
+
+        assert rejected is True
+        assert "proactive WeChat media/file sends require fresh conversation context" in json.loads(
+            writer.data.decode()
+        )["result"]
+
+        monkeypatch.setenv("BABATA_WEIXIN_ALLOW_PROACTIVE_MEDIA", "1")
+        allowed_writer = FakeWriter()
+        assert await br._reject_restored_media_context(allowed_writer) is False
+        assert allowed_writer.data == b""
+
+    asyncio.run(run())

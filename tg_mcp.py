@@ -32,6 +32,7 @@ _RETRYABLE_CONNECT_ERRNOS = {
     errno.ECONNREFUSED,
     errno.ECONNRESET,
 }
+_TG_PUBLIC_PAGE_ENV = "BABATA_TG_ENABLE_PUBLIC_PAGE"
 
 # TG bot instances exposed via optional `instance` tool argument. Derived from
 # INSTANCE_LABELS so OSS forks inherit the map automatically. WeChat and
@@ -207,11 +208,21 @@ _TG_TOOL_SPECS = (
 )
 
 
+def _public_page_enabled() -> bool:
+    return os.environ.get(_TG_PUBLIC_PAGE_ENV) == "1"
+
+
+def _tg_tool_specs() -> tuple:
+    if _public_page_enabled():
+        return _TG_TOOL_SPECS
+    return tuple(spec for spec in _TG_TOOL_SPECS if spec[0] != "tg_send_page")
+
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
         _tool(name, description() if callable(description) else description, properties, required)
-        for name, description, properties, required in _TG_TOOL_SPECS
+        for name, description, properties, required in _tg_tool_specs()
     ]
 
 
@@ -304,6 +315,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 caption=arguments.get("caption", ""),
             )
         elif name == "tg_send_page":
+            if not _public_page_enabled():
+                return [TextContent(
+                    type="text",
+                    text=f"Tool not available: tg_send_page requires {_TG_PUBLIC_PAGE_ENV}=1",
+                )]
             result = await _relay(
                 "send_page",
                 instance=instance,

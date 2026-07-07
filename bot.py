@@ -5066,8 +5066,8 @@ async def _post_init(app: Application) -> None:
     _write_runtime_status("post_init")
     await bridge.start()
     asyncio.create_task(_heartbeat_loop(app))
-    # Default context so terminal CC (no TG message yet) can push to user's TG
-    if ALLOWED_USER:
+    # Proactive TG bridge writes are opt-in; active turns set context in _begin_turn.
+    if ALLOWED_USER and os.environ.get("BABATA_TG_ENABLE_PROACTIVE_BRIDGE") == "1":
         bridge.set_context(app.bot, ALLOWED_USER, None)
     _channel_worker = ChannelWorker(cc, instance_label=_CURRENT_LABEL)
     await _channel_worker.start()
