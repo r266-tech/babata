@@ -229,6 +229,75 @@ def reset_bot_globals(monkeypatch, tmp_path):
     bot._shutdown_requested = False
 
 
+def test_tg_process_bounds_long_input_before_queue(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        monkeypatch.setattr(bot, "_TG_INPUT_MAX_CHARS", 64)
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        monkeypatch.setattr(bot, "_channel_worker", worker)
+        await worker.start()
+
+        ctx = FakeCtx()
+        chat = FakeChat(chat_id=42)
+        msg = FakeMessage(7, "long")
+        update = FakeUpdate(msg, chat, user_id=7, update_id=501)
+        text = "start-" + ("x" * 200) + "-TG-TAIL"
+
+        await bot._process(update, ctx, text)
+
+        queued = session.submitted[0][0]
+        assert len(queued) <= 64
+        assert "start-" in queued
+        assert "TG-TAIL" not in queued
+        assert "Telegram input truncated" in queued
+        pending = json.loads((tmp_path / "pending.json").read_text())["pending"]
+        assert pending["501"]["text"] == queued
+
+        await worker.stop()
+
+    asyncio.run(run())
+
+
+def test_tg_coalesced_prompt_is_bounded(monkeypatch):
+    monkeypatch.setattr(bot, "_TG_INPUT_MAX_CHARS", 128)
+    chat = FakeChat(chat_id=42)
+    long_text = "first-" + ("x" * 220) + "-TG-TAIL"
+    payloads = [
+        bot.Payload(update=FakeUpdate(FakeMessage(1), chat), ctx=FakeCtx(), text="short"),
+        bot.Payload(update=FakeUpdate(FakeMessage(2), chat), ctx=FakeCtx(), text=long_text),
+    ]
+
+    prompt = bot._format_coalesced_tg_prompt(payloads)
+
+    assert len(prompt) <= 128
+    assert "Multiple Telegram messages" in prompt
+    assert "TG-TAIL" not in prompt
+    assert "Telegram input truncated" in prompt
+
+
+def test_tg_pending_record_restore_bounds_text(monkeypatch):
+    monkeypatch.setattr(bot, "_TG_INPUT_MAX_CHARS", 64)
+    text = "start-" + ("x" * 200) + "-TG-TAIL"
+
+    payload = bot._payload_from_pending_record(
+        FakeBot(),
+        {
+            "update_id": 501,
+            "chat_id": 42,
+            "message_id": 7,
+            "text": text,
+            "images": [],
+        },
+    )
+
+    assert payload is not None
+    assert len(payload.text) <= 64
+    assert "start-" in payload.text
+    assert "TG-TAIL" not in payload.text
+    assert "Telegram input truncated" in payload.text
+
+
 class FakeCpuSession:
     def __init__(self, name: str, state_file: Path | None = None, sid: str | None = None):
         self._babata_engine_name = name

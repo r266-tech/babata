@@ -762,6 +762,8 @@ _last_session_id: str | None = _state.get("last_session_id")
 # 4000 not 4096: leaves headroom for HTML entity expansion (`&` → `&amp;`)
 # and the (1/N) chunk indicator suffix added by `_split`.
 _MAX_TG = 4000
+_TG_INPUT_MAX_CHARS = int(os.environ.get("BABATA_TG_INPUT_MAX_CHARS", "12000"))
+_TG_INPUT_TRUNCATED_NOTE = "\n\n[Telegram input truncated]"
 _TG_INDICATOR_RESERVE = 10  # " (XX/XX)"
 _TG_FENCE_CLOSE = "\n```"
 
@@ -1650,7 +1652,7 @@ class TextBubbleSendResult:
 
 def _format_coalesced_tg_prompt(payloads: list[Payload]) -> str:
     if len(payloads) <= 1:
-        return payloads[0].text if payloads else ""
+        return _truncate_tg_input(payloads[0].text) if payloads else ""
 
     blocks = [
         "Multiple Telegram messages, oldest to newest; later messages may "
@@ -1669,7 +1671,17 @@ def _format_coalesced_tg_prompt(payloads: list[Payload]) -> str:
         text = payload.text.strip() or "[empty message]"
         blocks.append(f"<user_message {' '.join(meta)}>\n{text}\n</user_message>")
         blocks.append("")
-    return "\n".join(blocks).strip()
+    return _truncate_tg_input("\n".join(blocks).strip())
+
+
+def _truncate_tg_input(text: str) -> str:
+    limit = max(1, _TG_INPUT_MAX_CHARS)
+    if len(text) <= limit:
+        return text
+    keep = max(0, limit - len(_TG_INPUT_TRUNCATED_NOTE))
+    if keep <= 0:
+        return _TG_INPUT_TRUNCATED_NOTE[-limit:]
+    return text[:keep].rstrip() + _TG_INPUT_TRUNCATED_NOTE
 
 
 def _stream_display_text(text: str) -> str:
@@ -1734,7 +1746,7 @@ def _payload_from_pending_record(bot_obj: Any, record: dict[str, Any]) -> Payloa
         update_id = int(record["update_id"])
         chat_id = int(record["chat_id"])
         message_id = int(record["message_id"])
-        text = str(record["text"])
+        text = _truncate_tg_input(str(record["text"]))
     except (KeyError, TypeError, ValueError):
         return None
     images = record.get("images") or None
@@ -2911,14 +2923,15 @@ class ChannelWorker:
         turn state + 💔. 从 submit() else 分支 + _handle_turn_end finally 调.
         Codex R3 P0 fix: cut-in 路径不再立即 submit, 等 A's turn_end 后由
         _begin_turn(B) 触发本函数 — 防 stale interrupt 命中 B + SDK batch 卡死."""
+        text = _truncate_tg_input(payload.text)
         try:
-            self.session.submit(payload.text, payload.images)
+            self.session.submit(text, payload.images)
             return
         except RuntimeError:
             log.warning("LiveSession was disconnected; reconnecting before submit")
         try:
             await self.session.connect()
-            self.session.submit(payload.text, payload.images)
+            self.session.submit(text, payload.images)
         except Exception as e:
             log.error("Second submit failed: %s — keeping V message pending", e)
             self._requeue_active_turn_for_recovery()
@@ -5499,6 +5512,7 @@ async def _process(
             or "[a message]"
         )
         text = f"[Replying to]: {quoted}\n\n{text}"
+    text = _truncate_tg_input(text)
 
     try:
         payload = Payload(
