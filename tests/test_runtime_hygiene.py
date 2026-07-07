@@ -7,6 +7,7 @@ def test_auto_update_has_single_canonical_implementation():
     root_entry = repo / "auto-update.sh"
     canonical = repo / "scripts" / "auto-update.sh"
     self_ops = repo / "scripts" / "self-ops.sh"
+    poll_healthcheck = repo / "scripts" / "poll-healthcheck.sh"
 
     root_text = root_entry.read_text(encoding="utf-8")
     assert root_entry.stat().st_mode & 0o111
@@ -28,6 +29,10 @@ def test_auto_update_has_single_canonical_implementation():
     self_ops_text = self_ops.read_text(encoding="utf-8")
     assert '"$REPO_DIR/scripts/auto-update.sh" --upgrade-sdk' in self_ops_text
     assert '"$REPO_DIR/auto-update.sh"' not in self_ops_text
+    for script in (canonical, self_ops, poll_healthcheck):
+        text = script.read_text(encoding="utf-8")
+        assert "PROJECT_STATE_DIR=$(grep -m1 '^PROJECT_STATE_DIR='" in text
+        assert "tr -d '\\r' || true)" in text
 
     pyproject_text = (repo / "pyproject.toml").read_text(encoding="utf-8")
     assert 'addopts = "-p no:cacheprovider"' in pyproject_text

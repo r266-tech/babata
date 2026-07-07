@@ -19,7 +19,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$REPO_DIR/.env"
 if [ -f "$ENV_FILE" ] && [ -z "${PROJECT_STATE_DIR:-}" ]; then
     PROJECT_STATE_DIR=$(grep -m1 '^PROJECT_STATE_DIR=' "$ENV_FILE" 2>/dev/null \
-        | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '\r')
+        | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '\r' || true)
     [ -n "$PROJECT_STATE_DIR" ] && export PROJECT_STATE_DIR
 fi
 
