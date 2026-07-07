@@ -148,6 +148,8 @@ def strip_markdown(text: str) -> str:
 
 
 _MAX_WX = 4000
+_WX_INPUT_MAX_CHARS = int(os.environ.get("BABATA_WX_INPUT_MAX_CHARS", "12000"))
+_WX_INPUT_TRUNCATED_NOTE = "\n\n[WeChat input truncated]"
 
 
 # ── stream split safety ───────────────────────────────────────────────
@@ -773,7 +775,7 @@ async def _flush_pending(key: tuple[str, str]) -> bool:
 def _format_wx_message_bodies(message_bodies: list[str]) -> str:
     combined = "\n".join(message_bodies).strip()
     if len(message_bodies) <= 1:
-        return combined
+        return _truncate_wx_input(combined)
     blocks = [
         "Multiple WeChat messages, oldest to newest; later messages may "
         "clarify or supersede earlier ones.",
@@ -782,7 +784,17 @@ def _format_wx_message_bodies(message_bodies: list[str]) -> str:
     for idx, body in enumerate(message_bodies, start=1):
         blocks.append(f"<user_message n={idx}>\n{body}\n</user_message>")
         blocks.append("")
-    return "\n".join(blocks).strip()
+    return _truncate_wx_input("\n".join(blocks).strip())
+
+
+def _truncate_wx_input(text: str) -> str:
+    limit = max(1, _WX_INPUT_MAX_CHARS)
+    if len(text) <= limit:
+        return text
+    keep = max(0, limit - len(_WX_INPUT_TRUNCATED_NOTE))
+    if keep <= 0:
+        return _WX_INPUT_TRUNCATED_NOTE[-limit:]
+    return text[:keep].rstrip() + _WX_INPUT_TRUNCATED_NOTE
 
 
 async def _collect_wx_turn_inputs(

@@ -29,6 +29,30 @@ def reset_wx_pending(monkeypatch, tmp_path):
     wb._pending_wx_records = {}
 
 
+def test_weixin_prompt_input_is_bounded(monkeypatch):
+    monkeypatch.setattr(wb, "_WX_INPUT_MAX_CHARS", 64)
+    text = "start-" + ("x" * 200) + "-WX-TAIL"
+
+    prompt = wb._format_wx_message_bodies([text])
+
+    assert len(prompt) <= 64
+    assert "start-" in prompt
+    assert "WX-TAIL" not in prompt
+    assert "WeChat input truncated" in prompt
+
+
+def test_weixin_multi_message_prompt_input_is_bounded(monkeypatch):
+    monkeypatch.setattr(wb, "_WX_INPUT_MAX_CHARS", 128)
+    text = "first-" + ("x" * 220) + "-WX-TAIL"
+
+    prompt = wb._format_wx_message_bodies(["short", text])
+
+    assert len(prompt) <= 128
+    assert "Multiple WeChat messages" in prompt
+    assert "WX-TAIL" not in prompt
+    assert "WeChat input truncated" in prompt
+
+
 # ── _md_balanced ────────────────────────────────────────────────────
 
 
