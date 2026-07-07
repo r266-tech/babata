@@ -26,7 +26,7 @@ def test_tg_voice_clone_pending_consumes_valid_state(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "INSTANCE", "test")
     monkeypatch.setattr(bot.time, "time", lambda: 10)
     state_file = tmp_path / "voice-clone-pending-test.json"
-    state_file.write_text(json.dumps({"expires_at": 20}), encoding="utf-8")
+    state_file.write_text(json.dumps({"stage": "awaiting_voice", "expires_at": 20}), encoding="utf-8")
 
     keep_wav = bot._consume_voice_clone_pending("voice-file")
 
@@ -46,6 +46,22 @@ def test_tg_voice_clone_pending_drops_stale_state(tmp_path, monkeypatch):
 
     assert keep_wav is None
     assert not state_file.exists()
+
+
+def test_tg_voice_clone_pending_does_not_consume_name_stage(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(bot, "INSTANCE", "test")
+    monkeypatch.setattr(bot.time, "time", lambda: 10)
+    state_file = tmp_path / "voice-clone-pending-test.json"
+    state_file.write_text(
+        json.dumps({"stage": "awaiting_name", "tmp_wav_path": "/tmp/ref.wav", "expires_at": 20}),
+        encoding="utf-8",
+    )
+
+    keep_wav = bot._consume_voice_clone_pending("voice-file")
+
+    assert keep_wav is None
+    assert json.loads(state_file.read_text(encoding="utf-8"))["stage"] == "awaiting_name"
 
 
 def test_tg_voice_clone_pending_ignores_missing_or_malformed_state(tmp_path, caplog, monkeypatch):
@@ -69,7 +85,7 @@ def test_tg_voice_clone_pending_consume_failure_is_soft(tmp_path, caplog, monkey
     monkeypatch.setattr(bot, "INSTANCE", "test")
     monkeypatch.setattr(bot.time, "time", lambda: 10)
     state_file = tmp_path / "voice-clone-pending-test.json"
-    state_file.write_text(json.dumps({"expires_at": 20}), encoding="utf-8")
+    state_file.write_text(json.dumps({"stage": "awaiting_voice", "expires_at": 20}), encoding="utf-8")
 
     def fail_rename(self: Path, target: Path):
         if self == state_file:

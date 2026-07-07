@@ -5018,6 +5018,9 @@ def _consume_voice_clone_pending(file_id: str) -> Path | None:
             log.warning("voice-clone stale state cleanup failed: %s", e)
         return None
 
+    if meta.get("stage") != "awaiting_voice":
+        return None
+
     consumed = pending.with_suffix(".json.consumed")
     try:
         pending.rename(consumed)
