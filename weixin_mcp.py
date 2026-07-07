@@ -49,9 +49,8 @@ _WX_TOOL_SPECS = (
     (
         "wx_send_text",
         (
-            "Send text to WeChat. Final-turn WeChat replies are auto-delivered; "
-            "use this additive tool only for mid-turn pushes, long-running "
-            "progress, or proactive sends."
+            "Send text to WeChat. Final replies are auto-delivered; use only for "
+            "mid-turn pushes, long-running progress, or proactive sends."
         ),
         {"text": {"type": "string"}},
         ["text"],
@@ -59,13 +58,11 @@ _WX_TOOL_SPECS = (
     (
         "wx_send_image",
         (
-            "Send a local image (jpg/png/gif/webp/bmp) to WeChat. "
-            "Optional caption is sent as a separate TEXT message first."
+            "Send local jpg/png/gif/webp/bmp to WeChat; caption sends separate text first."
         ),
         {
             "path": {
                 "type": "string",
-                "description": "Absolute or ~-relative file path",
             },
             "caption": {"type": "string"},
         },
@@ -73,7 +70,7 @@ _WX_TOOL_SPECS = (
     ),
     (
         "wx_send_video",
-        "Send a local video file (mp4/mov/webm) to WeChat.",
+        "Send local mp4/mov/webm to WeChat.",
         {
             "path": {"type": "string"},
             "caption": {"type": "string"},
@@ -83,8 +80,7 @@ _WX_TOOL_SPECS = (
     (
         "wx_send_file",
         (
-            "Send a local file as a WeChat file attachment (any type). "
-            "If file_name is omitted, the local file's basename is used."
+            "Send local file to WeChat; file_name overrides basename."
         ),
         {
             "path": {"type": "string"},
@@ -96,12 +92,11 @@ _WX_TOOL_SPECS = (
     # wx_send_voice stays absent: iLink filters bot->user voice.
     (
         "wx_send_typing",
-        "Show/cancel WeChat typing indicator.",
+        "Show/cancel WeChat typing indicator; status 1 on, 2 off.",
         {
             "status": {
                 "type": "integer",
                 "enum": [1, 2],
-                "description": "1 = typing on, 2 = typing off",
             },
         },
         ["status"],
