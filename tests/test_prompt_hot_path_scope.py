@@ -151,7 +151,7 @@ def test_sidebar_clean_read_user_prompt_stays_structural_and_evidence_bound():
     )
 
     assert truncated is False
-    assert len(prompt) <= 700
+    assert len(prompt) <= 610
     for marker in (
         "三击头像触发",
         "不添加原文没有的事实",
@@ -177,6 +177,8 @@ def test_sidebar_clean_read_user_prompt_stays_structural_and_evidence_bound():
         "共同进化",
         "哲学",
         "身份认同",
+        "标题党",
+        "权威洗白",
         "char_count",
         "paragraph_count",
         "extraction_method",
