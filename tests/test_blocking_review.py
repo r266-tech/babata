@@ -13,6 +13,15 @@ from test_codex_engine import FakeProcess, _json_line
 from test_live_session import FakeClaudeSDKClient, wait_for
 
 
+IDENTITY_PROMPT_MARKERS = (
+    "babata's",
+    "You are babata",
+    "你是 babata",
+    "共同进化",
+    "身份认同",
+)
+
+
 def _init_repo(path: Path) -> None:
     subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
@@ -291,6 +300,8 @@ def test_repair_prompt_stays_compact_without_losing_repair_boundary():
         assert marker in prompt
     for marker in ("previous code-changing turn did not pass", "confirm implementation details"):
         assert marker not in prompt
+    for marker in IDENTITY_PROMPT_MARKERS:
+        assert marker not in prompt
 
 
 def test_counterpart_review_prompt_stays_compact_without_losing_review_boundary(tmp_path):
@@ -330,4 +341,6 @@ def test_counterpart_review_prompt_stays_compact_without_losing_review_boundary(
         "Changed files:",
         "missing nice-to-have tests",
     ):
+        assert marker not in prompt
+    for marker in IDENTITY_PROMPT_MARKERS:
         assert marker not in prompt
