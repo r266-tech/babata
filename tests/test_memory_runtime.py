@@ -198,6 +198,9 @@ def test_render_memory_context_event_logs_enforced_reflex(monkeypatch, tmp_path)
     assert "<memory-reflex>" in context
     assert "routes: deep" in context
     assert "profile: deep" in context
+    assert "need detail" not in context
+    assert "signal:" not in context
+    assert "why:" not in context
     assert json.loads(inject_log.read_text()) == {
         "cpu": "codex",
         "include_top": "skip",
@@ -336,19 +339,19 @@ def test_log_memory_reflex_preflight_only_records_router_without_inject(monkeypa
     assert "look up yesterday" not in reflex_log.read_text(encoding="utf-8")
 
 
-def test_memory_reflex_hint_stays_compact_and_omits_empty_why():
+def test_memory_reflex_hint_stays_compact_and_omits_router_reasons():
     hint = memory_runtime.format_memory_reflex_hint({
         "routes": ["recent"],
         "profile": "recent",
+        "reasons": ["history"],
     })
 
-    assert len(hint) <= 130
+    assert len(hint) <= 80
     assert "routes: recent" in hint
     assert "profile: recent" in hint
-    assert "route only" in hint
-    assert "only if useful" in hint
+    assert "signal:" not in hint
     assert "why:" not in hint
-    assert "unspecified" not in hint
+    assert "history" not in hint
 
 
 def test_memory_runtime_owns_shared_reflex_helpers():
