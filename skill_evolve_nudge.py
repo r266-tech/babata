@@ -55,7 +55,7 @@ def notify_skill_evolve_turn(
 
     if not session_id:
         return
-    if os.environ.get("BABATA_SKILL_EVOLVE_NUDGE", "1") == "0":
+    if os.environ.get("BABATA_SKILL_EVOLVE_NUDGE") != "1":
         return
     if os.environ.get("SKILL_EVOLVE_SPAWNED") == "1":
         return
