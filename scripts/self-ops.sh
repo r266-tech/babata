@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# babata self-modification helper — see CLAUDE.md 铁律段.
-# 所有会改写 bot 自身 (launchd / claude binary / deps) 的操作走本脚本,
-# 内部 `nohup & disown` 脱离 bot 进程管辖, SIGTERM 不连坐.
+# babata self-maintenance helper.
+# Bot launchd/dependency/CPU-binary mutations go through this detached path so
+# service SIGTERM does not interrupt the active turn.
 
 set -euo pipefail
 
@@ -37,11 +37,9 @@ restart() {
     local reason="${*:-manual: self-ops restart}"
 
     # Self-suicide guard: if the caller is itself running under the launchd
-    # service we are about to kickstart -k, we'd SIGKILL our own ancestor
-    # before the current Claude turn finishes — V sees the assistant
-    # truncated mid-reply + a "可能 SIGKILL" watchdog alert. Detect by
-    # walking the parent PID chain looking for the launchd-managed bot
-    # process. If found, refuse the inline restart and tell the caller to
+    # service we are about to kickstart -k, we'd SIGKILL our own ancestor before
+    # the active turn finishes. Detect by walking the parent PID chain looking
+    # for the launchd-managed bot process. If found, refuse inline restart and
     # defer (e.g. via TG /restart, daily-restart 4am, or `at now+1m`).
     #
     # Heuristic: launchctl list <label> reports the live PID. Walk our own
@@ -52,8 +50,8 @@ restart() {
     # `|| true` on both pipeline assignments below is critical:
     # under `set -euo pipefail` (line 6), a non-zero exit from
     # launchctl/ps would abort the function before the guard logic
-    # could reach kickstart — turning a probe failure into a silent
-    # restart failure. Codex round-1 review caught this.
+    # could reach kickstart — turning a probe failure into a silent restart
+    # failure.
     local target_pid
     target_pid=$(launchctl list "$label" 2>/dev/null | awk -F'"' '/"PID"/{print $3; exit}' | tr -d '=; \t') || true
     if [ -n "$target_pid" ] && [ "$target_pid" != "-" ]; then
