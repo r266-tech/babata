@@ -13,6 +13,7 @@ Schema (jsonl cache):
   boundary 标记 V 触发新对话 (/new) — UI mount 时只拉最后一个 boundary 之后的 turns.
 """
 
+import hashlib
 import json
 import logging
 import time
@@ -26,6 +27,7 @@ log = logging.getLogger(__name__)
 HISTORY_DIR = SIDEBAR_DATA_DIR
 HISTORY_FILE = HISTORY_DIR / "chat_history.jsonl"
 HISTORY_TURN_RETENTION = 200
+HISTORY_TEXT_MAX_CHARS = 12000
 _lock = Lock()
 
 HISTORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -49,11 +51,15 @@ _probe_persistence()
 
 
 def append(role: str, text: str, **fields: Any) -> None:
+    raw_text = text or ""
     rec: dict[str, Any] = {
         "ts": int(time.time()),
         "role": role,
-        "text": text or "",
+        "text": _truncate_text(raw_text),
     }
+    if len(raw_text) > HISTORY_TEXT_MAX_CHARS:
+        rec["text_sha256"] = _sha256_text(raw_text)
+        rec["text_bytes"] = len(raw_text.encode("utf-8", errors="replace"))
     rec.update(fields)
     try:
         line = json.dumps(rec, ensure_ascii=False) + "\n"
@@ -72,6 +78,18 @@ def append(role: str, text: str, **fields: Any) -> None:
 def boundary() -> None:
     """Write a session boundary record. UI mount filters to last boundary onwards."""
     append("boundary", "")
+
+
+def _truncate_text(text: str) -> str:
+    if "... [truncated " in text and text.endswith(" chars]"):
+        return text
+    if len(text) <= HISTORY_TEXT_MAX_CHARS:
+        return text
+    return f"{text[:HISTORY_TEXT_MAX_CHARS]}... [truncated {len(text) - HISTORY_TEXT_MAX_CHARS} chars]"
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
 def read_since_last_boundary(limit: int = 200) -> list[dict]:

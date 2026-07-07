@@ -45,3 +45,19 @@ def test_sidebar_history_retains_only_recent_turns_without_boundary(monkeypatch,
     ]
     assert len(sidebar_history.read_since_last_boundary(limit="bad")) == 3
     assert sidebar_history.read_since_last_boundary(limit=0) == []
+
+
+def test_sidebar_history_bounds_long_turn_text(monkeypatch, tmp_path):
+    history_file = tmp_path / "chat_history.jsonl"
+    monkeypatch.setattr(sidebar_history, "HISTORY_FILE", history_file)
+    monkeypatch.setattr(sidebar_history, "HISTORY_TEXT_MAX_CHARS", 24)
+    text = "answer-" + ("a" * 80) + "-HISTORY-TAIL"
+
+    sidebar_history.append("assistant", text)
+
+    raw = history_file.read_text(encoding="utf-8")
+    assert "HISTORY-TAIL" not in raw
+    [row] = sidebar_history.read_since_last_boundary(limit=10)
+    assert row["text"].endswith("chars]")
+    assert row["text_sha256"] == sidebar_history._sha256_text(text)
+    assert row["text_bytes"] == len(text.encode("utf-8"))
