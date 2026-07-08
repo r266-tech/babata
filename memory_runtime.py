@@ -27,7 +27,6 @@ _MEMORY_INJECT_TIMEOUTS = {
 _REFLEX_ROUTES = {"none", "lite", "brain", "wx", "code-grounded", "recent", "deep"}
 _REFLEX_PROFILES = {"lite", "recent", "deep"}
 _REFLEX_FLAGS = {"bad_case", "reflection_candidate"}
-_REFLEX_PROMPT_ROUTES = {"brain", "wx", "code-grounded"}
 _REFLEX_VALUE_MAX_CHARS = 40
 
 
@@ -123,21 +122,6 @@ def _memory_reflex_for_prompt(
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _format_memory_reflex_hint(reflex: dict[str, Any]) -> str:
-    routes = [
-        route for route in _sanitize_reflex_list(reflex.get("routes"), _REFLEX_ROUTES)
-        if route in _REFLEX_PROMPT_ROUTES
-    ]
-    if not routes:
-        return ""
-    lines = [
-        "<memory-reflex>",
-        f"routes: {', '.join(routes)}",
-        "</memory-reflex>",
-    ]
-    return "\n".join(lines)
-
-
 def _sanitize_reflex_token(value: Any, allowed: set[str]) -> str | None:
     token = str(value or "").strip()
     if len(token) > _REFLEX_VALUE_MAX_CHARS:
@@ -180,7 +164,6 @@ def _log_memory_reflex_preflight(
     mode: str,
     actual_profile: str,
     memory_injected: bool,
-    hint_injected: bool,
 ) -> str | None:
     if not reflex:
         return None
@@ -211,7 +194,6 @@ def _log_memory_reflex_preflight(
         "router": router,
         "actual_profile": actual_profile,
         "memory_injected": memory_injected,
-        "hint_injected": hint_injected,
         "post_answer_observation": "pending",
     })
     return event_id
@@ -240,7 +222,6 @@ def log_memory_reflex_preflight_only(
         mode=memory_reflex_mode(),
         actual_profile=os.environ.get("BABATA_MEMORY_PROFILE") or "lite",
         memory_injected=False,
-        hint_injected=False,
     )
 
 
@@ -338,11 +319,6 @@ def render_babata_memory_context_event(
     )
     if not context_text:
         return "", None
-    parts = [context_text]
-    hint = _format_memory_reflex_hint(reflex) if mode == "enforce" else ""
-    if hint:
-        parts.append(hint)
-    context = "\n\n".join(part for part in parts if part)
     event_id = _log_memory_reflex_preflight(
         reflex=reflex,
         user_prompt=user_prompt,
@@ -350,7 +326,6 @@ def render_babata_memory_context_event(
         cpu=cpu,
         mode=mode,
         actual_profile=actual_profile,
-        memory_injected=bool(context),
-        hint_injected=bool(hint),
+        memory_injected=bool(context_text),
     )
-    return context, event_id
+    return context_text, event_id

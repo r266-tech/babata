@@ -208,7 +208,6 @@ def test_render_memory_context_event_logs_enforced_reflex(monkeypatch, tmp_path)
         {
             "actual_profile": "deep",
             "event": "preflight",
-            "hint_injected": False,
             "id": event_id,
             "memory_injected": True,
             "message_sha256": events[0]["message_sha256"],
@@ -320,7 +319,6 @@ def test_log_memory_reflex_preflight_only_records_router_without_inject(monkeypa
         {
             "actual_profile": "lite",
             "event": "preflight",
-            "hint_injected": False,
             "id": event_id,
             "memory_injected": False,
             "message_sha256": events[0]["message_sha256"],
@@ -339,27 +337,48 @@ def test_log_memory_reflex_preflight_only_records_router_without_inject(monkeypa
     assert str(tmp_path) not in reflex_log.read_text(encoding="utf-8")
 
 
-def test_memory_reflex_hint_stays_compact_and_omits_router_reasons():
-    hint = memory_runtime._format_memory_reflex_hint({
-        "routes": ["brain", "recent"],
-        "profile": "recent",
-        "reasons": ["history"],
-    })
+def test_memory_reflex_routes_stay_telemetry_not_prompt_hints(monkeypatch, tmp_path):
+    inject_script = tmp_path / "inject.sh"
+    reflex_script = tmp_path / "reflex.py"
+    reflex_log = tmp_path / "events.jsonl"
+    _write_executable(
+        inject_script,
+        "\n".join([
+            "#!/bin/sh",
+            "printf '%s\\n' '<memory-context>ok</memory-context>'",
+        ]),
+    )
+    _write_executable(
+        reflex_script,
+        "\n".join([
+            "#!/bin/sh",
+            "printf '%s\\n' '{\"routes\":[\"brain\",\"wx\",\"code-grounded\"],\"profile\":\"lite\",\"reasons\":[\"private detail\"]}'",
+        ]),
+    )
+    monkeypatch.setenv("BABATA_MEMORY_INJECT_SCRIPT", str(inject_script))
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_SCRIPT", str(reflex_script))
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_LOG", str(reflex_log))
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX", "1")
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_MODE", "enforce")
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_TIMEOUT", _TEST_REFLEX_TIMEOUT_S)
 
-    assert len(hint) <= 80
-    assert "routes: brain" in hint
-    assert "recent" not in hint
-    assert "profile:" not in hint
-    assert "signal:" not in hint
-    assert "why:" not in hint
-    assert "history" not in hint
+    context, event_id = memory_runtime.render_babata_memory_context_event(
+        enabled=True,
+        source="sidebar",
+        user_prompt="查一下这个人的微信和资料",
+        cpu="codex",
+        cwd=str(tmp_path),
+        timeout=float(_TEST_REFLEX_TIMEOUT_S),
+    )
 
-
-def test_memory_reflex_hint_suppresses_profile_only_routes():
-    assert memory_runtime._format_memory_reflex_hint({
-        "routes": ["recent", "deep"],
-        "profile": "deep",
-    }) == ""
+    assert event_id
+    assert context == "<memory-context>ok</memory-context>"
+    assert "<memory-reflex>" not in context
+    assert "routes:" not in context
+    assert "private detail" not in context
+    event = json.loads(reflex_log.read_text().splitlines()[0])
+    assert event["router"] == {"profile": "lite", "routes": ["brain", "wx", "code-grounded"]}
+    assert "hint_injected" not in event
 
 
 def test_memory_reflex_values_are_allowlisted(monkeypatch, tmp_path):
@@ -379,7 +398,6 @@ def test_memory_reflex_values_are_allowlisted(monkeypatch, tmp_path):
         mode="dry-run",
         actual_profile="lite",
         memory_injected=False,
-        hint_injected=False,
     )
 
     assert event_id
@@ -391,13 +409,6 @@ def test_memory_reflex_values_are_allowlisted(monkeypatch, tmp_path):
         "routes": ["recent"],
     }
     assert str(tmp_path) not in text
-
-    hint = memory_runtime._format_memory_reflex_hint({
-        "routes": ["brain", str(tmp_path)],
-        "profile": str(tmp_path),
-    })
-    assert "routes: brain" in hint
-    assert str(tmp_path) not in hint
 
 
 def test_memory_runtime_owns_shared_reflex_helpers():
@@ -414,7 +425,6 @@ def test_memory_runtime_owns_shared_reflex_helpers():
         "def _memory_reflex_mode",
         "def _memory_reflex_script",
         "def _memory_reflex_timeout",
-        "def _format_memory_reflex_hint",
         "def _render_babata_memory_context(",
         "def _memory_reflex_log_path",
         "def _append_memory_reflex_event",
