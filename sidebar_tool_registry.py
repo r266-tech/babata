@@ -25,7 +25,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "tab_metadata",
         "dispatch": "bridge",
         "description": (
-            "Read url/title/selection/scroll/lang; no DOM text. Use first; pass tab_id/window_id."
+            "Read url/title/selection/scroll/lang; no DOM; pass tab_id/window_id."
         ),
         "inputSchema": {"type": "object", "properties": _target_props()},
     },
@@ -33,7 +33,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "dom_query",
         "dispatch": "bridge",
         "description": (
-            "CSS query target tab; default body tag/text limit 50; root/props narrow."
+            "CSS query tab; body text limit 50; root/props narrow."
         ),
         "inputSchema": {
             "type": "object",
@@ -52,7 +52,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "dom_inject",
         "dispatch": "bridge",
         "description": (
-            "insertAdjacentHTML into matches for explicit annotations/UI only; translation uses /translate."
+            "insertAdjacentHTML for explicit annotations/UI only; translation uses /translate."
         ),
         "inputSchema": {
             "type": "object",
@@ -71,7 +71,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "dom_set",
         "dispatch": "bridge",
         "description": (
-            "Set input/text/attr and fire input/change; for forms or explicit edits; translation uses /translate."
+            "Set input/text/attr; fire input/change; explicit edit only; translation uses /translate."
         ),
         "inputSchema": {
             "type": "object",
@@ -87,7 +87,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "dom_click",
         "dispatch": "bridge",
         "description": (
-            "Synthetic .click() on first match. Not trusted input; captcha/OAuth may reject."
+            "Synthetic .click() first match; Not trusted input; captcha/OAuth may reject."
         ),
         "inputSchema": {
             "type": "object",
@@ -112,7 +112,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "article_extract",
         "dispatch": "bridge",
         "description": (
-            "Extract current tab article text/metadata; use page text, don't shell/curl current tab."
+            "Extract tab article text/metadata; don't shell/curl current tab."
         ),
         "inputSchema": {"type": "object", "properties": _target_props()},
     },
@@ -210,7 +210,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "bookmarks_create",
         "dispatch": "bridge",
         "description": (
-            "Create bookmark; parent_id optional; use bookmarks_tree for folders."
+            "Create bookmark; parent_id optional; use bookmarks_tree."
         ),
         "inputSchema": {
             "type": "object",
@@ -316,6 +316,8 @@ READ_TOOL_NAMES = frozenset({
     "page_snapshot",
     "article_extract",
     "translate",
+})
+GLOBAL_READ_TOOL_NAMES = frozenset({
     "bookmarks_search",
     "bookmarks_tree",
     "tabs_query",
@@ -323,17 +325,18 @@ READ_TOOL_NAMES = frozenset({
 })
 TOOL_SCOPE_NAMES = {
     "full": frozenset(t["name"] for t in SIDEBAR_TOOLS),
-    "read": READ_TOOL_NAMES,
+    "page-read": READ_TOOL_NAMES,
+    "read": READ_TOOL_NAMES | GLOBAL_READ_TOOL_NAMES,
     "proactive": PROACTIVE_TOOL_NAMES,
 }
 
 
-def tool_names(scope: str | None = None) -> frozenset[str]:
-    return TOOL_SCOPE_NAMES.get((scope or "read").strip().lower(), TOOL_SCOPE_NAMES["read"])
+def _tool_names(scope: str | None = None) -> frozenset[str]:
+    return TOOL_SCOPE_NAMES.get((scope or "page-read").strip().lower(), TOOL_SCOPE_NAMES["page-read"])
 
 
 def tool_specs(scope: str | None = None) -> list[dict[str, Any]]:
-    allowed = tool_names(scope)
+    allowed = _tool_names(scope)
     return [
         {
             "name": tool["name"],

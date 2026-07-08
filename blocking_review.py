@@ -75,10 +75,6 @@ _REVIEW_SCHEMA = {
 }
 
 
-def blocking_review_enabled() -> bool:
-    return os.environ.get("BABATA_BLOCKING_REVIEW", "1") != "0"
-
-
 def blocking_review_max_rounds() -> int:
     raw = os.environ.get("BABATA_BLOCKING_REVIEW_MAX_ROUNDS", "2")
     try:
@@ -96,7 +92,7 @@ def run_blocking_review(
     response_content: str,
     round_index: int,
 ) -> dict[str, Any]:
-    if not blocking_review_enabled():
+    if os.environ.get("BABATA_BLOCKING_REVIEW", "1") == "0":
         return _result("skipped", reason="BABATA_BLOCKING_REVIEW=0", round_index=round_index)
     if not _needs_review(audit_summary):
         return _result("skipped", reason="no code-changing turn", round_index=round_index)
@@ -679,7 +675,6 @@ def _cc_worker_cli() -> Path | None:
         return path if path.exists() and os.access(path, os.X_OK) else None
     candidates = [
         Path.home() / "cc-workspace/bin/cc-worker",
-        Path("~/cc-workspace/bin/cc-worker").expanduser(),
     ]
     for candidate in candidates:
         if candidate and candidate.exists() and os.access(candidate, os.X_OK):

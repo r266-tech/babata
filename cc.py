@@ -81,7 +81,7 @@ _CC_PROJECTS = Path.home() / ".claude" / "projects" / str(Path.home()).replace("
 _NO_BYTECODE_ENV = "PYTHONDONTWRITEBYTECODE"
 
 
-def mcp_servers_without_repo_bytecode(mcp_servers: dict[str, Any] | None) -> dict[str, Any]:
+def _mcp_servers_without_repo_bytecode(mcp_servers: dict[str, Any] | None) -> dict[str, Any]:
     """Ensure local MCP subprocesses do not write __pycache__ into the repo."""
     cleaned = copy.deepcopy(mcp_servers or {})
     for cfg in cleaned.values():
@@ -96,8 +96,8 @@ def mcp_servers_without_repo_bytecode(mcp_servers: dict[str, Any] | None) -> dic
 def _find_jsonl_any_bucket(sid: str) -> Path | None:
     """Locate <sid>.jsonl across all ~/.claude/projects/<cwd-hash>/ buckets.
 
-    babata 默认 cwd=$HOME, 单 bucket 看到的只是 V 在 $HOME 跑 claude 那批 session.
-    V 在 ~/code/foo 跑 claude 的 session 落在 -Users-admin-code-foo/ 别的 bucket,
+    babata 默认 cwd=$HOME, 单 bucket 只看到从 $HOME 启动的 claude sessions.
+    从 ~/code/foo 启动的 claude session 落在 -Users-admin-code-foo/ 别的 bucket,
     list_recent_sessions(scan_all_buckets=True) 会列出来; 但实际 resume / 读 turn
     时还得跨 bucket 找文件 — 这里就做这个查找.
 
@@ -146,9 +146,9 @@ def _import_jsonl_to_bucket(source_sid: str) -> str | None:
     """Resolve <source_sid>.jsonl to a sid that lives in babata's bucket.
 
     源文件已在 babata bucket → 直接返回 source_sid (no copy, no fork).
-    源文件在别的 cwd-bucket (V 在终端别处开的原生 CC) → fork: 用 *新 uuid*
+    源文件在别的 cwd-bucket (终端别处开的原生 CC) → fork: 用 *新 uuid*
     复制到 babata bucket, 返回新 sid. 关键设计:
-      - 新 uuid 避免 sid 冲突: 原 sid 在源 bucket 不动, V 在原 cwd 终端继续
+      - 新 uuid 避免 sid 冲突: 原 sid 在源 bucket 不动, 原 cwd 终端继续
         resume 同一个 sid 仍能续上, 跟 babata 这边的 fork 物理隔离 不会
         silent diverge (Codex A-FORK).
       - SDK --resume <new_sid> 能找到 (CLI cwd-bound, 文件在 babata bucket).
@@ -211,14 +211,13 @@ def _import_jsonl_to_bucket(source_sid: str) -> str | None:
         with suppress(Exception):
             lock_path.unlink()
 
-# 默认隔离 — 不读用户 ~/.claude/{settings.json, CLAUDE.md, skills/}, 不动 OAuth keychain.
-# 用户日常 CC 完全无感. 开源用户走这条 (.env 必须有 ANTHROPIC_API_KEY).
-# V 私人 .env 设 BABATA_SHARED_CC=1 → 共享用户 CC 全套 (skill / settings / OAuth), 跟之前体验一致.
+# Default isolated mode does not read ~/.claude/{settings.json, CLAUDE.md, skills/}
+# or OAuth keychain state. BABATA_SHARED_CC=1 opts into sharing the local
+# Claude Code profile for trusted personal deployments.
 _SETTING_SOURCES: list[str] = ["user"] if os.environ.get("BABATA_SHARED_CC") == "1" else []
 
-# 默认信任边界 — babata 容器化 default: cwd 限定 repo 自身 (不让 babata access 用户整个家),
-# permission_mode 走 "default" (重要 tool call 提示授权, 不静默 bypass).
-# V 私人 .env 设 BABATA_FULL_TRUST=1 → cwd=~/ + auto mode (官方支持, status "auto mode on").
+# Default trust boundary keeps cwd at the repo and permission prompts enabled.
+# BABATA_FULL_TRUST=1 opts into cwd=$HOME and auto mode for trusted personal deployments.
 _FULL_TRUST = os.environ.get("BABATA_FULL_TRUST") == "1"
 _DEFAULT_CWD = str(Path.home()) if _FULL_TRUST else str(Path(__file__).parent)
 _PERMISSION_MODE = "auto" if _FULL_TRUST else "default"
@@ -341,7 +340,7 @@ def _spawn_summary_generation(sid: str, source_mtime: float) -> None:
             cli = os.environ.get("CLAUDE_CLI_PATH") or "claude"
             # Model 不写死, 跟随 ~/.claude/settings.json 全局默认:
             # CC 模型会升级, 代码里写死 'haiku' 将来可能指向弃用 tier.
-            # 若 V 觉得总结任务用 opus 太慢, 改 settings.json 或加 env override.
+            # 若总结任务用 opus 太慢, 改 settings.json 或加 env override.
             #
             # CWD 用 _SUMMARY_SANDBOX 而不是 $HOME, 避免 subprocess session jsonl
             # 污染主 bucket (2026-04-20 踩过的坑).
@@ -370,7 +369,7 @@ def _spawn_summary_generation(sid: str, source_mtime: float) -> None:
 def _scan_peer_sids() -> dict[str, list[str]]:
     """扫 _STATE_DIR 所有 *-session.json, 返回 {sid: [channel_label, ...]}.
 
-    一个 sid 如果被多个 channel 的 recent_sids 收录 (例 V 从 TG /resume 了 bb 开的
+    一个 sid 如果被多个 channel 的 recent_sids 收录 (例从 TG /resume 了 bb 开的
     session → 两个 state 都会有它), 列表里会有多个来源.
     """
     out: dict[str, list[str]] = {}
@@ -497,8 +496,8 @@ async def _always_allow(
 # CC still decides meaning from the data we expose. Kept explicit so a future
 # reader sees the cost model instead of magic numbers.
 _MAX_RECENT_SIDS = 200          # ring buffer of past session_ids (~1y at 5/day, ~15KB state file)
-_RESUME_INJECT_PAIRS = 3        # last N user+assistant pairs to inject on resume failure
-_RESUME_INJECT_CHARS = 300      # per-turn char cap (3 pairs × 300 × 2 ≈ 1.8KB, fits any system_prompt)
+_RESUME_INJECT_PAIRS = 2        # last N user+assistant pairs to inject on resume failure
+_RESUME_INJECT_CHARS = 240      # per-turn char cap (2 pairs × 240 × 2 ≈ 1KB, fits any system_prompt)
 _IDLE_RESET_MINUTES_DEFAULT = 1440  # 24h, parity with hermes session_reset.idle_minutes (gateway/config.py:114)
 
 
@@ -557,7 +556,7 @@ def _idle_reset_seconds() -> int:
 #   <bash-input>…</bash-input>                       — CC's Bash tool calls
 #   <local-command-stdout>…                          — command captures
 # Any of these as the first "user" message of a session makes the /resume
-# preview useless. Match tag-prefixed content so V sees her real first prompt.
+# preview useless. Match tag-prefixed content so the real first prompt is shown.
 _SYNTHETIC_USER_PREFIXES = (
     "<local-command-",
     "<command-name>",
@@ -572,7 +571,7 @@ _SYNTHETIC_USER_PREFIXES = (
 
 
 def _is_synthetic_user_text(text: str) -> bool:
-    """True if `text` is CC-injected scaffolding rather than a V-authored turn."""
+    """True if `text` is CC-injected scaffolding rather than user-authored text."""
     stripped = text.lstrip()
     return stripped.startswith(_SYNTHETIC_USER_PREFIXES)
 
@@ -656,7 +655,7 @@ class Response:
 
 
 def _result_error_text(subtype: str | None, result: Any) -> str:
-    """Human-facing message for an error ResultMessage so V sees the real
+    """Human-facing message for an error ResultMessage so the UI shows the real
     failure (limit / max_turns / API error) rather than an empty answer."""
     labels = {
         "error_max_turns": "本轮触及最大工具调用轮次上限 (max_turns)",
@@ -837,7 +836,7 @@ class CC:
         self._source_prompt = source_prompt
         self._memory_source = memory_source or default_memory_source()
         self._memory_enabled = memory_enabled
-        self._mcp_servers = mcp_servers_without_repo_bytecode(mcp_servers)
+        self._mcp_servers = _mcp_servers_without_repo_bytecode(mcp_servers)
         self._model = model
         self._session_id: str | None = self._load_state().get("session_id")
         self._memory_reflex_event_id: str | None = None
@@ -916,7 +915,7 @@ class CC:
         """Silently reset session if idle exceeds threshold. Returns True if reset.
 
         Idle reset ≠ /new: fires only the babata-local session-end hook for the
-        old sid. Skips skill-evolve session-start (V didn't actively reset) and
+        old sid. Skips skill-evolve session-start (no explicit reset) and
         skips the "会话已重置" reply. Next turn starts fresh and picks up the
         standard startup memory context.
 
@@ -964,6 +963,7 @@ class CC:
             if not target.is_file():
                 continue
             turns: list[tuple[str, str]] = []
+            skip_synthetic_reply = False
             try:
                 for line in target.read_text().splitlines():
                     try:
@@ -977,8 +977,17 @@ class CC:
                     if role not in ("user", "assistant"):
                         continue
                     text = _extract_text(msg.get("content"))
-                    if text:
-                        turns.append((role, text))
+                    if not text:
+                        continue
+                    if role == "user":
+                        if _is_synthetic_user_text(text):
+                            skip_synthetic_reply = True
+                            continue
+                        skip_synthetic_reply = False
+                    elif skip_synthetic_reply:
+                        skip_synthetic_reply = False
+                        continue
+                    turns.append((role, text))
             except Exception:
                 continue
             if not turns:
@@ -995,7 +1004,7 @@ class CC:
             self._fire_hook(_HOOKS_DIR, "session-end.sh", old_sid)
         self._session_id = None
         self._record_sid(None)
-        # skill-evolve SessionStart: 处理 pending + surface 上次 evolve 给 V (空
+        # skill-evolve SessionStart: 处理 pending + surface 上次 evolve (空
         # sid, 它不关心新 sid 是啥). babata-local session-start 不在这里 fire —
         # 新 sid 要等下一次 query 的 ResultMessage 才拿得到, 见 _run().
         self._fire_hook(_SKILL_HOOKS_DIR, "session-start.sh", "")
@@ -1012,11 +1021,11 @@ class CC:
         session, 按 JSONL 的 entrypoint 字段细分:
           - entrypoint=sdk-cli → 'oneshot' (claude -p 一次性, cron / 手敲 -p)
           - 其他 (cli / claude-desktop / sdk-py orphan / 未知) → 'term' (交互或异常)
-        这样 /resume 里 "终端" 和 "一次性" 能分开, V 找 bb 交互 session 不再被
+        这样 /resume 里 "终端" 和 "一次性" 能分开, 交互 session 不再被
         cron 一次性塞满列表.
 
         行为变更 (2026-04-20): 从"扫本 channel state.recent_sids"改成"扫整个
-        _CC_PROJECTS bucket 的 *.jsonl 按 mtime 排序". 原因: V 的设计是多渠道
+        _CC_PROJECTS bucket 的 *.jsonl 按 mtime 排序". 原因: 多渠道
         共享一个 CC 内核, TG / WX / 终端 bb 开的 session 应互相可见. 旧实现
         依赖 per-channel state, bb/WX 开的 session TG 永远看不到.
 
@@ -1101,7 +1110,7 @@ class CC:
 
         Returns up to 2 * pairs (role, text) entries in chronological order,
         or empty list if sid has no JSONL or no meaningful turns. Used by
-        the bot's `/resume` button click to show V what she just resumed
+        the bot's `/resume` button click to show what was just resumed
         into — selecting by 48-char first-user preview isn't enough to tell
         two nearby threads apart.
         """
@@ -1148,7 +1157,7 @@ class CC:
         picker 的判定逻辑一致. assistant 只要写过任何一条 (含纯 tool_use) 就不
         算孤儿, 说明 CC 至少开始响应了.
 
-        用于 bot _post_init 上线通知: 孤儿 = 附加 ⚠️ 告警让 V 决定 /resume 或
+        用于 bot _post_init 上线通知: 孤儿 = 附加 ⚠️ 告警让用户决定 /resume 或
         /new. 不自动重试 (工具可能有副作用).
         """
         sid = sid or self._session_id
@@ -1232,10 +1241,10 @@ class CC:
             model=self._model,
             setting_sources=_SETTING_SOURCES,  # 默认 [] 隔离; BABATA_SHARED_CC=1 → ["user"] 共享
             mcp_servers=self._mcp_servers,
-            # SDK 默认 max_buffer_size = 1MB; V 发 PDF/大图 或 resume 含 base64
+            # SDK 默认 max_buffer_size = 1MB; PDF/大图 或 resume 含 base64
             # 附件的老 session 时, CLI stdout 单条 JSON message 就超了 → 报
             # "JSON message exceeded maximum buffer size" → SDK 抛 Exception
-            # → cc.query 走 resume-fail 分支 → fire 🔴 + 🟢 让 V 以为在瞎切 session.
+            # → cc.query 走 resume-fail 分支 → fire 🔴 + 🟢, 看起来像误切 session.
             # 64MB 一次性 settle (单条 JSON message 理论上限 ~ context window
             # 文本量级, 远不到 64MB). 2026-04-22 根因: babata-vvv.err 11:20 事件.
             max_buffer_size=64 * 1024 * 1024,
@@ -1257,7 +1266,7 @@ class CC:
             self.reset()
             return Response(content="会话已重置。", session_id="", cost=0.0)
 
-        # Silent idle reset (default 24h, hermes parity). V didn't ask for it,
+        # Silent idle reset (default 24h, hermes parity). No explicit reset,
         # don't reply "会话已重置" — fresh session + memory context takes over.
         # Override via BABATA_IDLE_RESET_MINUTES env (0 disables).
         self._check_idle_reset()

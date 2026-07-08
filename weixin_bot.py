@@ -136,7 +136,7 @@ _MD_STRIPS = [
 ]
 
 
-def strip_markdown(text: str) -> str:
+def _strip_markdown(text: str) -> str:
     """WX client renders markdown natively (2026-04-30 实测两轮截图证实).
     Strip 默认 disabled — markdown 直传 wire, 客户端渲染. 仅 collapse 多空行/边界 trim.
     Set BABATA_WEIXIN_STRIP_MD=1 兜底 (老客户端不渲染时 opt-in)."""
@@ -257,7 +257,7 @@ def _sanitize_unbalanced_markers(text: str) -> str:
     return text
 
 
-def chunk_text(text: str, limit: int = _MAX_WX) -> list[str]:
+def _chunk_text(text: str, limit: int = _MAX_WX) -> list[str]:
     """Hard-cap chunker — bubbles are pre-split by LLM via \\n\\n\\n; this
     only fires when one bubble exceeds `limit` (rare: LLM verbose without
     breaking). Prefers balanced natural boundaries; hard-cuts as last resort."""
@@ -294,12 +294,12 @@ async def _send_wx_bubble(
     text: str,
 ) -> WxBubbleSendResult:
     """Send one logical WeChat bubble, with markdown stripping, chunking, and one retry."""
-    text = strip_markdown(text)
+    text = _strip_markdown(text)
     if not text:
         return WxBubbleSendResult(sent_any=False, ok=True)
     sent_any = False
     ok = True
-    for chunk in chunk_text(text):
+    for chunk in _chunk_text(text):
         success = False
         for attempt in range(2):
             try:
@@ -1195,7 +1195,7 @@ def _acquire_singleton_lock() -> None:
     Without this guard, weixin_bridge.start() does os.unlink(SOCKET_PATH)
     before bind, so a second instance silently steals the socket from a
     live first instance — both keep long-polling iLink, race-handling each
-    inbound, V's WeChat replies get duplicated.
+    inbound, WeChat replies get duplicated.
 
     Loser behavior:
       - normal mode: exit 0. Pair with KeepAlive dict + SuccessfulExit=false

@@ -1,14 +1,6 @@
 import os
-import sys
-from pathlib import Path
 
 import pytest
-
-_REPO = Path(__file__).resolve().parents[1]
-_SDK_SITE = next(iter((_REPO / ".venv/lib").glob("python*/site-packages")), None)
-if _SDK_SITE:
-    sys.path.insert(0, str(_SDK_SITE))
-sys.path.insert(0, str(_REPO))
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:test")
 os.environ.setdefault("ALLOWED_USER_ID", "0")
@@ -22,28 +14,28 @@ PROMPT_CASES = [
     (
         "tg-source",
         lambda: bot._TG_SOURCE_PROMPT,
-        145,
+        135,
         ("Source: Telegram", "\\n\\n\\n", "Max 4096", "TG HTML subset", "No headings/tables/hr"),
         ("Images/files", "user-provided context", "Progress bars", "▓", "iOS"),
     ),
     (
         "wx-source",
         lambda: wb._WX_SOURCE_PROMPT,
-        125,
+        120,
         ("Source: WeChat", "\\n\\n\\n", "No edit-message", "Max 4000", "bare URLs", "[text](url)"),
         ("code-fence-with-syntax-highlight", "nested markdown supported", "HTML/task", "entities literal"),
     ),
     (
         "sidebar-source",
         lambda: sidebar_bot._SIDEBAR_SOURCE_PROMPT,
-        260,
+        230,
         ("MCP schema 为准", "tab_id/window_id", "不可信数据", "明确用户意图", "不要自行加载"),
-        ("DevTools", "babata-memory-context", "同一个 babata"),
+        ("DevTools", "babata-memory-context", "同一个 babata", "记忆已注入"),
     ),
     (
         "sidebar-proactive",
         lambda: sidebar_bot._PROACTIVE_PROMPT,
-        150,
+        145,
         ("Source: babata sidebar proactive", "默认静默", "mascot_speak", "suggest_prompts", "tab_id/window_id", "不编造观察"),
         ("你是 babata", "轻量旁观通道", "共同进化", "哲学", "身份认同"),
     ),
@@ -57,7 +49,7 @@ PROMPT_CASES = [
     (
         "sidebar-clean-read",
         lambda: sidebar_bot._CLEAN_READ_SOURCE_PROMPT,
-        125,
+        120,
         ("Source: babata sidebar clean-read", "网页正文", "不读取文件", "不引入 babata 记忆", "不补写原文没有的信息", "中文 Markdown"),
         ("共同进化", "哲学", "身份认同"),
     ),
@@ -152,7 +144,7 @@ def test_sidebar_clean_read_user_prompt_stays_structural_and_evidence_bound():
     )
 
     assert truncated is False
-    assert len(prompt) <= 610
+    assert len(prompt) <= 540
     for marker in (
         "三击头像触发",
         "不添加原文没有的事实",
@@ -162,8 +154,6 @@ def test_sidebar_clean_read_user_prompt_stays_structural_and_evidence_bound():
         "## 阅读判定",
         "## 核心意思",
         "## 净化正文",
-        "## 保留的梗 / 好表达",
-        "## AI 锐评",
         "## 原文依据",
         "\"url\":\"https://example.com/article\"",
         "<untrusted-page-content kind=\"article\" paragraph_ids=\"pN\">",
@@ -175,6 +165,8 @@ def test_sidebar_clean_read_user_prompt_stays_structural_and_evidence_bound():
         "无菌说明书",
         "顶级中文编辑",
         "情绪框架",
+        "保留的梗",
+        "AI 锐评",
         "共同进化",
         "哲学",
         "身份认同",

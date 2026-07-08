@@ -25,7 +25,7 @@ _local_whisper = None  # lazy singleton — init cost ~1-3s, model download ~150
 
 
 async def _stt_local(wav_path: Path) -> str:
-    """faster-whisper local STT — open box default, no API key needed.
+    """faster-whisper local STT — explicit opt-in, no API key needed.
     First call downloads model (~150MB for base) to ~/.cache/huggingface/. Subsequent calls reuse.
     """
     global _local_whisper
@@ -33,7 +33,7 @@ async def _stt_local(wav_path: Path) -> str:
         try:
             from faster_whisper import WhisperModel
         except ImportError as e:
-            raise RuntimeError("STT 未配置: faster-whisper 未装. 跑 `uv sync` 重装依赖.") from e
+            raise RuntimeError("STT 未配置: faster-whisper 未装. 跑 `uv sync --extra stt-local`.") from e
         _local_whisper = WhisperModel(_STT_LOCAL_MODEL, device="auto", compute_type="auto")
     loop = asyncio.get_running_loop()
 
@@ -49,11 +49,16 @@ async def _stt_local(wav_path: Path) -> str:
 
 
 async def _stt_wav(wav_path: Path) -> str:
-    """STT dispatcher: MiMo (if configured, best) → local whisper (default, free)."""
+    """STT dispatcher: MiMo when configured; local whisper only by explicit opt-in."""
     api_url = os.environ.get("MIMO_API_URL")
     api_key = os.environ.get("MIMO_API_KEY")
     if not api_url or not api_key:
-        return await _stt_local(wav_path)
+        if os.environ.get("BABATA_STT_LOCAL") == "1":
+            return await _stt_local(wav_path)
+        raise RuntimeError(
+            "STT 未配置: 设置 MIMO_API_URL/MIMO_API_KEY; "
+            "或显式 BABATA_STT_LOCAL=1 并安装 babata[stt-local]."
+        )
 
     audio_b64 = base64.b64encode(wav_path.read_bytes()).decode()
     import httpx
@@ -88,7 +93,7 @@ async def _stt_wav(wav_path: Path) -> str:
 
 
 async def transcribe_voice(ogg_path: Path, keep_wav: Path | None = None) -> str:
-    """TG OGG voice → text via ffmpeg + MiMo. Fail loud, no fallback.
+    """TG OGG voice → text via ffmpeg + configured STT. Fail loud, no silent fallback.
 
     keep_wav: 非 None 时把 16kHz mono WAV 在 STT 完成后复制到该路径 (不影响 STT 行为).
     voice-clone skill 用此机制让 CC 拿到 wav 路径做声音克隆.
@@ -120,7 +125,7 @@ async def transcribe_voice(ogg_path: Path, keep_wav: Path | None = None) -> str:
         wav_path.unlink(missing_ok=True)
 
 
-def silk_to_wav(silk_path: Path, sample_rate: int = 24000) -> Path:
+def _silk_to_wav(silk_path: Path, sample_rate: int = 24000) -> Path:
     """Decode WeChat SILK v3 voice → WAV file next to the input.
 
     Requires `pilk` (pip install pilk). WeChat voice is always 24kHz mono s16le
@@ -151,7 +156,7 @@ def silk_to_wav(silk_path: Path, sample_rate: int = 24000) -> Path:
 
 async def transcribe_silk(silk_path: Path) -> str:
     """WeChat SILK voice → text."""
-    wav_path = silk_to_wav(silk_path)
+    wav_path = _silk_to_wav(silk_path)
     try:
         return await _stt_wav(wav_path)
     finally:
@@ -319,63 +324,6 @@ async def _tts_to_mp3(text: str, voice: str | None, mp3: Path) -> bool:
     return mp3.exists()
 
 
-async def text_to_silk(text: str, voice: str | None = None) -> tuple[Path, int] | None:
-    """Text → WeChat SILK v3 voice. Returns (silk_path, duration_ms) or None.
-
-    Format spec from @tencent-weixin/openclaw-weixin TS api/types.ts:
-      VoiceItem.encode_type=6 (SILK), bits_per_sample=16, sample_rate=24000.
-    Pipeline: TTS → mp3 → ffmpeg → 24kHz mono s16le PCM → pilk encode → SILK.
-    """
-    import tempfile
-    import uuid
-
-    if not _strip_md(text)[:4000]:
-        return None
-
-    tmp = Path(tempfile.gettempdir())
-    tag = uuid.uuid4().hex
-    mp3 = tmp / f"tts_{tag}.mp3"
-    pcm = tmp / f"tts_{tag}.pcm"
-    silk = tmp / f"tts_{tag}.silk"
-
-    try:
-        if not await _tts_to_mp3(text, voice, mp3):
-            return None
-
-        # mp3 → 24 kHz mono s16le PCM (matches Weixin SILK_SAMPLE_RATE)
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", str(mp3),
-            "-f", "s16le", "-acodec", "pcm_s16le",
-            "-ar", "24000", "-ac", "1",
-            str(pcm),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.wait_for(proc.wait(), timeout=60)
-        if not pcm.exists() or pcm.stat().st_size == 0:
-            return None
-
-        # PCM → SILK v3 via pilk (already a dep for inbound silk_to_wav)
-        try:
-            import pilk
-        except ImportError as e:
-            raise RuntimeError("SILK encode 缺依赖: .venv/bin/pip install pilk") from e
-        pilk.encode(str(pcm), str(silk), pcm_rate=24000, tencent=False)
-        if not silk.exists() or silk.stat().st_size == 0:
-            return None
-
-        # duration_ms = pcm bytes / (2 bytes/sample × 24000 Hz) × 1000
-        duration_ms = int(pcm.stat().st_size / (2 * 24000) * 1000)
-        return (silk, duration_ms)
-    except Exception as e:
-        log.warning("text_to_silk failed: %s", e)
-        silk.unlink(missing_ok=True)
-        return None
-    finally:
-        mp3.unlink(missing_ok=True)
-        pcm.unlink(missing_ok=True)
-
-
 async def text_to_voice(text: str, voice: str | None = None) -> Path | None:
     """Text → OGG/Opus voice file. Returns path or None.
 
@@ -393,19 +341,8 @@ async def text_to_voice(text: str, voice: str | None = None) -> Path | None:
     ogg = mp3.with_suffix(".ogg")
 
     try:
-        if _TTS_URL:
-            v = voice or _TTS_VOICE
-            if _TTS_BACKEND == "mimo":
-                audio_bytes = await _tts_mimo(clean, v)
-            else:
-                audio_bytes = await _tts_openai(clean, v)
-            if not audio_bytes:
-                return None
-            mp3.write_bytes(audio_bytes)
-        else:
-            import edge_tts
-            communicator = edge_tts.Communicate(clean, voice or "zh-CN-XiaoxiaoNeural")
-            await communicator.save(str(mp3))
+        if not await _tts_to_mp3(clean, voice, mp3):
+            return None
 
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y", "-i", str(mp3),

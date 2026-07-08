@@ -59,7 +59,7 @@ class SidebarBridge:
     def detach_sw_if(self, expected: SwSender) -> None:
         """只在当前 sender 仍是 expected 时才 detach.
 
-        Race: WS A 关闭走 finally 时, WS B 可能已 attach (V 多窗口或 reload 扩展).
+        Race: WS A 关闭走 finally 时, WS B 可能已 attach (多窗口或 reload 扩展).
         无脑 detach_sw 会清掉 B 的 sender 和 B 新发的 pending future.
         """
         if self._sw_send is not expected:

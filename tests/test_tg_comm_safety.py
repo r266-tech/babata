@@ -3,15 +3,8 @@ import asyncio
 import inspect
 import json
 import os
-import sys
 from pathlib import Path
 import pytest
-
-_REPO = Path(__file__).resolve().parents[1]
-_SDK_SITE = next(iter((_REPO / ".venv/lib").glob("python*/site-packages")), None)
-if _SDK_SITE:
-    sys.path.insert(0, str(_SDK_SITE))
-sys.path.insert(0, str(_REPO))
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:test")
 os.environ.setdefault("ALLOWED_USER_ID", "0")
@@ -175,7 +168,7 @@ def test_tg_mcp_tool_descriptions_stay_operational(monkeypatch):
     for marker in ("interactive buttons", "string callback", "{label,url}", "Links sent"):
         assert marker in buttons.description
 
-    assert len(text.description) <= 140
+    assert len(text.description) <= 120
     for marker in ("Telegram", "auto-delivered", "mid-turn pushes", "long-running progress", "proactive sends"):
         assert marker in text.description
     for marker in (
@@ -186,7 +179,7 @@ def test_tg_mcp_tool_descriptions_stay_operational(monkeypatch):
     ):
         assert marker not in text.description
 
-    assert len(page.description) <= 135
+    assert len(page.description) <= 125
     for marker in ("Telegraph", "markdown", "long structured", "TG inline HTML", "returns the Telegraph URL"):
         assert marker in page.description
     for marker in ("Instant View card", "syntax-highlighted", "<ul>/<ol>", "h3/h4", "unsupported elements"):
@@ -242,7 +235,7 @@ def test_tg_mcp_schema_helper_keeps_tool_contracts(monkeypatch):
         "tg_send_video",
         "tg_send_page",
     ]
-    assert sum(len(description) for description in descriptions) <= 650
+    assert sum(len(description) for description in descriptions) <= 540
     assert schema_descriptions == []
     forbidden_markers = (
         "the user's",
@@ -408,7 +401,7 @@ def test_fmt_tool_marks_memory_context():
         },
     )
 
-    assert line == "🧠 Memory · context lite (L0+daily-map) · codex/terminal · top force"
+    assert line == "🧠 Memory · context lite · codex/terminal · top force"
 
 
 def test_fmt_tool_summarizes_shell_find_with_target_patterns():

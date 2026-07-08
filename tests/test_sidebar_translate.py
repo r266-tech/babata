@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 
 import httpx
 
@@ -194,7 +195,6 @@ def test_translate_batch_dedupes_hits_and_caches_misses(monkeypatch):
 
     rows = asyncio.run(
         st.translate_batch(
-            "site",
             "zh",
             [
                 {"hash": "hit", "text": "Hit"},
@@ -241,7 +241,6 @@ def test_translate_batch_partial_failure_keeps_only_successful_results(monkeypat
 
     rows = asyncio.run(
         st.translate_batch(
-            "site",
             "zh",
             [{"hash": "hit", "text": "Hit"}, {"hash": "miss", "text": "Miss"}],
             url="https://page.test",
@@ -268,7 +267,6 @@ def test_translate_batch_config_error_records_event(monkeypatch):
 
     rows = asyncio.run(
         st.translate_batch(
-            "site",
             "zh",
             [{"hash": "h", "text": "Hello"}],
             url="https://page.test",
@@ -282,3 +280,9 @@ def test_translate_batch_config_error_records_event(monkeypatch):
             {"reason": "missing key", "target": "zh", "model": st._MODEL},
         )
     ]
+
+
+def test_translate_batch_signature_uses_explicit_url_not_site():
+    params = inspect.signature(st.translate_batch).parameters
+
+    assert list(params) == ["target", "batch", "url"]

@@ -1,14 +1,7 @@
 import asyncio
 import json
 import os
-import sys
 from pathlib import Path
-
-_REPO = Path(__file__).resolve().parents[1]
-_SDK_SITE = next(iter((_REPO / ".venv/lib").glob("python*/site-packages")), None)
-if _SDK_SITE:
-    sys.path.insert(0, str(_SDK_SITE))
-sys.path.insert(0, str(_REPO))
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:test")
 os.environ.setdefault("ALLOWED_USER_ID", "0")
@@ -167,6 +160,7 @@ class FakeSession:
         self.interrupted = False
         self.submitted = []
         self.queue: asyncio.Queue = asyncio.Queue()
+        self.supports_hot_input = True
 
     async def connect(self):
         self.connected = True
@@ -1158,7 +1152,7 @@ def test_channel_worker_single_turn_clean_reset(monkeypatch, tmp_path):
 
 
 def test_channel_worker_cut_in_waits_for_next_turn(monkeypatch, tmp_path):
-    """V 快速连发: 第二条先 ack + interrupt, 但不立即 submit 进 SDK.
+    """用户快速连发: 第二条先 ack + interrupt, 但不立即 submit 进 SDK.
     等第一条 turn_end 后, worker 才 begin_turn + submit 第二条, 避免 stale
     interrupt 命中新 turn."""
     async def run():
@@ -1331,6 +1325,40 @@ def test_channel_worker_codex_coalesces_pending_cut_ins(monkeypatch, tmp_path):
 
     asyncio.run(run())
 
+
+def test_channel_worker_missing_hot_input_attr_defaults_to_coalesce(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        session = FakeSession()
+        delattr(session, "supports_hot_input")
+        worker = bot.ChannelWorker(session, instance_label="test")
+        await worker.start()
+
+        chat = FakeChat(chat_id=42)
+        ctx = FakeCtx()
+        await worker.submit(bot.Payload(update=FakeUpdate(FakeMessage(1, "first"), chat), ctx=ctx, text="first"))
+        await worker.submit(bot.Payload(update=FakeUpdate(FakeMessage(2, "second"), chat), ctx=ctx, text="second"))
+        await worker.submit(bot.Payload(update=FakeUpdate(FakeMessage(3, "third"), chat), ctx=ctx, text="third"))
+
+        assert session.submitted == [("first", None)]
+        assert session.interrupted is False
+
+        session.queue.put_nowait(
+            Event(kind="turn_end", response=Response(content="done1", session_id="sid-1", cost=0.01))
+        )
+
+        await wait_for(lambda: len(session.submitted) == 2)
+        prompt, images = session.submitted[1]
+        assert images is None
+        assert "Multiple Telegram messages, oldest to newest" in prompt
+        assert "second" in prompt
+        assert "third" in prompt
+
+        await worker.stop()
+
+    asyncio.run(run())
+
+
 def test_channel_worker_stopped_turn_marks_active_failed(monkeypatch, tmp_path):
     async def run():
         reset_bot_globals(monkeypatch, tmp_path)
@@ -1402,7 +1430,7 @@ def test_channel_worker_reaction_eye_then_ok_single_turn(monkeypatch, tmp_path):
 
 
 def test_channel_worker_reaction_back_to_back_messages(monkeypatch, tmp_path):
-    """V 连发两条: 两条都立即 👀; 每条在各自 turn_end 后 👌."""
+    """用户连发两条: 两条都立即 👀; 每条在各自 turn_end 后 👌."""
     async def run():
         reset_bot_globals(monkeypatch, tmp_path)
         session = FakeSession()
@@ -1854,7 +1882,7 @@ def test_channel_worker_unfinished_work_includes_pending_cut_ins(monkeypatch, tm
 
 
 def test_channel_worker_new_message_reply_does_not_merge(monkeypatch, tmp_path):
-    """V 发 msg1 流式中又发 msg2: msg1 的后续输出仍在 msg1, msg2
+    """用户发 msg1 流式中又发 msg2: msg1 的后续输出仍在 msg1, msg2
     等第一 turn_end 后开启自己的 reply."""
     async def run():
         reset_bot_globals(monkeypatch, tmp_path)
@@ -1876,7 +1904,7 @@ def test_channel_worker_new_message_reply_does_not_merge(monkeypatch, tmp_path):
         first_reply = m1.replies[0]
         assert "answer-1-part-A" in first_reply.text
 
-        # V 中途发 msg2 (turn 1 还没 turn_end)
+        # 用户中途发 msg2 (turn 1 还没 turn_end)
         await worker.submit(
             bot.Payload(update=FakeUpdate(m2, chat), ctx=ctx, text="second")
         )
@@ -1923,7 +1951,7 @@ def test_channel_worker_final_response_lands_on_active_reply_anchor(monkeypatch,
         session.queue.put_nowait(Event(kind="text_delta", chunk="streaming-msg1"))
         await wait_for(lambda: len(m1.replies) == 1)
 
-        # V 中途发 msg2 — 只 queue + interrupt, 不切当前 turn anchor.
+        # 用户中途发 msg2 — 只 queue + interrupt, 不切当前 turn anchor.
         await worker.submit(
             bot.Payload(update=FakeUpdate(m2, chat), ctx=ctx, text="second")
         )
@@ -1957,8 +1985,8 @@ def test_channel_worker_final_response_lands_on_active_reply_anchor(monkeypatch,
 
 
 def test_channel_worker_reset_drops_pending_marks(monkeypatch, tmp_path):
-    """P2-D: V 发 m1 → submit (pending=[m1]) → /new → reset_turn_state 应清
-    pending_marks. 接着 V 发 m2 → 只有 m2 进 pending, 不会带着 m1 一起 fire 👀."""
+    """P2-D: 用户发 m1 → submit (pending=[m1]) → /new → reset_turn_state 应清
+    pending_marks. 接着用户发 m2 → 只有 m2 进 pending, 不会带着 m1 一起 fire 👀."""
     async def run():
         reset_bot_globals(monkeypatch, tmp_path)
         session = FakeSession()
@@ -1982,10 +2010,10 @@ def test_channel_worker_reset_drops_pending_marks(monkeypatch, tmp_path):
         # /new 后 _pending_marks 应被清空 (drop_pending=True 路径)
         assert worker._pending_marks == []
         assert worker._active_marks == []
-        # m1 在 /new 时被 fire 💔 (区分 turn_end 的 👌, V 一眼看到未完成).
+        # m1 在 /new 时被 fire 💔 (区分 turn_end 的 👌, 用户一眼看到未完成).
         await wait_for(lambda: (42, 1, "💔") in ctx.bot.reactions)
 
-        # V 接着发 m2 — 只有 m2 进 pending → 👀 给 m2
+        # 用户接着发 m2 — 只有 m2 进 pending → 👀 给 m2
         m2 = FakeMessage(2, "after-reset")
         await worker.submit(
             bot.Payload(update=FakeUpdate(m2, chat), ctx=ctx, text="after-reset")

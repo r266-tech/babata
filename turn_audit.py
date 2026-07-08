@@ -91,11 +91,11 @@ class TurnAudit:
     record: dict[str, Any] = field(default_factory=dict)
 
 
-def audit_enabled() -> bool:
+def _audit_enabled() -> bool:
     return os.environ.get("BABATA_TURN_LEDGER", "1") != "0"
 
 
-def guard_mode() -> str:
+def _guard_mode() -> str:
     mode = os.environ.get("BABATA_DETERMINISTIC_GUARDS", "observe").strip().lower()
     if mode in {"0", "off", "false", "disabled"}:
         return "off"
@@ -104,11 +104,11 @@ def guard_mode() -> str:
     return "observe"
 
 
-def declared_checks_enabled() -> bool:
+def _declared_checks_enabled() -> bool:
     return os.environ.get("BABATA_DECLARED_CHECKS", "1") != "0"
 
 
-def review_bus_mode() -> str:
+def _review_bus_mode() -> str:
     mode = os.environ.get("BABATA_REVIEW_BUS", "off").strip().lower()
     if mode in {"0", "off", "false", "disabled"}:
         return "off"
@@ -133,7 +133,7 @@ def begin_turn(
     Disabled audit is a true no-op, so tests and special runtimes can opt out by
     setting BABATA_TURN_LEDGER=0.
     """
-    if not audit_enabled():
+    if not _audit_enabled():
         return None
 
     actual_cwd = Path(cwd or os.getcwd()).expanduser().resolve()
@@ -243,10 +243,10 @@ def finish_turn(
         },
         "tools": tool_names,
         "tool_uses": _compact_tool_uses(tool_uses),
-        "guard_mode": guard_mode(),
+        "guard_mode": _guard_mode(),
         "guard_findings": guard_findings,
         "declared_checks": check_results,
-        "review_bus_mode": review_bus_mode(),
+        "review_bus_mode": _review_bus_mode(),
         "review_tasks": review_tasks,
         "final_preview": _preview(final_content, _MAX_FINAL_PREVIEW),
         "final_sha256": _sha256_text(final_content),
@@ -263,7 +263,7 @@ def run_deterministic_guards(
     changed_files: list[str],
     tool_uses: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    mode = guard_mode()
+    mode = _guard_mode()
     if mode == "off":
         return []
 
@@ -468,7 +468,7 @@ def _declared_check_items(
     baseline_config_fingerprint: str | None,
     require_baseline_config: bool,
 ) -> tuple[list[Any], list[dict[str, Any]] | None]:
-    if not declared_checks_enabled():
+    if not _declared_checks_enabled():
         return [], [{"status": "skipped", "reason": "BABATA_DECLARED_CHECKS=0"}]
     if repo_root is None:
         return [], [{"status": "skipped", "reason": "not a git repo"}]
@@ -566,7 +566,7 @@ def enqueue_review_tasks(
     check_results: list[dict[str, Any]],
     tool_uses: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    mode = review_bus_mode()
+    mode = _review_bus_mode()
     if mode == "off":
         return []
 
@@ -628,7 +628,7 @@ def summarize_tool_use(name: str, tool_input: dict[str, Any] | None) -> dict[str
 
 
 def should_block_for_permission(tool_name: str, tool_input: dict[str, Any] | None) -> tuple[bool, str | None]:
-    if guard_mode() != "enforce":
+    if _guard_mode() != "enforce":
         return False, None
     findings = run_deterministic_guards(
         repo_root=None,

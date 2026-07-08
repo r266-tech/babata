@@ -13,41 +13,43 @@ from typing import Any
 _CACHE: tuple[float, dict[str, Any]] | None = None
 
 
-def review_health_snapshot(*, force: bool = False) -> dict[str, Any]:
+def review_health_snapshot(*, force: bool = False, probe: bool = True) -> dict[str, Any]:
     ttl = _cache_ttl_seconds()
     now = time.time()
     global _CACHE
     if not force and _CACHE is not None and now - _CACHE[0] < ttl:
         return _CACHE[1]
-    snapshot = _compute_snapshot()
-    _CACHE = (now, snapshot)
+    snapshot = _compute_snapshot(probe=probe)
+    if probe:
+        _CACHE = (now, snapshot)
     return snapshot
 
 
-def review_health_status() -> str:
-    snapshot = review_health_snapshot()
-    return str(snapshot.get("status") or "unknown")
-
-
-def _compute_snapshot() -> dict[str, Any]:
+def _compute_snapshot(*, probe: bool = True) -> dict[str, Any]:
     enabled = os.environ.get("BABATA_BLOCKING_REVIEW", "1") != "0"
     counterpart_enabled = _counterpart_enabled()
     strict = os.environ.get("BABATA_BLOCKING_REVIEW_INFRA_STRICT", "0") == "1"
-    probes = {
-        "cc_worker": _probe_cc_worker(),
-        "codex": _probe_codex(),
-    }
-    ok = all(item.get("ok") for item in probes.values())
     if not enabled:
         status = "disabled"
+        probes = {}
     elif not counterpart_enabled:
         status = "deterministic-only"
-    elif ok:
-        status = "ok"
-    elif strict:
-        status = "block"
+        probes = {}
+    elif not probe:
+        status = "not-checked"
+        probes = {}
     else:
-        status = "degraded"
+        probes = {
+            "cc_worker": _probe_cc_worker(),
+            "codex": _probe_codex(),
+        }
+        ok = all(item.get("ok") for item in probes.values())
+        if ok:
+            status = "ok"
+        elif strict:
+            status = "block"
+        else:
+            status = "degraded"
     return {
         "status": status,
         "enabled": enabled,
@@ -124,7 +126,6 @@ def _cc_worker_cli() -> Path | None:
         return path if path.exists() and os.access(path, os.X_OK) else None
     candidates = [
         Path.home() / "cc-workspace/bin/cc-worker",
-        Path("~/cc-workspace/bin/cc-worker").expanduser(),
     ]
     for candidate in candidates:
         if candidate and candidate.exists() and os.access(candidate, os.X_OK):

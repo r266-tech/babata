@@ -172,17 +172,10 @@ def _memory_context_detail(command: str) -> str:
     cpu = _option_value(parts, "--cpu")
     source = _option_value(parts, "--source")
     include_top = _option_value(parts, "--include-top")
-    profile_hint = {
-        "lite": "L0+daily-map",
-        "recent": "recent+L0",
-        "deep": "deep+L0",
-    }.get(profile, "")
 
     detail = "context"
     if profile:
         detail += f" {profile}"
-        if profile_hint:
-            detail += f" ({profile_hint})"
     else:
         detail += " context"
     route = "/".join([p for p in (cpu, source) if p])

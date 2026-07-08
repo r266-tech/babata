@@ -24,30 +24,35 @@ _MEMORY_INJECT_TIMEOUTS = {
     "claude": "BABATA_CC_MEMORY_INJECT_TIMEOUT",
     "codex": "BABATA_CODEX_MEMORY_INJECT_TIMEOUT",
 }
+_REFLEX_ROUTES = {"none", "lite", "brain", "wx", "code-grounded", "recent", "deep"}
+_REFLEX_PROFILES = {"lite", "recent", "deep"}
+_REFLEX_FLAGS = {"bad_case", "reflection_candidate"}
+_REFLEX_PROMPT_ROUTES = {"brain", "wx", "code-grounded"}
+_REFLEX_VALUE_MAX_CHARS = 40
 
 
-def memory_inject_script() -> Path:
+def _memory_inject_script() -> Path:
     configured = os.environ.get("BABATA_MEMORY_INJECT_SCRIPT")
     return Path(configured).expanduser() if configured else _DEFAULT_MEMORY_INJECT_SCRIPT
 
 
-def memory_reflex_enabled() -> bool:
+def _memory_reflex_enabled() -> bool:
     return os.environ.get("BABATA_MEMORY_REFLEX") == "1"
 
 
 def memory_reflex_mode() -> str:
-    if not memory_reflex_enabled():
+    if not _memory_reflex_enabled():
         return "off"
     mode = os.environ.get("BABATA_MEMORY_REFLEX_MODE", "dry-run").strip().lower()
     return mode if mode in {"dry-run", "enforce"} else "dry-run"
 
 
-def memory_reflex_script() -> Path:
+def _memory_reflex_script() -> Path:
     configured = os.environ.get("BABATA_MEMORY_REFLEX_SCRIPT")
     return Path(configured).expanduser() if configured else _DEFAULT_MEMORY_REFLEX_SCRIPT
 
 
-def memory_reflex_timeout() -> float:
+def _memory_reflex_timeout() -> float:
     raw = os.environ.get("BABATA_MEMORY_REFLEX_TIMEOUT", "0.8")
     try:
         return max(0.1, float(raw))
@@ -75,16 +80,16 @@ def memory_inject_timeout(cpu: str) -> float:
         return 5.0
 
 
-def memory_reflex_for_prompt(
+def _memory_reflex_for_prompt(
     *,
     source: str,
     user_prompt: str | None,
     cpu: str,
     cwd: str,
 ) -> dict[str, Any]:
-    if not memory_reflex_enabled() or not user_prompt:
+    if not _memory_reflex_enabled() or not user_prompt:
         return {}
-    script = memory_reflex_script()
+    script = _memory_reflex_script()
     if not script.is_file():
         log.warning("babata memory reflex script missing: %s", script)
         return {}
@@ -101,7 +106,7 @@ def memory_reflex_for_prompt(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=memory_reflex_timeout(),
+            timeout=_memory_reflex_timeout(),
             check=False,
         )
     except Exception as exc:
@@ -118,18 +123,37 @@ def memory_reflex_for_prompt(
     return parsed if isinstance(parsed, dict) else {}
 
 
-def format_memory_reflex_hint(reflex: dict[str, Any]) -> str:
-    routes = [str(r) for r in reflex.get("routes", []) if str(r)]
-    profile = str(reflex.get("profile") or "lite")
-    if not routes or (profile == "lite" and all(r in {"none", "lite"} for r in routes)):
+def _format_memory_reflex_hint(reflex: dict[str, Any]) -> str:
+    routes = [
+        route for route in _sanitize_reflex_list(reflex.get("routes"), _REFLEX_ROUTES)
+        if route in _REFLEX_PROMPT_ROUTES
+    ]
+    if not routes:
         return ""
     lines = [
         "<memory-reflex>",
         f"routes: {', '.join(routes)}",
-        f"profile: {profile}",
         "</memory-reflex>",
     ]
     return "\n".join(lines)
+
+
+def _sanitize_reflex_token(value: Any, allowed: set[str]) -> str | None:
+    token = str(value or "").strip()
+    if len(token) > _REFLEX_VALUE_MAX_CHARS:
+        return None
+    return token if token in allowed else None
+
+
+def _sanitize_reflex_list(value: Any, allowed: set[str]) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        token = _sanitize_reflex_token(item, allowed)
+        if token and token not in out:
+            out.append(token)
+    return out
 
 
 def _memory_reflex_log_path() -> Path:
@@ -147,7 +171,7 @@ def _append_memory_reflex_event(payload: dict[str, Any]) -> None:
         log.warning("babata memory reflex log failed: %s", exc)
 
 
-def log_memory_reflex_preflight(
+def _log_memory_reflex_preflight(
     *,
     reflex: dict[str, Any],
     user_prompt: str | None,
@@ -163,6 +187,19 @@ def log_memory_reflex_preflight(
     now = time.time()
     digest = hashlib.sha256((user_prompt or "").encode("utf-8")).hexdigest()
     event_id = hashlib.sha256(f"{now}:{cpu}:{source}:{digest}".encode("utf-8")).hexdigest()[:16]
+    router: dict[str, Any] = {}
+    routes = _sanitize_reflex_list(reflex.get("routes"), _REFLEX_ROUTES)
+    flags = _sanitize_reflex_list(reflex.get("flags"), _REFLEX_FLAGS)
+    profile = _sanitize_reflex_token(reflex.get("profile"), _REFLEX_PROFILES)
+    route = _sanitize_reflex_token(reflex.get("route"), _REFLEX_ROUTES)
+    if routes:
+        router["routes"] = routes
+    if flags:
+        router["flags"] = flags
+    if profile:
+        router["profile"] = profile
+    if route:
+        router["route"] = route
     _append_memory_reflex_event({
         "event": "preflight",
         "id": event_id,
@@ -171,7 +208,7 @@ def log_memory_reflex_preflight(
         "cpu": cpu,
         "mode": mode,
         "message_sha256": digest,
-        "router": reflex,
+        "router": router,
         "actual_profile": actual_profile,
         "memory_injected": memory_injected,
         "hint_injected": hint_injected,
@@ -189,13 +226,13 @@ def log_memory_reflex_preflight_only(
 ) -> str | None:
     if os.environ.get("BABATA_CRON_AGENT") == "1":
         return None
-    reflex = memory_reflex_for_prompt(
+    reflex = _memory_reflex_for_prompt(
         source=source,
         user_prompt=user_prompt,
         cpu=cpu,
         cwd=cwd,
     )
-    return log_memory_reflex_preflight(
+    return _log_memory_reflex_preflight(
         reflex=reflex,
         user_prompt=user_prompt,
         source=source,
@@ -232,9 +269,9 @@ def log_memory_reflex_post_answer(event_id: str | None, content: str) -> None:
 def _memory_context_profile(reflex: dict[str, Any], mode: str) -> str:
     configured = os.environ.get("BABATA_MEMORY_PROFILE")
     if configured:
-        return configured
+        return _sanitize_reflex_token(configured, _REFLEX_PROFILES) or "lite"
     if mode == "enforce":
-        return str(reflex.get("profile") or "lite")
+        return _sanitize_reflex_token(reflex.get("profile"), _REFLEX_PROFILES) or "lite"
     return "lite"
 
 
@@ -282,11 +319,11 @@ def render_babata_memory_context_event(
 ) -> tuple[str, str | None]:
     if not enabled:
         return "", None
-    script = memory_inject_script()
+    script = _memory_inject_script()
     if not script.is_file():
         log.warning("babata memory context script missing: %s", script)
         return "", None
-    reflex = memory_reflex_for_prompt(
+    reflex = _memory_reflex_for_prompt(
         source=source,
         user_prompt=user_prompt,
         cpu=cpu,
@@ -302,11 +339,11 @@ def render_babata_memory_context_event(
     if not context_text:
         return "", None
     parts = [context_text]
-    hint = format_memory_reflex_hint(reflex) if mode == "enforce" else ""
+    hint = _format_memory_reflex_hint(reflex) if mode == "enforce" else ""
     if hint:
         parts.append(hint)
     context = "\n\n".join(part for part in parts if part)
-    event_id = log_memory_reflex_preflight(
+    event_id = _log_memory_reflex_preflight(
         reflex=reflex,
         user_prompt=user_prompt,
         source=source,

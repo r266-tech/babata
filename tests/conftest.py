@@ -9,6 +9,13 @@ from typing import Any
 
 sys.dont_write_bytecode = True
 
+_REPO = Path(__file__).resolve().parents[1]
+_SDK_SITE = _REPO / ".venv/lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+if _SDK_SITE.is_dir() and str(_SDK_SITE) not in sys.path:
+    sys.path.insert(0, str(_SDK_SITE))
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
 import pytest
 
 

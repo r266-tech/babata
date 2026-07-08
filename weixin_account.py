@@ -67,7 +67,7 @@ def register_account(account_id: str) -> None:
         _write_json(_root() / "accounts.json", ids)
 
 
-def unregister_account(account_id: str) -> None:
+def _unregister_account(account_id: str) -> None:
     ids = [i for i in list_account_ids() if i != account_id]
     _write_json(_root() / "accounts.json", ids)
     for suffix in (".json", ".sync.json", ".context-tokens.json", ".allow.json"):
@@ -115,7 +115,7 @@ def load_sync_buf(account_id: str) -> str:
 # ── context tokens (per-peer, required for outbound reply) ───────────
 
 
-def load_context_tokens(account_id: str) -> dict[str, str]:
+def _load_context_tokens(account_id: str) -> dict[str, str]:
     data = _read_json(_account_path(account_id, ".context-tokens.json"), {})
     return data if isinstance(data, dict) else {}
 
@@ -123,7 +123,7 @@ def load_context_tokens(account_id: str) -> dict[str, str]:
 def set_context_token(account_id: str, user_id: str, ctx_token: str | None) -> None:
     if not user_id:
         return
-    tokens = load_context_tokens(account_id)
+    tokens = _load_context_tokens(account_id)
     if ctx_token:
         tokens[user_id] = ctx_token
     else:
@@ -132,11 +132,7 @@ def set_context_token(account_id: str, user_id: str, ctx_token: str | None) -> N
 
 
 def get_context_token(account_id: str, user_id: str) -> str | None:
-    return load_context_tokens(account_id).get(user_id)
-
-
-def clear_context_tokens(account_id: str) -> None:
-    _account_path(account_id, ".context-tokens.json").unlink(missing_ok=True)
+    return _load_context_tokens(account_id).get(user_id)
 
 
 # ── allowFrom (per-account authz) ────────────────────────────────────
@@ -199,7 +195,7 @@ def clear_stale_for_user(keeping_account_id: str, user_id: str) -> list[str]:
             continue
         meta = load_account(aid)
         if meta and meta.get("userId") == user_id:
-            unregister_account(aid)
+            _unregister_account(aid)
             removed.append(aid)
             log.info("cleared stale account %s (userId=%s)", aid, user_id)
     return removed

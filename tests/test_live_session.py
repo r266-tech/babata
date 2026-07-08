@@ -1,13 +1,5 @@
 import asyncio
 import json
-import sys
-from pathlib import Path
-
-_REPO = Path(__file__).resolve().parents[1]
-_SDK_SITE = next(iter((_REPO / ".venv/lib").glob("python*/site-packages")), None)
-if _SDK_SITE:
-    sys.path.insert(0, str(_SDK_SITE))
-sys.path.insert(0, str(_REPO))
 
 import cc
 from claude_agent_sdk import (
@@ -357,7 +349,7 @@ def test_live_session_reset_drops_pending_inbox(monkeypatch, tmp_path):
 
         await session.reset_live()
         # After reset, the OLD client must not have received any of the pending
-        # messages — they belonged to the session V just told us to drop.
+        # messages — they belonged to the session the user just told us to drop.
         assert first.sent == []
         # And the new client is fresh (no resume).
         assert len(FakeClaudeSDKClient.instances) >= 2
@@ -379,7 +371,11 @@ def test_live_session_resume_failure_reconnects_and_replays(monkeypatch, tmp_pat
         (projects / f"{old_sid}.jsonl").write_text(
             "\n".join(
                 [
+                    json.dumps({"message": {"role": "user", "content": "<command-name>/status</command-name>"}}),
+                    json.dumps({"message": {"role": "assistant", "content": "status output"}}),
                     json.dumps({"message": {"role": "user", "content": "old question"}}),
+                    json.dumps({"message": {"role": "user", "content": "<bash-input>pwd</bash-input>"}}),
+                    json.dumps({"message": {"role": "assistant", "content": "/tmp/internal-output"}}),
                     json.dumps({"message": {"role": "assistant", "content": "old answer"}}),
                 ]
             )
@@ -407,8 +403,13 @@ def test_live_session_resume_failure_reconnects_and_replays(monkeypatch, tmp_pat
         assert "会话从历史归档恢复" in second.options.system_prompt
         assert "user: old question" in second.options.system_prompt
         assert "assistant: old answer" in second.options.system_prompt
+        assert "<command-name>" not in second.options.system_prompt
+        assert "<bash-input>" not in second.options.system_prompt
+        assert "status output" not in second.options.system_prompt
+        assert "/tmp/internal-output" not in second.options.system_prompt
         assert "V: old question" not in second.options.system_prompt
         assert "CC: old answer" not in second.options.system_prompt
+        assert len(second.options.system_prompt) <= 1400
         assert second.sent[0]["message"]["content"] == "new question"
 
         second.receive_queue.put_nowait(result("fresh-session", "fresh answer"))

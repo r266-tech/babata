@@ -58,7 +58,6 @@ LOGIN_TOTAL_TIMEOUT_S = 480
 MEDIA_IMAGE = 1
 MEDIA_VIDEO = 2
 MEDIA_FILE = 3
-MEDIA_VOICE = 4
 
 # Inbound MessageItem type values (proto: MessageItemType).
 ITEM_TEXT = 1
@@ -95,12 +94,7 @@ def _common_headers() -> dict[str, str]:
 # ── AES-128-ECB (CDN media crypto) ────────────────────────────────────
 
 
-def aes_ecb_padded_size(rawsize: int) -> int:
-    """PKCS7 pads to next 16-byte boundary; full block added when already aligned."""
-    return ((rawsize // 16) + 1) * 16
-
-
-def encrypt_aes_ecb(plaintext: bytes, key: bytes) -> bytes:
+def _encrypt_aes_ecb(plaintext: bytes, key: bytes) -> bytes:
     if len(key) != 16:
         raise ValueError(f"AES-128 key must be 16 bytes, got {len(key)}")
     padder = PKCS7(128).padder()
@@ -109,7 +103,7 @@ def encrypt_aes_ecb(plaintext: bytes, key: bytes) -> bytes:
     return enc.update(padded) + enc.finalize()
 
 
-def decrypt_aes_ecb(ciphertext: bytes, key: bytes) -> bytes:
+def _decrypt_aes_ecb(ciphertext: bytes, key: bytes) -> bytes:
     if len(key) != 16:
         raise ValueError(f"AES-128 key must be 16 bytes, got {len(key)}")
     dec = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
@@ -118,7 +112,7 @@ def decrypt_aes_ecb(ciphertext: bytes, key: bytes) -> bytes:
     return unpadder.update(padded) + unpadder.finalize()
 
 
-def parse_inbound_aes_key(raw: str | None) -> bytes | None:
+def _parse_inbound_aes_key(raw: str | None) -> bytes | None:
     """Decode inbound AES key from one of 3 protocol shapes.
 
     The protocol emits keys in inconsistent encodings across media types:
@@ -149,7 +143,7 @@ def parse_inbound_aes_key(raw: str | None) -> bytes | None:
     return None
 
 
-def encode_outbound_aes_key(key: bytes) -> str:
+def _encode_outbound_aes_key(key: bytes) -> str:
     """CDNMedia.aes_key = base64 of hex-string (not base64 of raw bytes)."""
     return base64.b64encode(key.hex().encode()).decode()
 
@@ -310,10 +304,6 @@ class WeixinClient:
     def _pause(self) -> None:
         self._paused_until = time.time() + SESSION_PAUSE_SECONDS
         log.warning("session paused 1h for accountId=%s", self.account_id)
-
-    @property
-    def is_paused(self) -> bool:
-        return self._paused_until > time.time()
 
     # ── core POST ────────────────────────────────────────────────────
 
@@ -486,7 +476,7 @@ class WeixinClient:
         """
         key = token_bytes(16)
         filekey = token_bytes(16).hex()
-        ciphertext = encrypt_aes_ecb(data, key)
+        ciphertext = _encrypt_aes_ecb(data, key)
         rawsize = len(data)
         filesize = len(ciphertext)
         md5 = hashlib.md5(data).hexdigest()
@@ -518,7 +508,7 @@ class WeixinClient:
 
         return {
             "encrypt_query_param": download_param,
-            "aes_key": encode_outbound_aes_key(key),
+            "aes_key": _encode_outbound_aes_key(key),
             "full_url": (
                 f"{self.cdn_base_url}/download"
                 f"?encrypted_query_param={quote(download_param, safe='')}"
@@ -589,7 +579,7 @@ class WeixinClient:
             except ValueError:
                 key = None
         if key is None:
-            key = parse_inbound_aes_key(cdn_media.get("aes_key"))
+            key = _parse_inbound_aes_key(cdn_media.get("aes_key"))
         if key is None:
             raise WeixinApiError("download_media: could not parse aes_key")
 
@@ -605,7 +595,7 @@ class WeixinClient:
             r.raise_for_status()
             ciphertext = r.content
 
-        return decrypt_aes_ecb(ciphertext, key)
+        return _decrypt_aes_ecb(ciphertext, key)
 
 
 # ── item builders (convenience for send_message) ──────────────────────

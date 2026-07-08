@@ -2,20 +2,12 @@
 
 These guard the wx bot stream coalescer from cutting messages mid-word /
 inside ``...`` / inside **...**, which would leak markdown chars verbatim
-because strip_markdown's pair-matching regexes fail on broken pairs.
+because _strip_markdown's pair-matching regexes fail on broken pairs.
 """
 from __future__ import annotations
 
 import asyncio
 import os
-import sys
-from pathlib import Path
-
-_REPO = Path(__file__).resolve().parents[1]
-_SDK_SITE = next(iter((_REPO / ".venv/lib").glob("python*/site-packages")), None)
-if _SDK_SITE:
-    sys.path.insert(0, str(_SDK_SITE))
-sys.path.insert(0, str(_REPO))
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:test")
 os.environ.setdefault("ALLOWED_USER_ID", "0")
@@ -134,14 +126,14 @@ def test_md_balanced_link_with_double_nested_paren():
     assert isinstance(result, bool)
 
 
-# ── strip_markdown fence info string ────────────────────────────────
+# ── _strip_markdown fence info string ────────────────────────────────
 
 
 def test_strip_markdown_fence_with_dot_in_lang(monkeypatch):
     # Round 2 codex finding: `.env` info string was leaking before fix.
     monkeypatch.setenv("BABATA_WEIXIN_STRIP_MD", "1")
     text = "```.env\nKEY=value\n```"
-    out = wb.strip_markdown(text)
+    out = wb._strip_markdown(text)
     assert "KEY=value" in out
     assert ".env" not in out
     assert "```" not in out
@@ -150,7 +142,7 @@ def test_strip_markdown_fence_with_dot_in_lang(monkeypatch):
 def test_strip_markdown_fence_with_space_in_lang(monkeypatch):
     monkeypatch.setenv("BABATA_WEIXIN_STRIP_MD", "1")
     text = "```shell script\nls -la\n```"
-    out = wb.strip_markdown(text)
+    out = wb._strip_markdown(text)
     assert "ls -la" in out
     assert "shell script" not in out
     assert "```" not in out
@@ -159,7 +151,7 @@ def test_strip_markdown_fence_with_space_in_lang(monkeypatch):
 def test_strip_markdown_fence_with_csharp_lang(monkeypatch):
     monkeypatch.setenv("BABATA_WEIXIN_STRIP_MD", "1")
     text = "```c#\nint x = 1;\n```"
-    out = wb.strip_markdown(text)
+    out = wb._strip_markdown(text)
     assert "int x = 1;" in out
     assert "c#" not in out
     assert "```" not in out
@@ -227,7 +219,7 @@ def test_find_safe_split_chinese_period():
 
 def test_find_safe_split_avoid_unpaired_backtick():
     # The latest space sits inside an unpaired `code span — splitting there
-    # would leave the prefix with an unclosed ` that strip_markdown can't
+    # would leave the prefix with an unclosed ` that _strip_markdown can't
     # remove. _find_safe_split must retract to a safer boundary.
     text = "前面一句话。后面 `code span 还没"
     pos = wb._find_safe_split(text)
@@ -261,7 +253,7 @@ def test_find_safe_split_falls_back_to_space():
 
 
 def test_find_safe_split_screenshot_case():
-    # Reproduction of V's actual screenshot — buf cut inside `...`.
+    # Reproduction of the actual screenshot — buf cut inside `...`.
     text = (
         "把它设回 False → 新 turn 没人监控\n"
         "中等 (2):\n"
@@ -281,16 +273,16 @@ def test_find_safe_split_screenshot_case():
     assert prefix.endswith("\n")
 
 
-# ── chunk_text untouched: regression guards ─────────────────────────
+# ── _chunk_text untouched: regression guards ─────────────────────────
 
 
 def test_chunk_text_short_stays_one():
-    assert wb.chunk_text("short text") == ["short text"]
+    assert wb._chunk_text("short text") == ["short text"]
 
 
 def test_chunk_text_long_splits_at_newline():
     para = "para one.\n" + ("x" * 3000) + "\npara three"
-    chunks = wb.chunk_text(para, limit=2000)
+    chunks = wb._chunk_text(para, limit=2000)
     assert len(chunks) >= 2
     assert all(len(c) <= 2000 for c in chunks)
 
@@ -435,7 +427,7 @@ def test_wx_final_replay_reports_unrecoverable_send_failure_without_final():
     asyncio.run(run())
 
 
-# ── strip_markdown: fenced code body must survive ───────────────────
+# ── _strip_markdown: fenced code body must survive ───────────────────
 
 
 def test_strip_markdown_keeps_fenced_code_body(monkeypatch):
@@ -443,7 +435,7 @@ def test_strip_markdown_keeps_fenced_code_body(monkeypatch):
     code output entirely. Strip fallback keeps the inner text, drops fence."""
     monkeypatch.setenv("BABATA_WEIXIN_STRIP_MD", "1")
     text = "before\n```python\nimport os\nprint('hi')\n```\nafter"
-    out = wb.strip_markdown(text)
+    out = wb._strip_markdown(text)
     assert "import os" in out
     assert "print('hi')" in out
     assert "```" not in out
@@ -452,14 +444,14 @@ def test_strip_markdown_keeps_fenced_code_body(monkeypatch):
 def test_strip_markdown_keeps_unlabelled_fence(monkeypatch):
     monkeypatch.setenv("BABATA_WEIXIN_STRIP_MD", "1")
     text = "```\nplain block content\n```"
-    out = wb.strip_markdown(text)
+    out = wb._strip_markdown(text)
     assert "plain block content" in out
     assert "```" not in out
 
 
 def test_strip_markdown_link_to_label_plus_url(monkeypatch):
     monkeypatch.setenv("BABATA_WEIXIN_STRIP_MD", "1")
-    out = wb.strip_markdown("see [docs](https://example.com) end")
+    out = wb._strip_markdown("see [docs](https://example.com) end")
     assert "docs" in out
     assert "https://example.com" in out
     assert "[" not in out and "](" not in out

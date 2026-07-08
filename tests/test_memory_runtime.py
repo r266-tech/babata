@@ -1,10 +1,6 @@
 import json
 import stat
-import sys
 from pathlib import Path
-
-_REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_REPO))
 
 import cc
 import codex_engine
@@ -74,11 +70,11 @@ def test_memory_reflex_is_opt_in(monkeypatch):
     monkeypatch.delenv("BABATA_MEMORY_REFLEX", raising=False)
     monkeypatch.setenv("BABATA_MEMORY_REFLEX_MODE", "enforce")
 
-    assert memory_runtime.memory_reflex_enabled() is False
+    assert memory_runtime._memory_reflex_enabled() is False
     assert memory_runtime.memory_reflex_mode() == "off"
 
     monkeypatch.setenv("BABATA_MEMORY_REFLEX", "1")
-    assert memory_runtime.memory_reflex_enabled() is True
+    assert memory_runtime._memory_reflex_enabled() is True
     assert memory_runtime.memory_reflex_mode() == "enforce"
 
 
@@ -170,7 +166,7 @@ def test_render_memory_context_event_logs_enforced_reflex(monkeypatch, tmp_path)
         reflex_script,
         "\n".join([
             "#!/bin/sh",
-            "printf '%s\\n' '{\"routes\":[\"deep\"],\"profile\":\"deep\",\"reasons\":[\"need detail\"]}'",
+            f"printf '%s\\n' '{{\"routes\":[\"deep\"],\"profile\":\"deep\",\"flags\":[\"reflection_candidate\"],\"reasons\":[\"need detail\"],\"cwd\":\"{str(tmp_path)}\",\"source\":\"sidebar\"}}'",
         ]),
     )
     monkeypatch.setenv("BABATA_MEMORY_INJECT_SCRIPT", str(inject_script))
@@ -195,9 +191,9 @@ def test_render_memory_context_event_logs_enforced_reflex(monkeypatch, tmp_path)
 
     assert event_id
     assert "<memory-context>ok</memory-context>" in context
-    assert "<memory-reflex>" in context
-    assert "routes: deep" in context
-    assert "profile: deep" in context
+    assert "<memory-reflex>" not in context
+    assert "routes: deep" not in context
+    assert "profile: deep" not in context
     assert "need detail" not in context
     assert "signal:" not in context
     assert "why:" not in context
@@ -212,13 +208,13 @@ def test_render_memory_context_event_logs_enforced_reflex(monkeypatch, tmp_path)
         {
             "actual_profile": "deep",
             "event": "preflight",
-            "hint_injected": True,
+            "hint_injected": False,
             "id": event_id,
             "memory_injected": True,
             "message_sha256": events[0]["message_sha256"],
             "mode": "enforce",
             "post_answer_observation": "pending",
-            "router": {"profile": "deep", "reasons": ["need detail"], "routes": ["deep"]},
+            "router": {"flags": ["reflection_candidate"], "profile": "deep", "routes": ["deep"]},
             "source": "sidebar",
             "cpu": "codex",
             "ts": events[0]["ts"],
@@ -226,6 +222,8 @@ def test_render_memory_context_event_logs_enforced_reflex(monkeypatch, tmp_path)
     ]
     assert len(events[0]["message_sha256"]) == 64
     assert "hello memory" not in reflex_log.read_text(encoding="utf-8")
+    assert "need detail" not in reflex_log.read_text(encoding="utf-8")
+    assert str(tmp_path) not in reflex_log.read_text(encoding="utf-8")
     assert "message_summary" not in events[0]
 
     memory_runtime.log_memory_reflex_post_answer(event_id, "没有找到")
@@ -299,7 +297,7 @@ def test_log_memory_reflex_preflight_only_records_router_without_inject(monkeypa
         reflex_script,
         "\n".join([
             "#!/bin/sh",
-            "printf '%s\\n' '{\"routes\":[\"recent\"],\"profile\":\"recent\",\"reasons\":[\"history\"]}'",
+            f"printf '%s\\n' '{{\"routes\":[\"recent\"],\"profile\":\"recent\",\"reasons\":[\"history\"],\"cwd\":\"{str(tmp_path)}\"}}'",
         ]),
     )
     monkeypatch.setenv("BABATA_MEMORY_REFLEX_SCRIPT", str(reflex_script))
@@ -328,7 +326,7 @@ def test_log_memory_reflex_preflight_only_records_router_without_inject(monkeypa
             "message_sha256": events[0]["message_sha256"],
             "mode": "dry-run",
             "post_answer_observation": "pending",
-            "router": {"profile": "recent", "reasons": ["history"], "routes": ["recent"]},
+            "router": {"profile": "recent", "routes": ["recent"]},
             "source": "sidebar",
             "cpu": "codex",
             "ts": events[0]["ts"],
@@ -337,21 +335,69 @@ def test_log_memory_reflex_preflight_only_records_router_without_inject(monkeypa
     assert len(events[0]["message_sha256"]) == 64
     assert "message_summary" not in events[0]
     assert "look up yesterday" not in reflex_log.read_text(encoding="utf-8")
+    assert "history" not in reflex_log.read_text(encoding="utf-8")
+    assert str(tmp_path) not in reflex_log.read_text(encoding="utf-8")
 
 
 def test_memory_reflex_hint_stays_compact_and_omits_router_reasons():
-    hint = memory_runtime.format_memory_reflex_hint({
-        "routes": ["recent"],
+    hint = memory_runtime._format_memory_reflex_hint({
+        "routes": ["brain", "recent"],
         "profile": "recent",
         "reasons": ["history"],
     })
 
     assert len(hint) <= 80
-    assert "routes: recent" in hint
-    assert "profile: recent" in hint
+    assert "routes: brain" in hint
+    assert "recent" not in hint
+    assert "profile:" not in hint
     assert "signal:" not in hint
     assert "why:" not in hint
     assert "history" not in hint
+
+
+def test_memory_reflex_hint_suppresses_profile_only_routes():
+    assert memory_runtime._format_memory_reflex_hint({
+        "routes": ["recent", "deep"],
+        "profile": "deep",
+    }) == ""
+
+
+def test_memory_reflex_values_are_allowlisted(monkeypatch, tmp_path):
+    reflex_log = tmp_path / "events.jsonl"
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_LOG", str(reflex_log))
+
+    event_id = memory_runtime._log_memory_reflex_preflight(
+        reflex={
+            "routes": ["recent", str(tmp_path), "unexpected-route"],
+            "profile": str(tmp_path),
+            "route": "deep",
+            "flags": ["reflection_candidate", str(tmp_path), "free text reason"],
+        },
+        user_prompt="hello",
+        source="sidebar",
+        cpu="codex",
+        mode="dry-run",
+        actual_profile="lite",
+        memory_injected=False,
+        hint_injected=False,
+    )
+
+    assert event_id
+    text = reflex_log.read_text(encoding="utf-8")
+    event = json.loads(text.splitlines()[0])
+    assert event["router"] == {
+        "flags": ["reflection_candidate"],
+        "route": "deep",
+        "routes": ["recent"],
+    }
+    assert str(tmp_path) not in text
+
+    hint = memory_runtime._format_memory_reflex_hint({
+        "routes": ["brain", str(tmp_path)],
+        "profile": str(tmp_path),
+    })
+    assert "routes: brain" in hint
+    assert str(tmp_path) not in hint
 
 
 def test_memory_runtime_owns_shared_reflex_helpers():

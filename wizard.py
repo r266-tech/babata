@@ -65,25 +65,6 @@ def confirm(prompt: str, default: bool = True) -> bool:
 # ── .env 原子读写 ─────────────────────────────────────────────────────
 
 
-def read_env() -> dict[str, str]:
-    """Parse .env into key→value dict (skip comments / blank lines)."""
-    out: dict[str, str] = {}
-    if not ENV_FILE.exists():
-        return out
-    for raw in ENV_FILE.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        k = k.strip()
-        v = v.strip()
-        # strip inline comment after value (only when not quoted)
-        if v and v[0] not in ('"', "'") and "#" in v:
-            v = v.split("#", 1)[0].strip()
-        out[k] = v
-    return out
-
-
 def write_env(updates: dict[str, str]) -> None:
     """Atomic update: replace existing keys in place, append new ones at end.
 

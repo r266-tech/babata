@@ -1,7 +1,7 @@
 [project]
 name = "babata"
 version = "0.1.0"
-description = "Thin Telegram transport layer for Claude Code"
+description = "Thin transport shell for babata channels and CPU adapters"
 requires-python = ">=3.11"
 dependencies = [
     "python-telegram-bot>=22.0",
@@ -10,12 +10,14 @@ dependencies = [
     "httpx>=0.27",
     "aiohttp>=3.10",
     "cryptography>=42.0",
-    # 开箱即用 voice — 默认本地, 用户填 MIMO env 升级到 MiMo Omni.
     "edge-tts>=6.1",        # MS Edge 免费 TTS, 中文 zh-CN-XiaoxiaoNeural 默认; ~150KB
-    "faster-whisper>=1.0",  # 本地 STT, base 模型 ~150MB 首跑下载缓存到 ~/.cache/
 ]
 
 [project.optional-dependencies]
+stt-local = [
+    "faster-whisper>=1.0",  # 显式 BABATA_STT_LOCAL=1 时才需要.
+]
+
 # WX channel: pilk = SILK voice decode (C ext, build 需要 gcc); qrcode = 终端 ASCII QR.
 # TG-only 用户不装这俩, 避免 ARM/无 prebuilt wheel 场景 (e.g. Linux + Python 3.13) 卡 build.
 # wizard.py step_wx 选 yes 时才 `uv sync --extra wx` 现装.
@@ -40,10 +42,10 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 py-modules = [
     "blocking_review", "bot", "bridge", "cc", "codex_engine", "constants", "engine", "media",
-    "review_health",
+    "memory_runtime", "review_health",
     "tg_mcp", "tg_transcript", "weixin_account", "weixin_bot",
     "weixin_bridge", "weixin_ilink", "weixin_mcp",
     "sidebar_bot", "sidebar_bridge", "sidebar_events",
-    "sidebar_history", "sidebar_mcp", "sidebar_translate",
-    "turn_audit",
+    "sidebar_history", "sidebar_mcp", "sidebar_tool_registry", "sidebar_translate",
+    "skill_evolve_nudge", "telegraph", "tg_tool_format", "turn_audit",
 ]

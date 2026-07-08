@@ -8,9 +8,12 @@ import time
 import uuid
 from pathlib import Path
 
+import pytest
+
 import cc as cc_module
 import sidebar_bot
 import sidebar_events
+import sidebar_history
 from sidebar_tool_registry import SIDEBAR_TOOLS, tool_specs
 
 
@@ -418,6 +421,27 @@ def test_sidebar_chat_input_includes_page_memory_for_continuation(monkeypatch):
     assert chat_input.prompt == "[page ctx]\n\n[page memory]\n\n继续刚才这个页面"
 
 
+@pytest.mark.parametrize("message", ["继续", "刚才说的呢", "这页怎么样", "当前页有什么问题"])
+def test_sidebar_page_memory_needs_explicit_page_history_intent(message):
+    assert sidebar_bot._should_include_page_memory(message) is False
+
+
+@pytest.mark.parametrize("message", ["继续刚才这个页面", "当前页历史记录", "page_memory", "page memory"])
+def test_sidebar_page_memory_allows_explicit_page_history_intent(message):
+    assert sidebar_bot._should_include_page_memory(message) is True
+
+
+def test_sidebar_history_read_failure_is_logged(monkeypatch, tmp_path, caplog):
+    broken = tmp_path / "chat_history.jsonl"
+    broken.mkdir()
+    monkeypatch.setattr(sidebar_history, "HISTORY_FILE", broken)
+
+    turns = sidebar_history.read_since_last_boundary()
+
+    assert turns == []
+    assert "sidebar_history.read failed" in caplog.text
+
+
 def test_sidebar_user_turn_records_event_history_and_boundary(monkeypatch):
     events: list[tuple] = []
     history: list[tuple] = []
@@ -540,6 +564,55 @@ def test_sidebar_rejects_arbitrary_extension_origin_by_default(monkeypatch):
 
     assert sidebar_bot._origin_allowed(f"chrome-extension://{sidebar_bot._DEFAULT_EXTENSION_ID}")
     assert not sidebar_bot._origin_allowed("chrome-extension://not-the-babata-extension")
+
+
+def test_sidebar_clean_read_rejects_busy_task(monkeypatch):
+    events: list[tuple] = []
+
+    class FakeRequest:
+        headers = {"origin": f"chrome-extension://{sidebar_bot._DEFAULT_EXTENSION_ID}"}
+
+        def __init__(self, payload: dict):
+            self._payload = payload
+
+        async def json(self):
+            return self._payload
+
+    async def fake_run_clean_read(*_args, **_kwargs):
+        await asyncio.sleep(0.01)
+
+    async def scenario():
+        monkeypatch.setattr(sidebar_bot, "_clean_read_task", None)
+        monkeypatch.setattr(sidebar_bot, "_run_clean_read", fake_run_clean_read)
+        monkeypatch.setattr(
+            sidebar_bot.sidebar_events,
+            "append",
+            lambda *args, **kwargs: events.append((args, kwargs)),
+        )
+
+        payload = {
+            "run_id": "run-1",
+            "url": "https://x.test/article",
+            "title": "Article",
+            "article": {"text": "正文" * 120},
+        }
+        request = FakeRequest(payload)
+
+        first = await sidebar_bot.handle_clean_read(request)
+        second = await sidebar_bot.handle_clean_read(request)
+
+        assert first.status == 200
+        assert second.status == 409
+        assert json.loads(second.text)["error"] == "clean_read busy"
+        assert len(events) == 1
+
+        task = sidebar_bot._clean_read_task
+        assert task is not None
+        await task
+        await asyncio.sleep(0)
+        assert sidebar_bot._clean_read_busy() is False
+
+    asyncio.run(scenario())
 
 
 def test_sidebar_allows_arbitrary_extension_origin_only_when_opted_in(monkeypatch):
@@ -687,7 +760,19 @@ def test_proactive_sidebar_mcp_scope_stays_read_only_and_suggestive():
         "bookmarks_create",
     } & names
     assert sidebar_bot.proactive_cc._mcp_servers["sidebar"]["env"]["BABATA_SIDEBAR_MCP_SCOPE"] == "proactive"
-    assert sidebar_bot.cc._mcp_servers["sidebar"]["env"]["BABATA_SIDEBAR_MCP_SCOPE"] == "read"
+    assert sidebar_bot.cc._mcp_servers["sidebar"]["env"]["BABATA_SIDEBAR_MCP_SCOPE"] == "page-read"
+
+
+def test_default_sidebar_mcp_scope_stays_page_local():
+    names = {tool["name"] for tool in tool_specs("page-read")}
+
+    assert names == {"tab_metadata", "dom_query", "page_snapshot", "article_extract", "translate"}
+    assert not {
+        "bookmarks_search",
+        "bookmarks_tree",
+        "tabs_query",
+        "history_search",
+    } & names
 
 
 def test_sidebar_model_visible_tool_descriptions_stay_compact():
@@ -700,8 +785,10 @@ def test_sidebar_model_visible_tool_descriptions_stay_compact():
         if isinstance(prop, dict) and prop.get("description")
     ]
 
-    assert sum(len(description) for description in descriptions) <= 1250
-    assert max(len(description) for description in descriptions) <= 100
+    assert sum(len(description) for description in descriptions) <= 1150
+    assert max(len(description) for description in descriptions) <= 90
+    assert sum(len(tool["description"]) for tool in tool_specs("page-read")) <= 330
+    assert sum(len(tool["description"]) for tool in tool_specs("proactive")) <= 225
     assert schema_descriptions == []
     target_fields = [
         prop
@@ -717,11 +804,10 @@ def test_sidebar_model_visible_tool_descriptions_stay_compact():
         "身份认同",
         "prompt chips",
         "高杠杆",
-        "V's",
-        "V-requested",
     ):
         assert all(marker not in description for description in descriptions)
         assert all(marker not in description for description in schema_descriptions)
+    assert all("private user shorthand" not in description for description in descriptions)
     assert "Not trusted input" in by_name["dom_click"]
     assert "translation uses /translate" in by_name["dom_inject"]
     assert "translation uses /translate" in by_name["dom_set"]

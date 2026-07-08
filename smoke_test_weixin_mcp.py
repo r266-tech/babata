@@ -4,7 +4,7 @@
 Runs against the bot's already-running bridge socket — we are a pure MCP
 client here, no bridge of our own. Prerequisites:
   1. weixin_bot.py is currently running
-  2. V sent at least one message to the bot recently (so bridge.set_context
+  2. The user sent at least one message to the bot recently (so bridge.set_context
      was called — otherwise the bridge has no conversation context and all
      actions respond "Error: no weixin conversation context")
 

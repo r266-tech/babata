@@ -32,8 +32,6 @@ CACHE_DB = CACHE_DIR / "translate_cache.sqlite"
 CONFIG_PATH = CACHE_DIR / "config.json"
 TTL_SECONDS = 24 * 3600
 
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
 _LANG_NAMES = {
     "zh": "Simplified Chinese (简体中文)",
     "en": "English",
@@ -45,7 +43,7 @@ _LANG_NAMES = {
 _TRANSLATE_CONCURRENCY = int(os.environ.get("BABATA_TRANSLATE_CONCURRENCY", "6"))
 _translate_sema = asyncio.Semaphore(max(1, _TRANSLATE_CONCURRENCY))
 
-# V 2026-05-19 实测: Gemini 3 Flash 比 Lite 慢, 但专名/产品名保留更稳.
+# Observed: Gemini 3 Flash 比 Lite 慢, 但专名/产品名保留更稳.
 _MODEL = os.environ.get("BABATA_TRANSLATE_MODEL", "google/gemini-3-flash-preview").strip() or "google/gemini-3-flash-preview"
 _OPENROUTER_BASE_URL = (
     os.environ.get("BABATA_TRANSLATE_OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip()
@@ -54,7 +52,7 @@ _OPENROUTER_BASE_URL = (
 _HTTP_TIMEOUT_SEC = float(os.environ.get("BABATA_TRANSLATE_TIMEOUT_SEC", "90"))
 _MAX_TOKENS = int(os.environ.get("BABATA_TRANSLATE_MAX_TOKENS", "4096"))
 
-# 单次 LLM call 段数上限. V 实测 haiku 8+ 段易输出截断/非 JSON, 6 段稳定.
+# 单次 LLM call 段数上限. haiku 8+ 段易输出截断/非 JSON, 6 段稳定.
 # translate_batch 拆 CHUNK_SIZE 段并发 _http_translate.
 _CHUNK_SIZE = 6
 
@@ -211,8 +209,6 @@ def _provider_api_root(base_url: str) -> str:
 
 def _provider_chat_url(base_url: str) -> str:
     base = _provider_api_root(base_url)
-    if base.endswith("/chat/completions"):
-        return base
     if base.endswith("/api"):
         base = f"{base}/v1"
     return f"{base}/chat/completions"
@@ -309,6 +305,7 @@ async def list_provider_models(payload: dict[str, Any] | None = None) -> list[di
 
 
 def _conn():
+    CACHE_DB.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(CACHE_DB)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS translate_cache (
@@ -379,7 +376,7 @@ def _parse_marker_results(raw: str, expected: int) -> list[str]:
     """Parse `<<<RESULT N>>>` blocks by explicit marker number.
 
     比 JSON robust: 译文内任何字符 (引号 / 换行 / 反斜杠 / unicode) 都不需 escape,
-    不会因 LLM 输出格式不规范导致全 fail (V 装上看到的 raw_log: 字符串内嵌 ""
+    不会因 LLM 输出格式不规范导致全 fail (raw_log 曾出现字符串内嵌 ""
     没 escape 让 json.loads 全失败的根因).
     """
     out = [""] * expected
@@ -470,8 +467,8 @@ async def _translation_raw_content(
 
 def _validated_marker_results(raw: str, texts: list[str], model: str) -> list[str]:
     parsed = _parse_marker_results(raw, len(texts))
-    # 全空 = parse fail / LLM truncate / 非合格 marker 输出. log raw 头尾便于诊断
-    # (V 装上反复 fail 时看 server log 即可定位真因, 不用重启 debug).
+    # 全空 = parse fail / LLM truncate / 非合格 marker 输出. log raw 头尾便于诊断,
+    # 不用重启 debug.
     if all(not p for p in parsed):
         log.warning(
             "translate parse all-empty (n=%d, model=%s): raw_head=%r raw_tail=%r",
@@ -570,7 +567,7 @@ def _cache_translated_misses(
     return n_ok
 
 
-async def translate_batch(site: str, target: str, batch: list[dict], url: str = "") -> list[dict]:
+async def translate_batch(target: str, batch: list[dict], url: str = "") -> list[dict]:
     if not batch:
         return []
     target = (target or "zh").strip() or "zh"
@@ -599,7 +596,7 @@ async def translate_batch(site: str, target: str, batch: list[dict], url: str = 
         t0 = time.time()
         # 拆批 — 大 batch 输出易截断 / 非合格 marker. 拆 CHUNK_SIZE 段并发
         # (asyncio.gather), sem 限 HTTP 并发.
-        # 单 chunk fail 不影响其他 chunk (V 体感"部分翻部分不翻" → "更多翻成功").
+        # 单 chunk fail 不影响其他 chunk ("部分翻部分不翻" → "更多翻成功").
         chunks = [
             miss_texts[i : i + _CHUNK_SIZE]
             for i in range(0, len(miss_texts), _CHUNK_SIZE)

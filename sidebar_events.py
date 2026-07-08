@@ -11,9 +11,9 @@ Schema (松散, 每条带 ts/url/kind, 余字段按 kind 自由):
   translate_spawn     — provider 翻 N 段
   translate_done      — provider 完成 (含 spawn_ms 用时)
   translate_fail      — provider 失败 (timeout / parse / HTTP error)
-  chat_turn           — V 在 sidepanel 发了一条
-  proactive_run       — V 切 tab 触发 proactive (含 url/title)
-  viewport            — content script 推 viewport_hashes (V 当前可见段)
+  chat_turn           — sidepanel user message
+  proactive_run       — tab-triggered proactive pass (含 url/title)
+  viewport            — content script 推 viewport_hashes (当前可见段)
   attention           — content script 推 visibility/sidepanel/idle
 """
 
@@ -33,8 +33,6 @@ EVENTS_FILE = EVENTS_DIR / "events.jsonl"
 MAX_FIELD_TEXT = 512
 _lock = Lock()
 
-EVENTS_DIR.mkdir(parents=True, exist_ok=True)
-
 
 def append(url: str, kind: str, **fields: Any) -> None:
     """Append one event. Best-effort, log IO errors (静默失败会让 page_memory 假成功)."""
@@ -50,6 +48,7 @@ def append(url: str, kind: str, **fields: Any) -> None:
         line = json.dumps({"ts": rec["ts"], "url": rec["url"], "kind": kind, "_serialize_error": True}) + "\n"
     try:
         with _lock:
+            EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
             with EVENTS_FILE.open("a", encoding="utf-8") as f:
                 f.write(line)
     except OSError as e:
@@ -91,7 +90,7 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
-def grep_url(url: str, max_records: int = 100, max_age_sec: int = 86400 * 30) -> list[dict]:
+def _grep_url(url: str, max_records: int = 100, max_age_sec: int = 86400 * 30) -> list[dict]:
     """Return events for given url, oldest first, capped at max_records (most recent N).
 
     max_age_sec: 默认 30 天内. 超龄事件不返 (page memory 自然衰减).
@@ -126,7 +125,7 @@ def summarize_for_chat(url: str) -> str:
 
     都返空 = 第一次看 + 当前没态. LLM 自然不会引用.
     """
-    events = grep_url(url)
+    events = _grep_url(url)
     if not events:
         return ""
 
@@ -140,7 +139,7 @@ def summarize_for_chat(url: str) -> str:
 
 
 def _format_page_state(recent: list[dict]) -> str:
-    """最近 5min 内 viewport / attention. V 现在视口几段 / 是不是在看."""
+    """最近 5min 内 viewport / attention. 当前视口几段 / 是不是在看."""
     if not recent:
         return ""
     last_viewport = next(

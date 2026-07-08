@@ -1,16 +1,16 @@
 """Sidebar chat history — bounded UI state across mount/refresh.
 
 cc.py session 文件持久化 LLM 端 turn state, 但 sidepanel React state 在 unmount
-时丢失. 这个模块独立持久化 V 最近看到的 turn-by-turn UI history, 让
+时丢失. 这个模块独立持久化最近显示的 turn-by-turn UI history, 让
 sidebar / chat popup / 刷新页面能恢复当前窗口.
 
 跟 sidebar_events.jsonl 区别:
 - events 是 url-anchored 事实流 (audit + page memory + viewport / attention)
-- history 是 chronological chat turns (V 发了什么 / babata 回了什么)
+- history 是 chronological chat turns (user / assistant)
 
 Schema (jsonl cache):
   {ts, role: "user"|"assistant"|"boundary", text, url?, title?, has_image?, has_video?, has_file?, tool_trace?}
-  boundary 标记 V 触发新对话 (/new) — UI mount 时只拉最后一个 boundary 之后的 turns.
+  boundary 标记新对话 (/new) — UI mount 时只拉最后一个 boundary 之后的 turns.
 """
 
 import hashlib
@@ -30,25 +30,6 @@ HISTORY_TURN_RETENTION = 200
 HISTORY_TEXT_MAX_CHARS = 12000
 _lock = Lock()
 
-HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _probe_persistence() -> None:
-    """Module-load 时 fail-fast probe — 防 silent storage failure.
-
-    sidebar_history.append 静默失败会让 sidepanel mount 拉不到历史. 启动时
-    探一下能不能写, 写不动就在 launchd stderr 留 ERROR (V 后续 grep 可见).
-    """
-    try:
-        marker = HISTORY_DIR / ".history_probe"
-        marker.write_text("ok", encoding="utf-8")
-        marker.unlink()
-    except OSError as e:
-        log.error("sidebar_history persistence broken: %s — chat history will silently fail", e)
-
-
-_probe_persistence()
-
 
 def append(role: str, text: str, **fields: Any) -> None:
     raw_text = text or ""
@@ -67,6 +48,7 @@ def append(role: str, text: str, **fields: Any) -> None:
         return
     try:
         with _lock:
+            HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
             with HISTORY_FILE.open("a", encoding="utf-8") as f:
                 f.write(line)
             _trim_history_file_locked()
@@ -100,7 +82,8 @@ def read_since_last_boundary(limit: int = 200) -> list[dict]:
     try:
         with HISTORY_FILE.open("r", encoding="utf-8") as f:
             lines = f.readlines()
-    except OSError:
+    except OSError as e:
+        log.warning("sidebar_history.read failed: %s", e)
         return []
 
     records: list[dict] = []

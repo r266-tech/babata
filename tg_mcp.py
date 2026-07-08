@@ -89,7 +89,7 @@ _TG_TOOL_SPECS = (
     (
         "tg_send_buttons",
         (
-            "Send interactive buttons: string callback or {label,url} link; URL-only returns 'Links sent'."
+            "Send interactive buttons: string callback or {label,url}; URL-only returns 'Links sent'."
         ),
         {
             "text": {"type": "string"},
@@ -118,8 +118,8 @@ _TG_TOOL_SPECS = (
     (
         "tg_send_text",
         (
-            "Send plain text to Telegram. Final replies are auto-delivered; use only for "
-            "mid-turn pushes, long-running progress, or proactive sends."
+            "Send text to Telegram. Final replies auto-delivered; only for "
+            "mid-turn pushes, long-running progress, proactive sends."
         ),
         {
             "text": {"type": "string"},
@@ -188,8 +188,8 @@ _TG_TOOL_SPECS = (
     (
         "tg_send_page",
         (
-            "Publish Telegraph page from markdown for long structured/code-heavy "
-            "content TG inline HTML cannot render; returns the Telegraph URL."
+            "Publish Telegraph page from markdown for long structured content "
+            "TG inline HTML cannot render; returns the Telegraph URL."
         ),
         {
             "title": {

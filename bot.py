@@ -127,7 +127,7 @@ _PROCESSED_MAX = 1000  # 滚动窗口
 
 def _write_runtime_status(event: str = "") -> None:
     try:
-        review_health = review_health_snapshot()
+        review_health = review_health_snapshot(probe=False)
         tmp = RUNTIME_STATUS_FILE.with_suffix(".json.partial")
         tmp.write_text(
             json.dumps(
@@ -603,7 +603,7 @@ def _startup_restart_reason() -> str:
 
 
 async def _graceful_shutdown(app: "Application", reason: str) -> None:
-    """Wait for the live turn, notify V via TG, then exit."""
+    """Wait for the live turn, notify the TG user, then exit."""
     global _shutdown_requested
     if _shutdown_requested:
         log.warning("Second shutdown signal (%s), force exit", reason)
@@ -777,7 +777,7 @@ _MAX_EDIT_INTERVAL = 10.0
 # turn-end's `_deliver_response` send the rest as a fresh reply_text.
 _MAX_FLOOD_STRIKES = 3
 # A broken CPU stream is recoverable: reconnect the CPU and replay the active
-# V message before continuing later cut-ins. After this many immediate retries,
+# active user message before continuing later cut-ins. After this many immediate retries,
 # the turn remains unconsumed and queued, but later retries are logged as a
 # persistent fault instead of being treated as a consumed user update.
 _MAX_TURN_RECOVERY_ATTEMPTS = int(os.environ.get("BABATA_TURN_RECOVERY_ATTEMPTS", "2"))
@@ -891,7 +891,7 @@ def _to_html(md: str) -> str:
     # 1b. Pre-existing TG-compatible HTML inline tags. CC may write them
     # directly (e.g. `<b>核心</b>` instead of `**核心**`); we park them so
     # later `html.escape` doesn't turn `<b>` into `&lt;b&gt;` (which TG
-    # would render as literal text — exactly the bug V hit 2026-05-06).
+    # would render as literal text — the 2026-05-06 regression).
     # Single-level only (no nested tag parsing) — adequate for chat.
     # Order matters: longer tag names first so `<strong>` matches before
     # the regex would otherwise try `<s>` on the same span.
@@ -1316,14 +1316,14 @@ class ChannelWorker:
         # 每条 mark = (bot, chat_id, message_id). bot 用 Any 因为 PTB Bot 实例 (含 ctx.bot)
         self._pending_marks: list[tuple[Any, int, int]] = []
         # idempotency: 跟 _pending_marks / _active_marks 同步, turn_end 时
-        # _mark_processed all (per-V-msg 标 done, 多 V msg batch 一个 turn 全标).
+        # _mark_processed all (per-user-msg 标 done, 多 user msg batch 一个 turn 全标).
         self._pending_update_ids: list[int | None] = []
         self._active_update_ids: list[int | None] = []
         self._active_marks: list[tuple[Any, int, int]] = []
         self._reaction_tasks: set[asyncio.Task[None]] = set()
         # P2-A: 串行所有 reaction API 调用, 保证 schedule 顺序 = 执行顺序
         # (turn_end finally 先 schedule 👌 再触发 _begin_turn → 👀, lock FIFO
-        # 保证 V 看到的最终 reaction 是 👌 不是 👀).
+        # 保证用户看到的最终 reaction 是 👌 不是 👀).
         self._reaction_lock = asyncio.Lock()
         # P1-A/B: anchor generation token. submit / _begin_turn 切 anchor 时 +1;
         # _handle_text_delta / _handle_tool_event 在 await 边界检查, 变了就 abort
@@ -1331,15 +1331,15 @@ class ChannelWorker:
         self._anchor_generation: int = 0
         # 流式输出 reply 的 anchor — 跟 _turn_payload 解耦.
         # _turn_payload 是 SDK turn 边界 anchor (P1.4 promote 用); 一个 turn 可能
-        # 跨多条 V 消息. _active_reply_payload 是 V 视角的 "当前活跃消息" — 每条
-        # V message 进来都切到自己, 让流式输出和 tool 状态走新 reply, 不混到上
+        # 跨多条 user 消息. _active_reply_payload 是用户视角的 "当前活跃消息" — 每条
+        # user message 进来都切到自己, 让流式输出和 tool 状态走新 reply, 不混到上
         # 一条的 reply 上 (即使 SDK 把多条 batch 成一个 turn 也能保持 per-message
         # reply 体验).
         self._active_reply_payload: Payload | None = None
         self._turn_payload_batch: list[Payload] = []
-        # Cut-in 队列 (interrupt 模式): V 流式中再发 → SDK interrupt + append 到这.
+        # Cut-in 队列 (interrupt 模式): 用户流式中再发 → SDK interrupt + append 到这.
         # _handle_turn_end 末尾 pop 出来 _begin_turn 启动新 turn. submit() 不再
-        # 改 anchor 状态 (留给老 turn 自然收尾), V 看到的 in-flight 气泡保留.
+        # 改 anchor 状态 (留给老 turn 自然收尾), 用户看到的 in-flight 气泡保留.
         self._pending_payloads: list[Payload] = []
         # Recoverable CPU stream failures replay the active payload before
         # continuing pending cut-ins. This counter is per active user turn and
@@ -1350,7 +1350,7 @@ class ChannelWorker:
         # check epoch 没变才继续 — 防 fire-and-forget interrupt 因 race 打断错的
         # 后续 turn (例: A 自然完 → _begin_turn(B) → 老 interrupt 命中 B).
         self._turn_epoch: int = 0
-        # Codex round-4 P2 (dedupe): 同 epoch 内多 cut-in (V 连发 m2 m3 m4) 别
+        # Codex round-4 P2 (dedupe): 同 epoch 内多 cut-in (m2 m3 m4) 别
         # 重复 spawn interrupt — SDK round-trip 浪费 + log noise. epoch bump 后
         # 自然对不上, 重置.
         self._interrupt_spawned_epoch: int = -1
@@ -1404,15 +1404,15 @@ class ChannelWorker:
             # next SDK turn if the race between submit and turn_end leaves
             # _turn_payload unset.
             self._latest_payload = payload
-            # 消息状态: append + 立即 fire 👀 — V 视角"看到这条了". 切入消息也即时
+            # 消息状态: append + 立即 fire 👀 — 用户视角"看到这条了". 切入消息也即时
             # 拿到 ack, 不再等下个 _begin_turn (_begin_turn 不再 fire 👀, 只挪账).
             new_mark = (payload.ctx.bot, chat.id, msg.message_id)
             self._pending_marks.append(new_mark)
             self._pending_update_ids.append(payload.update_id)
             self._schedule_marks([new_mark], "👀")
             if self._turn_active:
-                # Cut-in (interrupt 模式 + R3 P0 fix): V 流式中再发. 保留老 turn
-                # 状态 — 已 ship 气泡 + in-flight 气泡都不动 (V 看见 A 半句留在 A
+                # Cut-in (interrupt 模式 + R3 P0 fix): 用户流式中再发. 保留老 turn
+                # 状态 — 已 ship 气泡 + in-flight 气泡都不动 (用户看见 A 半句留在 A
                 # 下面). interrupt 让 SDK 尽快收尾老 turn. **不**立即 session.submit(B)
                 # — B 留在 _pending_payloads, 等 A's turn_end → _begin_turn(B) 时才
                 # 入 SDK inbox. 否则 stale interrupt 可能命中 B (race) + SDK batch
@@ -1461,9 +1461,9 @@ class ChannelWorker:
             if self._turn_active:
                 await self._surface_error(RuntimeError("会话已切换。"))
             # P2-D: drop_pending — resume 后 inbox drain (LiveSession.resume_live
-            # 内部 _stop_client_locked 会 drain), pending V messages 永远不会被
+            # 内部 _stop_client_locked 会 drain), pending user messages 永远不会被
             # 处理, 不能让它们的 mark 被下次 _begin_turn promote.
-            # 💔: 让 V 看到这些 V msg 被中止, reaction 状态不卡 👀.
+            # 💔: 让用户看到这些 user msg 被中止, reaction 状态不卡 👀.
             self._reset_turn_state(
                 exit_inflight=True, drop_pending=True, fail_emoji="💔"
             )
@@ -1474,7 +1474,7 @@ class ChannelWorker:
         if self._turn_active:
             await self._surface_error(RuntimeError("会话已重置。"))
         # P2-D: 同 resume — /new drain 后 pending marks 失效.
-        # 💔: 标记这些 V msg 为"未完成" (区别于 turn_end 的 👌).
+        # 💔: 标记这些 user msg 为"未完成" (区别于 turn_end 的 👌).
         self._reset_turn_state(
             exit_inflight=True, drop_pending=True, fail_emoji="💔"
         )
@@ -1484,7 +1484,7 @@ class ChannelWorker:
         self._apply_accounting(resp)
 
     def _session_supports_hot_input(self) -> bool:
-        return bool(getattr(self.session, "supports_hot_input", True))
+        return bool(getattr(self.session, "supports_hot_input", False))
 
     def _coalesce_payloads_for_turn(self, payloads: list[Payload]) -> Payload:
         if len(payloads) <= 1:
@@ -1540,7 +1540,7 @@ class ChannelWorker:
         self._turn_epoch += 1
         self._active_reply_payload = payload  # 同步切 reply anchor
         # Codex round-1 P1: bridge anchor 跟 turn 走 — cut-in 不动, _begin_turn
-        # 时切到当前 turn 的 V msg, 让 mcp_send (cron 等) reply 到对的 message.
+        # 时切到当前 turn 的 user msg, 让 mcp_send (cron 等) reply 到对的 message.
         chat = payload.update.effective_chat
         if msg is not None and chat is not None:
             bridge.set_context(payload.ctx.bot, chat.id, msg.message_id)
@@ -1556,9 +1556,9 @@ class ChannelWorker:
         self._streamed_bubble_count = 0
         self._stale_text_messages = []
         self._reset_flood_state()
-        # 消息状态 promote: pending → active. 👀 已在 submit fire (每条 V msg
+        # 消息状态 promote: pending → active. 👀 已在 submit fire (每条 user msg
         # 立即 ack), 这里只挪账, 不再 fire — 避免重复 setMessageReaction 调用.
-        # Hot-input sessions keep one V message per queued turn. Non-hot
+        # Hot-input sessions keep one user message per queued turn. Non-hot
         # sessions (Codex CLI) may coalesce several pending messages into one
         # physical model turn; all their marks/uids move together.
         promote_count = min(
@@ -1582,7 +1582,7 @@ class ChannelWorker:
 
     async def _consume_events(self) -> None:
         """P1.2 supervisor: re-establish the LiveSession when events() exits
-        on un-recovered error so V's next message still gets processed instead
+        on un-recovered error so the user's next message still gets processed instead
         of vanishing into a dead inbox.
         """
         backoff = 1.0
@@ -1936,7 +1936,7 @@ class ChannelWorker:
         if _verbose == 0:
             return
         # 同 _handle_text_delta: per-message reply anchor 优先, 让 tool 状态也
-        # 跟着新 V 消息走 (不混到上一条 reply 链).
+        # 跟着新 user 消息走 (不混到上一条 reply 链).
         # P1-B: gen check 同 _handle_text_delta.
         anchor = self._current_reply_anchor()
         if anchor is None:
@@ -1957,7 +1957,7 @@ class ChannelWorker:
 
         body = "\n".join(self._tool_entries[-30:])[:_MAX_TG]
         # Fallback mode: stop editing tool_status. Tool entries continue to
-        # accumulate in _tool_entries (V loses live progress, but turn-end
+        # accumulate in _tool_entries (user loses live progress, but turn-end
         # still shows the work via _deliver_response's resp.tools / final
         # response text). We don't try to flush tool entries as a fresh
         # message because they're transient by design (verbose=1 deletes
@@ -1973,7 +1973,7 @@ class ChannelWorker:
                     self._on_tool_edit_failure(e)
                 return
             # P1-B 同 _handle_text_delta: gen mismatch = orphan tool_status 在 m_old
-            # 下, 删掉避免 V 在错误 anchor 下看到孤立 tool 状态.
+            # 下, 删掉避免用户在错误 anchor 下看到孤立 tool 状态.
             if gen == self._anchor_generation:
                 self._tool_status = new_status
                 self._tool_last_edit = time.monotonic()
@@ -2006,9 +2006,9 @@ class ChannelWorker:
             # P1.4: race window — if submit() acquired _state_lock between SDK's
             # ResultMessage and consume_events reaching here, _turn_payload may
             # already point at a newer Payload. Either way, fall back to
-            # _latest_payload so V never sees a silent drop.
-            # P1-C/D: 优先用 _active_reply_payload (V 视角"当前活跃") — final
-            # response 落到 V 最新 message 的 reply, 跟流式期间的 _text_message
+            # _latest_payload so the user never sees a silent drop.
+            # P1-C/D: 优先用 _active_reply_payload (用户视角"当前活跃") — final
+            # response 落到用户最新 message 的 reply, 跟流式期间的 _text_message
             # 同 anchor; 否则 long-response overflow parts 会跨两个 anchor 分裂.
             payload = (
                 self._active_reply_payload
@@ -2032,11 +2032,11 @@ class ChannelWorker:
                     active_uids,
                 )
             finally:
-                # 只 fire 完成态给 _active_marks (= 当前 turn 的 V msgs). _pending_marks
-                # 是 cut-in 期间 push 的 (= 下一 turn 的 V msgs), 留着等 _begin_turn
-                # promote 进 _active_marks. SDK 真 batch 多 V msg 进一个 turn 的话,
+                # 只 fire 完成态给 _active_marks (= 当前 turn 的 user msgs). _pending_marks
+                # 是 cut-in 期间 push 的 (= 下一 turn 的 user msgs), 留着等 _begin_turn
+                # promote 进 _active_marks. SDK 真 batch 多 user msg 进一个 turn 的话,
                 # _pending_marks 在那时本就是空 (submit 只在 turn_active 才 push 到
-                # pending). 所以这里只动 active 是对的. stopped=True 是 V 主动
+                # pending). 所以这里只动 active 是对的. stopped=True 是用户主动
                 # /stop, 不是正常完成, 要标成未完成态而不是 👌.
                 done_marks = self._active_marks
                 done_uids = self._active_update_ids
@@ -2050,10 +2050,10 @@ class ChannelWorker:
                     for _uid in done_uids:
                         await _mark_processed(_uid)
                 self._reset_turn_state(exit_inflight=True)
-                # Turn 结束 → 清 bridge.reply_to. 不清的话, V turn 之后 cron
+                # Turn 结束 → 清 bridge.reply_to. 不清的话, user turn 之后 cron
                 # 走 mcp__tg__tg_send_* 发的消息 (gmail PR-merged 通报 / weekly
-                # report / X 日报...) 都会带上 V 上一条 message_id 当 reply_to,
-                # TG 渲染成"引用 V 上一条". chat_id 保留 — cron 还得知道发哪
+                # report / X 日报...) 都会带上上一条 user message_id 当 reply_to,
+                # TG 渲染成"引用上一条". chat_id 保留 — cron 还得知道发哪
                 # 个 chat. 只清 reply_to.
                 with suppress(Exception):
                     bridge.reply_to = None
@@ -2149,7 +2149,7 @@ class ChannelWorker:
         """After a supervised reconnect, resume the queued FIFO work.
 
         This is the recovery actuator for a broken CPU stream: _handle_error()
-        puts the active V message back at the front of _pending_payloads, then
+        puts the active user message back at the front of _pending_payloads, then
         the supervisor reconnects the physical session and calls here.
         """
         async with self._state_lock:
@@ -2158,7 +2158,7 @@ class ChannelWorker:
             await self._start_next_pending_locked()
 
     def _requeue_active_turn_for_recovery(self) -> bool:
-        """Put the active V message back before pending cut-ins.
+        """Put the active user message back before pending cut-ins.
 
         Returns False when there is no reliable active payload anchor. Must be
         called with _state_lock held.
@@ -2195,7 +2195,7 @@ class ChannelWorker:
                 continue
         if surfaced:
             return
-        # P2-C: 用 _active_reply_payload 优先 (errors 应落 V 最新 message reply,
+        # P2-C: 用 _active_reply_payload 优先 (errors 应落用户最新 message reply,
         # 不是旧 turn anchor).
         payload = (
             self._active_reply_payload
@@ -2378,7 +2378,7 @@ class ChannelWorker:
         self._stale_text_messages = []
         self._reset_flood_state()
         # 失败路径 (error / reset / resume / submit retry fail): fire 💔 给
-        # active + (drop 模式下) pending 让 V 一眼看到这些 V message 没正常完成.
+        # active + (drop 模式下) pending 让用户一眼看到这些 user message 没正常完成.
         # turn_end 路径不传 fail_emoji — finally 段已经手动 fire 过 👌.
         if fail_emoji:
             failed = list(self._active_marks)
@@ -2444,7 +2444,7 @@ class ChannelWorker:
             await self.session.connect()
             self.session.submit(text, payload.images)
         except Exception as e:
-            log.error("Second submit failed: %s — keeping V message pending", e)
+            log.error("Second submit failed: %s — keeping user message pending", e)
             self._requeue_active_turn_for_recovery()
             self._reset_turn_state(
                 exit_inflight=True,
@@ -2460,7 +2460,7 @@ class ChannelWorker:
         interrupt 此时 fire 会打断 B 而不是 A. epoch != captured → 直接 return.
         reset/error 也 bump epoch, 防 interrupt 命中 dead/reset client.
 
-        Codex round-4 P2 dedupe: 同 epoch 已 spawn 过 → return (V 连发 m2 m3 m4
+        Codex round-4 P2 dedupe: 同 epoch 已 spawn 过 → return (m2 m3 m4
         在 m1 turn 内, 三次都触发 cut-in, 但 SDK 只需 interrupt 一次)."""
         captured_epoch = self._turn_epoch
         if self._interrupt_spawned_epoch == captured_epoch:
@@ -2501,7 +2501,7 @@ class ChannelWorker:
     ) -> None:
         # P2-A: 全局串行所有 reaction API 调用. asyncio.Lock FIFO 保证 schedule
         # 顺序 = 执行顺序 — turn_end finally 先 schedule 👌(active) 再触发
-        # _begin_turn → 👀(next), V 看到的最终 reaction 一定是后者覆盖前者.
+        # _begin_turn → 👀(next), 用户看到的最终 reaction 一定是后者覆盖前者.
         # 没这个 lock, 两个 create_task 并发可能让快的 👀 覆盖慢的 👌, 那条
         # 消息卡在 👀 永远不变 👌 (TG setMessageReaction 是 last-write-wins).
         async with self._reaction_lock:
@@ -3167,7 +3167,7 @@ def _fmt_codex_limit(
 
 # ── Status: quota / today cost / formatting helpers ──────────────────
 #
-# V's terminal CC /status shows:
+# Terminal CC /status shows:
 #   [bar] N% · <model> (<window> context)
 #   session N% · resets Npm  |  week N% · resets Mon DD  |  $X today
 #
@@ -3176,7 +3176,7 @@ def _fmt_codex_limit(
 # numbers the official CLI's TUI surfaces (claude_agent_sdk's RateLimitEvent
 # strips utilization in print/SDK mode, and /api/oauth/usage is rate-limited
 # upstream, so neither works as a fallback). Costs ~9 input + 1 output token
-# of the cheapest model per /status invocation; not cached because V wants
+# of the cheapest model per /status invocation; not cached because status
 # real-time numbers.
 
 
@@ -3418,7 +3418,7 @@ def _short_window(tokens: int | None) -> str:
 
 
 _CCUSAGE_BIN = Path.home() / ".bun" / "bin" / "ccusage"
-# Share cache with statusline.sh — when V has a terminal CC open, its
+# Share cache with statusline.sh — when a terminal CC is open, its
 # statusline keeps this cache fresh, and /status hits it for free. When
 # nothing is keeping it warm, our own daemon thread refreshes it.
 _CCUSAGE_CACHE = Path(f"/tmp/cc-ccusage-{os.getuid()}.txt")
@@ -3864,7 +3864,7 @@ async def cmd_context(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Graceful restart: 等 in-flight CC 任务跑完再让 launchd (KeepAlive=true)
-    重拉. 和 SIGTERM 走同一条 _graceful_shutdown 路径, 保证 V 手动 /restart
+    重拉. 和 SIGTERM 走同一条 _graceful_shutdown 路径, 保证手动 /restart
     不中断任务.
 
     ThrottleInterval=10s + ExitTimeOut=600s 在 plist 里设置, 最多等 10 分钟
@@ -4015,7 +4015,7 @@ async def on_cpu_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await q.edit_message_text(f"/cpu 失败: {type(e).__name__}: {e}")
 
 
-# cc-router 是可选外部服务 (V 私人多 Anthropic 账号切换). 没设 BABATA_CC_ROUTER_DIR
+# cc-router 是可选外部服务 (多 Anthropic 账号切换). 没设 BABATA_CC_ROUTER_DIR
 # = OSS 用户没这服务, /provider 命令降级 "未配置". V .env 设路径走原行为.
 _CC_ROUTER_DIR = os.environ.get("BABATA_CC_ROUTER_DIR", "")
 _CC_ROUTER_CLI = str(Path(_CC_ROUTER_DIR) / "cli.py") if _CC_ROUTER_DIR else ""
@@ -4170,7 +4170,7 @@ async def _run_cc_router_codex_add_relay(base_url: str, api_key: str) -> tuple[i
 
 def _codex_main_menu_markup(current_key: str):
     """Inline keyboard for the codex /provider main view. Reused on entry and
-    on back-button so the menu looks identical regardless of how V got there."""
+    on back-button so the menu looks identical regardless of navigation path."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     choices = _codex_choices()
     buttons = [
@@ -4195,7 +4195,7 @@ async def cmd_provider(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     cc-router cli 改完 ~/.claude/settings.json env 会同步清 4 个 channel 的
     session_id (避免跨 provider 续 redacted_thinking 爆), 然后 self-ops.sh
-    detached restart 4 个 launchd 实例. V 在 TG 体感 ~10s 断线再上线, 下条消息
+    detached restart 4 个 launchd 实例. TG 体感 ~10s 断线再上线, 下条消息
     走新 provider, 新 session 无上下文 (跟手动 /new 一样).
     """
     # Infrastructure-changing command: fail-closed even if ALLOWED_USER==0 (开发态后门).
@@ -4219,7 +4219,7 @@ async def cmd_provider(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("⚠️ codex_accounts 未配置 (cc-router codex init 没跑过)")
             return
         # Entering the menu clears any half-finished relay-add state from a
-        # previous turn, so V can't accidentally treat normal chat as URL+key.
+        # previous turn, so normal chat cannot accidentally be treated as URL+key.
         _ctx_user_data(ctx).pop("pending_relay_add", None)
         await update.message.reply_text(
             f"Codex 账号 (当前: {current_label}):",
@@ -4387,7 +4387,7 @@ async def on_codex_add_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 async def on_codex_del_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Dispatcher for `codex_del:*`: menu → pick:<slot> → do:<slot> → back.
     Two-step (pick then confirm) because removing an entry drops the api_key
-    along with it — V's only copy if they didn't save it elsewhere."""
+    along with it — possibly the user's only copy if not saved elsewhere."""
     q = update.callback_query
     if not await _callback_allowed(q):
         return
@@ -4465,9 +4465,9 @@ async def on_codex_del_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def _parse_relay_add_text(text: str) -> tuple[str, str] | tuple[None, str]:
-    """Pick a URL and an API key out of free-form V input. Returns (url, key)
+    """Pick a URL and an API key out of free-form user input. Returns (url, key)
     on success or (None, error_msg) on failure. Robust against pasted lines
-    with extra prose because V types fast."""
+    with extra prose because users type fast."""
     import re as _re
     tokens = _re.split(r"\s+", text.strip())
     url = next((t for t in tokens if t.startswith(("http://", "https://"))), None)
@@ -4482,7 +4482,7 @@ def _parse_relay_add_text(text: str) -> tuple[str, str] | tuple[None, str]:
 
 
 async def _handle_relay_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Consume V's URL+key reply after `codex_add:relay` was clicked.
+    """Consume the user's URL+key reply after `codex_add:relay` was clicked.
     Returns True if the message was consumed (don't fall through to chat).
     State is cleared whether parse succeeds or fails so a typo doesn't trap V."""
     _ctx_user_data(ctx).pop("pending_relay_add", None)
@@ -4504,7 +4504,7 @@ async def _handle_relay_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
         return
-    # If V just clicked "新增中转", the next plaintext message is the URL+key
+    # If the user just clicked "新增中转", the next plaintext message is the URL+key
     # payload — divert to add-relay handler so it never reaches CC as chat (key
     # would leak into the transcript otherwise).
     if _ctx_user_data(ctx).get("pending_relay_add"):
@@ -4743,7 +4743,7 @@ _CURRENT_LABEL = INSTANCE_LABELS.get(INSTANCE, INSTANCE or PROJECT)
 # (category_id, 中文显示名, channel labels in cc.py, scan_all_buckets)
 # scan_all_buckets=True: 跨 ~/.claude/projects/<cwd-hash>/ 全部 bucket 扫.
 # tg/wx 是 babata 自己拥有的 channel, sids 在 babata 自己 cwd 对应的单 bucket
-# 里, 不用全扫. term/oneshot 是 V 在终端 (任意 cwd) 开的原生 CC, sessions
+# 里, 不用全扫. term/oneshot 是终端 (任意 cwd) 开的原生 CC, sessions
 # 散落在不同 bucket, 必须全扫才能跟终端 /resume 对齐.
 _RESUME_CATEGORIES: list[tuple[str, str, list[str], bool]] = [
     ("tg",      "当前",   [_CURRENT_LABEL],            False),
@@ -4784,7 +4784,7 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     Level 1: 选渠道 (TG / 微信 / 终端 / 一次性). /resume 直接给的这层.
     Level 2: 选具体 session. 对应渠道内最近 5 条, 底部带"← 返回"回到 Level 1.
 
-    两级设计避免跨渠道 session 混在一个 list 里噪音大, V 明确指定"在哪个渠道
+    两级设计避免跨渠道 session 混在一个 list 里噪音大, 用户明确指定"在哪个渠道
     的历史里挑"让 picker 更聚焦. 仍然跨渠道可见 — 在 TG 里也能看到终端 /微信开的
     session, 只是需要先点对应按钮.
     """
@@ -4858,7 +4858,7 @@ async def on_resume_channel_pick(
         buttons.append([
             InlineKeyboardButton(label, callback_data=f"resume:{s['sid']}"),
         ])
-    # 底部"← 返回"回到 Level 1 渠道 picker — V 选错渠道时不用重发 /resume.
+    # 底部"← 返回"回到 Level 1 渠道 picker — 选错渠道时不用重发 /resume.
     buttons.append([
         InlineKeyboardButton("← 返回", callback_data="resume-back"),
     ])
@@ -4916,7 +4916,7 @@ async def on_resume_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Cross-bucket fork: 跨 cwd-bucket 选的 sid, cc 已 import 成新 uuid 写到
     # babata bucket (见 cc._import_jsonl_to_bucket). 这里用公开 session_id 反映
-    # 真实激活的 sid, 让 V 知道发生了 fork.
+    # 真实激活的 sid, 让用户知道发生了 fork.
     active_sid = cc.session_id or sid
     forked = active_sid != sid
 
@@ -4998,7 +4998,7 @@ async def _process(
 ) -> None:
     """Enqueue user input into the live CC session and return immediately."""
     update_id = getattr(update, "update_id", None)
-    # Idempotency: 重启后 TG 重交付的 update 跳过, V 不会看到重做的 reply.
+    # Idempotency: 重启后 TG 重交付的 update 跳过, 用户不会看到重做的 reply.
     if update_id in _processed_set:
         log.info("idempotent skip: update_id=%s already processed", update_id)
         return
@@ -5078,14 +5078,14 @@ async def _post_init(app: Application) -> None:
     delivery_replay = await _replay_pending_deliveries(app)
     pending_replay = await _replay_pending_updates(app)
 
-    # 意外重启 / launchd kickstart / 任务中 /restart → bot 重连后主动告知 V 当
+    # 意外重启 / launchd kickstart / 任务中 /restart → bot 重连后主动告知用户当
     # 前 session 号. 不走 hook (hook 只在 session 边界触发, bot 重启时 sid 没变).
     # sid 可能为 None (新进程还没跑过任何 CC session) — 显示 (new) 提示 V "接下来
     # 第一句话会开一个新 session".
     #
     # 孤儿 turn 告警: graceful shutdown 正常走完不会留孤儿; 但 SIGKILL / OOM /
     # 硬崩 绕过 graceful 时, CC CLI 被强杀来不及写完 assistant turn, jsonl 里会
-    # 留一条 user 没回复. 检测到就附警告让 V 决定 /resume (看片段) 或 /new.
+    # 留一条 user 没回复. 检测到就附警告让用户决定 /resume (看片段) 或 /new.
     if ALLOWED_USER:
         sid = cc.session_id
         sid_display = sid if sid else "(new)"
@@ -5106,7 +5106,7 @@ async def _post_init(app: Application) -> None:
 
 def _spawn_weixin_if_configured() -> "subprocess.Popen | None":
     """装了 WX 就 spawn weixin_bot.py 子进程 — 让 babata 一条命令跑 TG+WX.
-    判据: WEIXIN_DATA_DIR/accounts/ 有 token 文件. 没有则 V 没装 WX, 不 spawn.
+    判据: WEIXIN_DATA_DIR/accounts/ 有 token 文件. 没有则未装 WX, 不 spawn.
     生产 launchd 模式各 channel 独立 plist 跑, 通过 BABATA_NO_AUTO_WX=1 关掉.
     """
     if os.environ.get("BABATA_NO_AUTO_WX"):

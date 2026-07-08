@@ -1,15 +1,24 @@
+import ast
 import json
-import sys
 from pathlib import Path
-
-_REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_REPO))
 
 import memory_health
 
 
 def _issue_buckets():
     return memory_health._empty_issue_buckets()
+
+
+def test_memory_health_public_surface_stays_thin():
+    tree = ast.parse(Path(memory_health.__file__).read_text(encoding="utf-8"))
+    public_defs = sorted(
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and not node.name.startswith("_")
+    )
+
+    assert public_defs == ["main", "run"]
 
 
 def test_scan_root_memory_files_keeps_root_checks_together(tmp_path):
@@ -24,16 +33,15 @@ def test_scan_root_memory_files_keeps_root_checks_together(tmp_path):
     )
     issues = _issue_buckets()
 
-    orphans = memory_health._scan_root_memory_files(tmp_path, {"good.md"}, issues)
+    memory_health._scan_root_memory_files(tmp_path, {"good.md"}, issues)
 
-    assert orphans == [
+    assert issues["orphan"] == [
         {
             "file": "bad.md",
             "line": 0,
             "detail": "exists but is not linked from MEMORY.md or indexes/*.md",
         }
     ]
-    assert issues["orphan"] == orphans
     assert issues["missing_field"] == [
         {
             "file": "bad.md",
@@ -88,9 +96,7 @@ def test_run_human_mode_accepts_clean_router(tmp_path, capsys):
     (tmp_path / "MEMORY.md").write_text("- [good](good.md)\n", encoding="utf-8")
     (tmp_path / "good.md").write_text("# good\n", encoding="utf-8")
 
-    code = memory_health.run(
-        tmp_path, json_mode=False, fix_mode=False, strict_mode=True
-    )
+    code = memory_health.run(tmp_path, json_mode=False, strict_mode=True)
 
     assert code == 0
     assert capsys.readouterr().out == "No structural issues found.\n"
@@ -100,9 +106,7 @@ def test_run_json_strict_reports_router_and_root_issues(tmp_path, capsys):
     (tmp_path / "MEMORY.md").write_text("- [missing](missing.md)\n", encoding="utf-8")
     (tmp_path / "orphan.md").write_text("# orphan\n", encoding="utf-8")
 
-    code = memory_health.run(
-        tmp_path, json_mode=True, fix_mode=False, strict_mode=True
-    )
+    code = memory_health.run(tmp_path, json_mode=True, strict_mode=True)
     payload = json.loads(capsys.readouterr().out)
 
     assert code == 1

@@ -1,10 +1,6 @@
 import asyncio
 import json
-import sys
 from pathlib import Path
-
-_REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_REPO))
 
 import codex_engine
 import engine

@@ -49,8 +49,8 @@ _WX_TOOL_SPECS = (
     (
         "wx_send_text",
         (
-            "Send text to WeChat. Final replies are auto-delivered; use only for "
-            "mid-turn pushes, long-running progress, or proactive sends."
+            "Send text to WeChat. Final replies auto-delivered; only for "
+            "mid-turn pushes, long-running progress, proactive sends."
         ),
         {"text": {"type": "string"}},
         ["text"],
@@ -58,7 +58,7 @@ _WX_TOOL_SPECS = (
     (
         "wx_send_image",
         (
-            "Send local jpg/png/gif/webp/bmp to WeChat; caption sends separate text first."
+            "Send jpg/png/gif/webp/bmp to WeChat; caption sends separate text first."
         ),
         {
             "path": {

@@ -26,7 +26,7 @@ def test_sidebar_events_bounds_long_string_fields(monkeypatch, tmp_path):
     assert event["error_bytes"] == len(error.encode("utf-8"))
     assert event["nested"]["detail"].endswith("chars]")
     assert event["nested"]["_meta"] == "kept"
-    assert sidebar_events.grep_url(url)[0]["kind"] == "translate_fail"
+    assert sidebar_events._grep_url(url)[0]["kind"] == "translate_fail"
 
 
 def test_sidebar_events_truncate_is_idempotent(monkeypatch):

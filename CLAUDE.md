@@ -6,12 +6,6 @@ personal-context routing, and public-action permissions come from
 `~/cc-workspace/AGENTS.md` / `~/cc-workspace/CLAUDE.md` plus rendered memory
 context; do not duplicate them here.
 
-For Codex terminal sessions, load shared context first when acting as babata:
-
-```bash
-~/cc-workspace/bin/babata-memory-context --profile standing --cpu codex --source terminal --include-top skip
-```
-
 ## Boundary
 
 - Keep this repo thin: channel protocol, formatting, auth, media conversion,

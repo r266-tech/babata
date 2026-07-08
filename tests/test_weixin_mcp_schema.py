@@ -2,13 +2,6 @@ import asyncio
 import json
 import sys
 import types
-from pathlib import Path
-
-_REPO = Path(__file__).resolve().parents[1]
-_SDK_SITE = next(iter((_REPO / ".venv/lib").glob("python*/site-packages")), None)
-if _SDK_SITE:
-    sys.path.insert(0, str(_SDK_SITE))
-sys.path.insert(0, str(_REPO))
 
 import weixin_mcp
 import weixin_ilink
@@ -46,7 +39,7 @@ def test_wx_text_tool_description_stays_operational():
     tools = _tools()
     text = tools["wx_send_text"].description
 
-    assert len(text) <= 140
+    assert len(text) <= 120
     for marker in ("WeChat", "auto-delivered", "mid-turn pushes", "long-running progress", "proactive sends"):
         assert marker in text
     for marker in ("Markdown natively", "bold/italic", "lists/tables", "Bare URLs", "[text](url)"):
@@ -63,8 +56,8 @@ def test_wx_tool_descriptions_stay_compact_and_schema_owned():
         if isinstance(prop, dict) and prop.get("description")
     ]
 
-    assert sum(len(description) for description in descriptions) <= 390
-    assert max(len(description) for description in descriptions) <= 140
+    assert sum(len(description) for description in descriptions) <= 340
+    assert max(len(description) for description in descriptions) <= 120
     assert schema_descriptions == []
     forbidden_markers = (
         "the user's",
@@ -121,6 +114,7 @@ def test_wx_voice_tool_stays_absent_from_model_visible_schema():
     tools = _tools()
 
     assert "wx_send_voice" not in tools
+    assert not hasattr(weixin_ilink, "MEDIA_VOICE")
     assert not hasattr(weixin_ilink, "voice_item")
     assert not hasattr(weixin_bridge.WeixinBridge, "_handle_send_voice")
 

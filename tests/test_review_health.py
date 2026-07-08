@@ -54,8 +54,45 @@ def test_review_health_degrades_when_soft_and_tool_missing(monkeypatch, tmp_path
 def test_review_health_deterministic_only_mode(monkeypatch):
     monkeypatch.setenv("BABATA_BLOCKING_REVIEW_AGENT", "deterministic")
     monkeypatch.setenv("BABATA_REVIEW_HEALTH_TTL", "0")
+    monkeypatch.setattr(
+        review_health,
+        "_run_probe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("probe should not run")),
+    )
 
     snap = review_health.review_health_snapshot(force=True)
 
     assert snap["status"] == "deterministic-only"
     assert snap["counterpart_enabled"] is False
+    assert snap["probes"] == {}
+
+
+def test_review_health_disabled_skips_external_probes(monkeypatch):
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW", "0")
+    monkeypatch.setenv("BABATA_REVIEW_HEALTH_TTL", "0")
+    monkeypatch.setattr(
+        review_health,
+        "_run_probe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("probe should not run")),
+    )
+
+    snap = review_health.review_health_snapshot(force=True)
+
+    assert snap["status"] == "disabled"
+    assert snap["probes"] == {}
+
+
+def test_review_health_no_probe_reports_not_checked_without_external_calls(monkeypatch):
+    monkeypatch.setenv("BABATA_REVIEW_HEALTH_TTL", "0")
+    monkeypatch.setattr(
+        review_health,
+        "_run_probe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("probe should not run")),
+    )
+
+    snap = review_health.review_health_snapshot(force=True, probe=False)
+
+    assert snap["status"] == "not-checked"
+    assert snap["enabled"] is True
+    assert snap["counterpart_enabled"] is True
+    assert snap["probes"] == {}
