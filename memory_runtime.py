@@ -174,15 +174,12 @@ def _log_memory_reflex_preflight(
     routes = _sanitize_reflex_list(reflex.get("routes"), _REFLEX_ROUTES)
     flags = _sanitize_reflex_list(reflex.get("flags"), _REFLEX_FLAGS)
     profile = _sanitize_reflex_token(reflex.get("profile"), _REFLEX_PROFILES)
-    route = _sanitize_reflex_token(reflex.get("route"), _REFLEX_ROUTES)
     if routes:
         router["routes"] = routes
     if flags:
         router["flags"] = flags
     if profile:
         router["profile"] = profile
-    if route:
-        router["route"] = route
     _append_memory_reflex_event({
         "event": "preflight",
         "id": event_id,

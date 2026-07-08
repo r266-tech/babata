@@ -405,7 +405,6 @@ def test_memory_reflex_values_are_allowlisted(monkeypatch, tmp_path):
     event = json.loads(text.splitlines()[0])
     assert event["router"] == {
         "flags": ["reflection_candidate"],
-        "route": "deep",
         "routes": ["recent"],
     }
     assert str(tmp_path) not in text
