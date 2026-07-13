@@ -519,6 +519,34 @@ def test_sidebar_page_memory_omits_user_message_preview():
     assert "last said" not in line
 
 
+def test_translate_trace_handler_writes_one_diagnostic_batch(monkeypatch):
+    calls: list[tuple[str, list]] = []
+    traces = [
+        {"src": "a", "dec": "keep"},
+        {"src": "b", "dec": "skip"},
+    ]
+
+    class FakeRequest:
+        headers = {
+            "origin": f"chrome-extension://{sidebar_bot._DEFAULT_EXTENSION_ID}",
+        }
+
+        async def json(self):
+            return {"url": "https://x.test/article", "traces": traces}
+
+    monkeypatch.setattr(
+        sidebar_bot.sidebar_events,
+        "append_client_trace_batch",
+        lambda url, batch: calls.append((url, batch)),
+    )
+
+    response = asyncio.run(sidebar_bot.handle_translate_trace(FakeRequest()))
+
+    assert response.status == 200
+    assert json.loads(response.text) == {"ok": True}
+    assert calls == [("https://x.test/article", traces)]
+
+
 def test_sidebar_assistant_turn_records_only_completed_response(monkeypatch):
     history: list[tuple] = []
     monkeypatch.setattr(

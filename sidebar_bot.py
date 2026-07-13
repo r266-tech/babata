@@ -979,8 +979,7 @@ async def handle_attention(request: web.Request) -> web.Response:
 
 async def handle_translate_trace(request: web.Request) -> web.Response:
     """Client-side translate trace 收集.
-    每条 trace 写一行 events.jsonl client_trace kind, 含 src/dec/hash/el.
-    可直接 tail 每个 decision, 不再 hypothesize 闪烁/漏翻 root cause."""
+    每个请求聚合为一条有上限的诊断记录，不进入 page-memory fact stream."""
     rejected = _reject_untrusted_origin(request)
     if rejected:
         return rejected
@@ -992,18 +991,7 @@ async def handle_translate_trace(request: web.Request) -> web.Response:
     traces = data.get("traces") or []
     if not isinstance(traces, list):
         return web.json_response({"ok": False, "error": "traces must be array"}, status=400, headers=_cors_headers(request))
-    for t in traces:
-        if not isinstance(t, dict):
-            continue
-        sidebar_events.append(
-            url,
-            "client_trace",
-            **{
-                k: v
-                for k, v in t.items()
-                if k != "txt" and isinstance(v, (str, int, float, bool))
-            },
-        )
+    sidebar_events.append_client_trace_batch(url, traces)
     return web.json_response({"ok": True}, headers=_cors_headers(request))
 
 

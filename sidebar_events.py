@@ -1,7 +1,10 @@
-"""babata sidebar events.jsonl — unified fact stream for audit + page memory.
+"""babata sidebar fact events plus a bounded diagnostic trace stream.
 
 三线 (translate / chat / proactive / attention) 都 append. chat 进 prompt 时
 grep 当前 url 最近事件摘要塞 page_context (= page memory).
+
+High-volume client translation traces are diagnostics, not page-memory facts.
+They are written as sampled batches to a separate 50 MiB + one-rotation stream.
 
 Fact stream only: lines do not directly call each other; consumers decide from
 the same append-only event log.
@@ -18,8 +21,10 @@ Schema (松散, 每条带 ts/url/kind, 余字段按 kind 自由):
 """
 
 import hashlib
+import fcntl
 import json
 import logging
+import os
 import time
 from threading import Lock
 from typing import Any
@@ -30,8 +35,16 @@ log = logging.getLogger(__name__)
 
 EVENTS_DIR = SIDEBAR_DATA_DIR
 EVENTS_FILE = EVENTS_DIR / "events.jsonl"
+CLIENT_TRACE_FILE = EVENTS_DIR / "client-trace.jsonl"
 MAX_FIELD_TEXT = 512
+CLIENT_TRACE_FILE_LIMIT_BYTES = 50 * 1024 * 1024
+CLIENT_TRACE_MAX_INPUTS = 4096
+CLIENT_TRACE_MAX_SAMPLES = 32
+CLIENT_TRACE_MAX_FIELDS = 32
+CLIENT_TRACE_MAX_KEY_CHARS = 64
+CLIENT_TRACE_MAX_LINE_BYTES = 1024 * 1024
 _lock = Lock()
+_client_trace_lock = Lock()
 
 
 def append(url: str, kind: str, **fields: Any) -> None:
@@ -49,10 +62,129 @@ def append(url: str, kind: str, **fields: Any) -> None:
     try:
         with _lock:
             EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with EVENTS_FILE.open("a", encoding="utf-8") as f:
-                f.write(line)
+            lock_path = EVENTS_FILE.with_name("events.lock")
+            with lock_path.open("a+") as lock_handle:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                with EVENTS_FILE.open("a", encoding="utf-8") as f:
+                    f.write(line)
     except OSError as e:
         log.warning("sidebar_events.append failed (kind=%s url=%s): %s", kind, url, e)
+
+
+def append_client_trace_batch(url: str, traces: list[Any]) -> None:
+    """Append one bounded diagnostic record for a client trace batch.
+
+    Repeated trace rows are aggregated before sampling. The diagnostic lane is
+    deliberately separate from ``events.jsonl`` so page-memory facts stay
+    append-only and high-signal.
+    """
+    received_n = len(traces)
+    processed = traces[:CLIENT_TRACE_MAX_INPUTS]
+    groups: dict[str, dict[str, Any]] = {}
+    valid_n = 0
+    for trace in processed:
+        if not isinstance(trace, dict):
+            continue
+        valid_n += 1
+        fields = _normalize_client_trace(trace)
+        fingerprint = json.dumps(
+            fields,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        group = groups.get(fingerprint)
+        if group is None:
+            groups[fingerprint] = {"repeat_n": 1, "fields": fields}
+        else:
+            group["repeat_n"] += 1
+
+    samples = list(groups.values())[:CLIENT_TRACE_MAX_SAMPLES]
+    safe_url = _truncate_text(url or "")
+    rec: dict[str, Any] = {
+        "ts": int(time.time()),
+        "url": safe_url,
+        "kind": "client_trace_batch",
+        "received_n": received_n,
+        "processed_n": len(processed),
+        "valid_n": valid_n,
+        "invalid_n": len(processed) - valid_n,
+        "input_truncated_n": received_n - len(processed),
+        "unique_n": len(groups),
+        "sampled_n": len(samples),
+        "unsampled_unique_n": max(0, len(groups) - len(samples)),
+        "samples": samples,
+    }
+    if len(url or "") > MAX_FIELD_TEXT:
+        rec["url_sha256"] = _sha256_text(url)
+        rec["url_bytes"] = len(url.encode("utf-8", errors="replace"))
+    line = _serialize_client_trace_record(rec)
+    _append_bounded_client_trace(line)
+
+
+def _normalize_client_trace(trace: dict[Any, Any]) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    for raw_key, value in trace.items():
+        if raw_key == "txt" or not isinstance(value, (str, int, float, bool)):
+            continue
+        if len(fields) >= CLIENT_TRACE_MAX_FIELDS:
+            break
+        key = str(raw_key)[:CLIENT_TRACE_MAX_KEY_CHARS]
+        if not key or key in fields:
+            continue
+        fields[key] = _truncate_text(value) if isinstance(value, str) else value
+    return fields
+
+
+def _serialize_client_trace_record(rec: dict[str, Any]) -> bytes:
+    """Keep a single batch record bounded even for hostile extension input."""
+    while True:
+        data = (
+            json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        if len(data) <= CLIENT_TRACE_MAX_LINE_BYTES:
+            return data
+        samples = rec.get("samples") or []
+        if not samples:
+            minimal = {
+                key: value
+                for key, value in rec.items()
+                if key not in {"samples", "sampled_n"}
+            }
+            minimal["sampled_n"] = 0
+            minimal["samples"] = []
+            minimal["record_truncated"] = True
+            return (
+                json.dumps(minimal, ensure_ascii=False, separators=(",", ":"))
+                + "\n"
+            ).encode("utf-8")
+        keep = max(0, len(samples) // 2)
+        rec["samples"] = samples[:keep]
+        rec["sampled_n"] = keep
+        rec["unsampled_unique_n"] = max(0, int(rec["unique_n"]) - keep)
+        rec["record_truncated"] = True
+
+
+def _append_bounded_client_trace(data: bytes) -> None:
+    """Append diagnostics with a 50 MiB current file and one rotation."""
+    if len(data) > CLIENT_TRACE_FILE_LIMIT_BYTES:
+        log.warning(
+            "sidebar client trace batch skipped: record bytes=%s limit=%s",
+            len(data),
+            CLIENT_TRACE_FILE_LIMIT_BYTES,
+        )
+        return
+    try:
+        with _client_trace_lock:
+            CLIENT_TRACE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            current_size = CLIENT_TRACE_FILE.stat().st_size if CLIENT_TRACE_FILE.exists() else 0
+            if current_size + len(data) > CLIENT_TRACE_FILE_LIMIT_BYTES:
+                rotated = CLIENT_TRACE_FILE.with_name(CLIENT_TRACE_FILE.name + ".1")
+                os.replace(CLIENT_TRACE_FILE, rotated)
+            with CLIENT_TRACE_FILE.open("ab") as handle:
+                handle.write(data)
+    except OSError as exc:
+        log.warning("sidebar client trace append failed: %s", exc)
 
 
 def _bounded_fields(fields: dict[str, Any]) -> dict[str, Any]:
