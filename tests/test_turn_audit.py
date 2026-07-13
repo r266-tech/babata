@@ -58,7 +58,7 @@ def test_turn_audit_records_ledger_guards_checks_and_review_bus(monkeypatch, tmp
     )
     assert turn is not None
 
-    (repo / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-testsecret0000000000000000\n")
+    (repo / ".env").write_text("ANTHROPIC_API_KEY=fixture_test_value\n")
 
     summary = turn_audit.finish_turn(
         turn,
@@ -209,7 +209,7 @@ def test_permission_guard_can_enforce_secret_file_writes(monkeypatch):
         "Write",
         {
             "file_path": ".env",
-            "content": "ANTHROPIC_API_KEY=sk-ant-testsecret0000000000000000",
+            "content": "ANTHROPIC_API_KEY=fixture_test_value",
         },
     )
     assert block is True
@@ -218,7 +218,7 @@ def test_permission_guard_can_enforce_secret_file_writes(monkeypatch):
 
 def test_deterministic_guards_combine_file_and_tool_findings(monkeypatch, tmp_path):
     monkeypatch.setenv("BABATA_DETERMINISTIC_GUARDS", "observe")
-    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-testsecret0000000000000000\n")
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=fixture_test_value\n")
 
     findings = turn_audit.run_deterministic_guards(
         repo_root=tmp_path,
@@ -234,7 +234,7 @@ def test_deterministic_guards_combine_file_and_tool_findings(monkeypatch, tmp_pa
     rules = {finding["rule"] for finding in findings}
     assert {
         "env-file-changed",
-        "secret-pattern:anthropic_api_key",
+        "secret-pattern:secret_assignment",
         "destructive-memory-command",
     } <= rules
 

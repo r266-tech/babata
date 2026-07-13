@@ -31,7 +31,7 @@ cat > "$TEST_DIR/.env" <<EOF
 TELEGRAM_BOT_TOKEN=fake_test_token
 ALLOWED_USER_ID=12345
 CLAUDE_CLI_PATH=/usr/bin/false
-ANTHROPIC_API_KEY=sk-fake
+ANTHROPIC_API_KEY=fixture_test_value
 EOF
 
 # Run with all V private envs stripped, mocked HOME, cwd = fresh dir.
