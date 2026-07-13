@@ -19,6 +19,7 @@ fi
 
 LABEL_PREFIX="com.${PROJECT_NAMESPACE:-babata}"
 RESTART_IDLE_WAIT_SECONDS="${RESTART_IDLE_WAIT_SECONDS:-3600}"
+DISABLE_WAIT_SECONDS="${DISABLE_WAIT_SECONDS:-60}"
 
 runtime_file_for_label() {
     local label="$1"
@@ -81,7 +82,8 @@ restart() {
     # channel — writing the file would be unread + stale-on-first-consume hazard
     # if a wx alert is added later. Same skip lives in babata-daily-restart.sh
     # and babata-daily-restart.sh.
-    if [ "$label" != "${LABEL_PREFIX}.weixin" ]; then
+    if [[ "$label" == "$LABEL_PREFIX" || "$label" == "$LABEL_PREFIX".* ]] && \
+            [ "$label" != "${LABEL_PREFIX}.weixin" ]; then
         local state_dir="${PROJECT_STATE_DIR:-$REPO_DIR/state}"
         {
             mkdir -p "$state_dir" && \
@@ -132,7 +134,8 @@ reload_plist() {
         echo "ERR: plist not found: $plist" >&2
         return 1
     fi
-    if [ "$label" != "${LABEL_PREFIX}.weixin" ]; then
+    if [[ "$label" == "$LABEL_PREFIX" || "$label" == "$LABEL_PREFIX".* ]] && \
+            [ "$label" != "${LABEL_PREFIX}.weixin" ]; then
         local state_dir="${PROJECT_STATE_DIR:-$REPO_DIR/state}"
         {
             mkdir -p "$state_dir" && \
@@ -194,9 +197,73 @@ bootstrap_plist() {
     echo "已排队: bootstrap $plist"
 }
 
+disable_plist() {
+    local label="${1:?launchd label required}"
+    local plist="${2:-$HOME/Library/LaunchAgents/${label}.plist}"
+    local disabled_plist="${plist}.disabled"
+    if [ ! -f "$plist" ]; then
+        echo "ERR: plist not found: $plist" >&2
+        return 1
+    fi
+    if [ -e "$disabled_plist" ]; then
+        echo "ERR: disabled plist already exists: $disabled_plist" >&2
+        return 1
+    fi
+
+    local helper="${label}.disable.$(date +%s).$$"
+    launchctl submit -l "$helper" -- /bin/bash -lc '
+        set -u
+        delay="$1"
+        uid_n="$2"
+        label="$3"
+        plist="$4"
+        disabled_plist="$5"
+        helper="$6"
+        wait_s="$7"
+        domain="gui/$uid_n"
+        sleep "$delay"
+
+        # Disable first so a periodic job cannot restart while an existing
+        # invocation gets a bounded chance to exit naturally.
+        if ! launchctl disable "$domain/$label"; then
+            echo "ERROR: failed to disable $domain/$label" >&2
+            launchctl remove "$helper" >/dev/null 2>&1 || true
+            exit 1
+        fi
+        deadline=$(( $(date +%s) + wait_s ))
+        while launchctl print "$domain/$label" 2>/dev/null | grep -q "pid ="; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "WARN: $label still running after ${wait_s}s; left disabled, not killed" >&2
+                launchctl remove "$helper" >/dev/null 2>&1 || true
+                exit 1
+            fi
+            sleep 1
+        done
+
+        launchctl bootout "$domain/$label" 2>/dev/null || true
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            launchctl print "$domain/$label" >/dev/null 2>&1 || break
+            sleep 1
+        done
+        if launchctl print "$domain/$label" >/dev/null 2>&1; then
+            echo "WARN: $label still loaded after bootout; plist left in place" >&2
+            launchctl remove "$helper" >/dev/null 2>&1 || true
+            exit 1
+        fi
+
+        if ! mv "$plist" "$disabled_plist"; then
+            echo "ERROR: failed to preserve disabled plist at $disabled_plist" >&2
+            launchctl remove "$helper" >/dev/null 2>&1 || true
+            exit 1
+        fi
+        launchctl remove "$helper" >/dev/null 2>&1 || true
+    ' bash "$DELAY" "$UID_N" "$label" "$plist" "$disabled_plist" "$helper" "$DISABLE_WAIT_SECONDS"
+    echo "已排队: disable $label; plist 将保留为 $disabled_plist"
+}
+
 update_claude() {
     # 走 canonical auto-update 脚本而非 `claude update`; install.sh 也注册这一路径.
-    nohup "$REPO_DIR/scripts/auto-update.sh" --upgrade-sdk >/dev/null 2>&1 &
+    nohup "$REPO_DIR/scripts/auto-update.sh" --upgrade-claude --upgrade-sdk >/dev/null 2>&1 &
     disown
     echo "已排队: scripts/auto-update.sh"
 }
@@ -205,6 +272,7 @@ case "${1:-}" in
     restart)        shift; restart "$@" ;;
     reload-plist)   shift; reload_plist "$@" ;;
     bootstrap)      shift; bootstrap_plist "$@" ;;
+    disable-plist)  shift; disable_plist "$@" ;;
     update-claude)  update_claude ;;
-    *) echo "Usage: $0 {restart [<label> [reason...]] | reload-plist [<label> [<plist>]] | bootstrap <plist> | update-claude}" >&2; exit 1 ;;
+    *) echo "Usage: $0 {restart [<label> [reason...]] | reload-plist [<label> [<plist>]] | bootstrap <plist> | disable-plist <label> [<plist>] | update-claude}" >&2; exit 1 ;;
 esac

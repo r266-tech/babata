@@ -98,11 +98,6 @@ BRIDGE_SOCKET = os.environ.get(
     f"/tmp/{NAMESPACE}-bridge.sock",
 )
 
-# Skill-evolve hooks — opt-in. Default = empty path (no hooks fired). Set
-# PROJECT_SKILL_HOOKS_DIR to point at a directory of session-{start,end}.sh
-# scripts. cc.py's fire code is is_file() guarded so missing = silent no-op.
-SKILL_HOOKS_DIR = Path(os.environ.get("PROJECT_SKILL_HOOKS_DIR", ""))
-
 # Project-local lifecycle hooks — lives in the repo (checked in), so OSS forks
 # get them for free. cc.py fires session-start.sh / session-end.sh from here on
 # every session boundary (new sid observed, /reset, /resume). Scripts receive

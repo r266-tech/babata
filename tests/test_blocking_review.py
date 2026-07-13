@@ -155,7 +155,7 @@ def test_claude_live_review_followup_precedes_turn_end(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
-def test_codex_turn_routes_default_review_to_claude_counterpart(monkeypatch, tmp_path):
+def test_codex_turn_can_explicitly_route_review_to_claude_counterpart(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     _init_repo(repo)
@@ -180,6 +180,7 @@ def test_codex_turn_routes_default_review_to_claude_counterpart(monkeypatch, tmp
         return Proc()
 
     monkeypatch.setenv("BABATA_BLOCKING_REVIEW_COUNTERPART", "1")
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW_CPU", "claude")
     monkeypatch.setenv("BABATA_AUDIT_DIR", str(tmp_path / "audit"))
     monkeypatch.setattr(blocking_review, "_cc_worker_cli", lambda: Path("/bin/cc-worker"))
     monkeypatch.setattr(blocking_review.subprocess, "run", fake_run)
@@ -208,7 +209,7 @@ def test_codex_turn_routes_default_review_to_claude_counterpart(monkeypatch, tmp
     assert any(call[0][0] == "/bin/cc-worker" and call[0][1] == "remove" for call in calls)
 
 
-def test_claude_turn_routes_default_review_to_codex_counterpart(monkeypatch, tmp_path):
+def test_codex_turn_routes_default_review_to_codex_counterpart(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     _init_repo(repo)
@@ -240,7 +241,7 @@ def test_claude_turn_routes_default_review_to_codex_counterpart(monkeypatch, tmp
             "changed_files": ["app.py"],
             "declared_checks": [{"status": "skipped"}],
         },
-        cpu="claude",
+        cpu="codex",
         channel="test",
         response_content="draft",
         round_index=0,
@@ -251,8 +252,65 @@ def test_claude_turn_routes_default_review_to_codex_counterpart(monkeypatch, tmp
     codex_call = next(call for call in calls if call[0][0] == "/bin/codex" and call[0][1] == "exec")
     assert "--sandbox" in codex_call[0]
     assert "read-only" in codex_call[0]
+    assert "--model" in codex_call[0]
+    assert codex_call[0][codex_call[0].index("--model") + 1] == "gpt-5.6-sol"
+    assert "-c" in codex_call[0]
+    assert 'model_reasoning_effort="max"' in codex_call[0]
     assert codex_call[1]["env"]["BABATA_BLOCKING_REVIEW"] == "0"
     assert codex_call[1]["env"]["BABATA_BLOCKING_REVIEW_DEPTH"] == "1"
+
+
+def test_codex_counterpart_review_allows_model_and_reasoning_override(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    calls = []
+
+    class Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        output_flag = "--output-last-message"
+        output_path = Path(args[args.index(output_flag) + 1])
+        output_path.write_text(json.dumps({"status": "passed", "findings": []}))
+        return Proc()
+
+    monkeypatch.setenv("BABATA_CODEX_REVIEW_MODEL", "codex-review-test")
+    monkeypatch.setenv("BABATA_CODEX_REVIEW_REASONING", "ultra")
+    monkeypatch.setattr(blocking_review, "_codex_cli", lambda: Path("/bin/codex"))
+    monkeypatch.setattr(blocking_review.subprocess, "run", fake_run)
+
+    result = blocking_review._run_codex_counterpart_review(
+        {"cpu": "claude", "audit": {"repo_root": str(repo)}},
+        round_index=0,
+    )
+
+    assert result["status"] == "passed"
+    args = calls[0][0]
+    assert args[args.index("--model") + 1] == "codex-review-test"
+    assert 'model_reasoning_effort="ultra"' in args
+
+
+def test_unknown_review_cpu_falls_back_to_codex(monkeypatch):
+    sentinel = {"status": "passed", "reviewer": "codex-counterpart"}
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW_CPU", "cluade")
+    monkeypatch.setattr(
+        blocking_review,
+        "_run_codex_counterpart_review",
+        lambda _payload, _round_index: sentinel,
+    )
+    monkeypatch.setattr(
+        blocking_review,
+        "_run_claude_counterpart_review",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid reviewer value must not route to Claude")
+        ),
+    )
+
+    assert blocking_review._run_counterpart_review({"cpu": "codex"}, 0) is sentinel
 
 
 def test_counterpart_review_skips_when_already_inside_reviewer(monkeypatch, tmp_path):
@@ -275,6 +333,49 @@ def test_counterpart_review_skips_when_already_inside_reviewer(monkeypatch, tmp_
     assert result["status"] == "passed"
     assert result["reviewer"] == "deterministic"
     assert result["reason"] == "counterpart review skipped inside delegated reviewer"
+
+
+def test_review_result_scrubs_echoed_response_draft_from_return_and_ledger(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    (repo / "app.py").write_text("print('changed')\n")
+    audit_dir = tmp_path / "audit"
+    response = "PRIVATE-DRAFT-" + ("x" * 80) + "-DRAFT-TAIL"
+    script = tmp_path / "echo_review.py"
+    script.write_text(
+        "import json, sys\n"
+        "payload = json.load(sys.stdin)\n"
+        "draft = payload['response_preview']\n"
+        "print(json.dumps({\n"
+        "    'status': 'needs_fix',\n"
+        "    'message': draft,\n"
+        "    'findings': [{'severity': 'high', 'rule': 'echo', 'message': draft}],\n"
+        "}))\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("BABATA_AUDIT_DIR", str(audit_dir))
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW_CMD", f"{sys.executable} {script}")
+    result = blocking_review.run_blocking_review(
+        {"turn_id": "turn-echo", "repo_root": str(repo), "changed_files": ["app.py"]},
+        cpu="codex",
+        channel="test",
+        response_content=response,
+        round_index=0,
+    )
+
+    raw_result = json.dumps(result, ensure_ascii=False)
+    ledger = (audit_dir / "babata-blocking-review.jsonl").read_text(encoding="utf-8")
+    for text in (raw_result, ledger):
+        assert response not in text
+        assert "PRIVATE-DRAFT-" not in text
+        assert "DRAFT-TAIL" not in text
+        assert "[response draft omitted sha256=" in text
+        assert blocking_review._sha256_text(response) in text
+    assert result["response_sha256"] == blocking_review._sha256_text(response)
+    assert result["response_bytes"] == len(response.encode("utf-8"))
+    assert "raw_output" not in result
 
 
 def test_counterpart_auth_failure_degrades_when_not_strict(monkeypatch, tmp_path):
@@ -301,6 +402,7 @@ def test_counterpart_auth_failure_degrades_when_not_strict(monkeypatch, tmp_path
         return Proc()
 
     monkeypatch.setenv("BABATA_BLOCKING_REVIEW_COUNTERPART", "1")
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW_CPU", "claude")
     monkeypatch.setenv("BABATA_BLOCKING_REVIEW_INFRA_STRICT", "0")
     monkeypatch.setenv("BABATA_AUDIT_DIR", str(tmp_path / "audit"))
     monkeypatch.setattr(blocking_review, "_cc_worker_cli", lambda: Path("/bin/cc-worker"))
@@ -339,6 +441,7 @@ def test_counterpart_auth_failure_blocks_when_strict(monkeypatch, tmp_path):
         stderr = ""
 
     monkeypatch.setenv("BABATA_BLOCKING_REVIEW_COUNTERPART", "1")
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW_CPU", "claude")
     monkeypatch.setenv("BABATA_BLOCKING_REVIEW_INFRA_STRICT", "1")
     monkeypatch.setenv("BABATA_AUDIT_DIR", str(tmp_path / "audit"))
     monkeypatch.setattr(blocking_review, "_cc_worker_cli", lambda: Path("/bin/cc-worker"))

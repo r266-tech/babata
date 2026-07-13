@@ -2,7 +2,7 @@
 # Fresh-OSS-user smoke test. Validates default behavior with no V private envs:
 #   - paths derive from repo (not ~/cc-workspace)
 #   - INSTANCE_LABELS in English
-#   - cc.py defaults to isolated mode (setting_sources=[], cwd=repo, permission_mode=default)
+#   - cc.py isolates user settings but loads repo project instructions
 #   - bot.py _allowed() fails closed when ALLOWED_USER_ID==0
 #   - /provider gracefully degrades when BABATA_CC_ROUTER_DIR unset
 #
@@ -67,14 +67,13 @@ def check(name, actual, expected):
 
 print('═══ constants.py defaults ═══')
 check('STATE_DIR contains repo dir', str(constants.STATE_DIR), lambda v: '/state' in v and 'cc-workspace' not in v)
-check('SKILL_HOOKS_DIR is empty/. (no-op)', str(constants.SKILL_HOOKS_DIR), lambda v: v in ('', '.'))
 check('INSTANCE_LABELS main', constants.INSTANCE_LABELS[''], 'babata')
 check('INSTANCE_LABELS no Chinese', constants.INSTANCE_LABELS, lambda d: not any('巴' in v for v in d.values()))
 check('NAMESPACE', constants.NAMESPACE, 'babata')
 
 print()
 print('═══ cc.py isolation defaults ═══')
-check('setting_sources empty', cc._SETTING_SOURCES, [])
+check('setting_sources project-only', cc._SETTING_SOURCES, ['project'])
 check('cwd is repo, not HOME', cc._DEFAULT_CWD, lambda v: '/Users/' not in v or v.startswith('$TEST_DIR'))
 check('permission_mode default', cc._PERMISSION_MODE, 'default')
 

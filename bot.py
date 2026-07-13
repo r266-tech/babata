@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import suppress
 from dataclasses import dataclass
@@ -58,6 +59,7 @@ from telegram.ext import (
 
 from bridge import bridge
 from cc import Event, LiveSession, Response
+from cli_runtime import env_cli_path
 from engine import (
     VENV_PYTHON,
     engine_choices,
@@ -193,6 +195,7 @@ class PendingDeliveryRecord:
     content: str
     session_id: str
     resume_note: str | None
+    generated_images: tuple[str, ...] = ()
 
 
 def _pending_replay_notice_lines(summary: PendingReplaySummary) -> list[str]:
@@ -298,6 +301,7 @@ async def _record_pending_delivery(
         "content": resp.content,
         "resume_note": resp.resume_note,
         "session_id": resp.session_id,
+        "generated_images": list(resp.generated_images),
         "created_at": time.time(),
     }
     async with _pending_deliveries_lock:
@@ -478,7 +482,7 @@ def _bot_commands_for_cpu(cpu: str | None = None) -> list[tuple[str, str]]:
     if name == "claude":
         commands.insert(3, ("context", "Context usage breakdown"))
         commands.append(("provider", "切换 Anthropic 渠道"))
-    else:  # codex — cmd_provider line 3075 分支切 codex_accounts
+    elif name == "codex":
         commands.append(("provider", "切换 Codex 账号"))
     return commands
 
@@ -731,6 +735,8 @@ def _save_state() -> None:
         for key in _BOT_STATE_KEYS:
             if key in _state:
                 merged[key] = _state[key]
+            else:
+                merged.pop(key, None)
         _STATE_PATH.write_text(json.dumps(merged))
     except Exception:
         pass
@@ -2268,6 +2274,28 @@ class ChannelWorker:
         if msg is None:
             return False
 
+        if resp.generated_images:
+            chat = payload.update.effective_chat
+            bot_obj = getattr(payload.ctx, "bot", None)
+            if chat is None or bot_obj is None:
+                return False
+            for raw_path in resp.generated_images:
+                path = Path(raw_path).expanduser()
+                if not path.is_file():
+                    log.warning("generated image missing before TG delivery: %s", path)
+                    return False
+                try:
+                    with path.open("rb") as handle:
+                        await bot_obj.send_document(
+                            chat_id=chat.id,
+                            document=handle,
+                            filename=path.name,
+                            reply_to_message_id=msg.message_id,
+                        )
+                except Exception as e:
+                    log.warning("generated image delivery failed: %s: %s", path, e)
+                    return False
+
         if self._tool_status and _verbose == 1:
             try:
                 await self._tool_status.delete()
@@ -2291,6 +2319,8 @@ class ChannelWorker:
             self._stale_text_messages = []
 
         if not resp.content:
+            if resp.generated_images:
+                return True
             await msg.reply_text("(no response)")
             return True
 
@@ -2300,6 +2330,8 @@ class ChannelWorker:
         )
         if not pending:
             if has_bubbles:
+                return True
+            if resp.generated_images:
                 return True
             await msg.reply_text("(no response)")
             return True
@@ -2323,8 +2355,11 @@ class ChannelWorker:
         if not resp.session_id and resp.cost == 0.0 and not resp.tools:
             _session_cost = 0.0
             _session_turns = 0
+            _last_model = None
+            _last_context_window = None
             _last_used_tokens = 0
             _last_cost = 0.0
+            _last_session_id = None
         else:
             _session_cost += resp.cost
             _session_turns += 1
@@ -2347,10 +2382,16 @@ class ChannelWorker:
         _state["last_used_tokens"] = _last_used_tokens
         if _last_model:
             _state["last_model"] = _last_model
+        else:
+            _state.pop("last_model", None)
         if _last_context_window:
             _state["last_context_window"] = _last_context_window
+        else:
+            _state.pop("last_context_window", None)
         if _last_session_id:
             _state["last_session_id"] = _last_session_id
+        else:
+            _state.pop("last_session_id", None)
         _save_state()
 
     def _reset_turn_state(
@@ -2604,6 +2645,7 @@ def _parse_pending_delivery_record(record: dict[str, Any]) -> PendingDeliveryRec
         content=str(record.get("content") or ""),
         session_id=str(record.get("session_id") or ""),
         resume_note=record.get("resume_note") or None,
+        generated_images=tuple(str(path) for path in (record.get("generated_images") or [])),
     )
 
 
@@ -2644,6 +2686,7 @@ async def _replay_pending_delivery_record(
                 session_id=record.session_id,
                 cost=0.0,
                 resume_note=record.resume_note,
+                generated_images=list(record.generated_images),
             ),
         )
     except Exception as e:
@@ -2761,7 +2804,7 @@ def _cc_version() -> str:
     """Ask the actual claude binary for its version. Same binary bot spawns per
     query — so this number = what /new will run. Subprocess each call (low-
     frequency command, no cache needed)."""
-    cli = os.environ.get("CLAUDE_CLI_PATH") or shutil.which("claude")
+    cli = env_cli_path("CLAUDE_CLI_PATH") or shutil.which("claude")
     if not cli:
         return "—"
     try:
@@ -2783,11 +2826,7 @@ def _sdk_version() -> str:
 
 
 def _codex_cli_path() -> str | None:
-    return (
-        os.environ.get("BABATA_CODEX_CLI_PATH")
-        or os.environ.get("CODEX_CLI_PATH")
-        or shutil.which("codex")
-    )
+    return env_cli_path("BABATA_CODEX_CLI_PATH", "CODEX_CLI_PATH") or shutil.which("codex")
 
 
 def _codex_version() -> str:
@@ -2799,6 +2838,70 @@ def _codex_version() -> str:
         return r.stdout.strip().split()[-1] if r.stdout else "—"
     except Exception:
         return "—"
+
+
+def _grok_cli_path() -> str | None:
+    return env_cli_path("BABATA_GROK_CLI_PATH", "GROK_CLI_PATH") or shutil.which("grok")
+
+
+def _grok_version() -> str:
+    cli = _grok_cli_path()
+    if not cli:
+        return "—"
+    try:
+        r = subprocess.run([cli, "--version"], capture_output=True, text=True, timeout=3)
+        return r.stdout.strip().split()[1] if r.stdout else "—"
+    except Exception:
+        return "—"
+
+
+def _grok_model_label() -> str:
+    raw_model = os.environ.get("BABATA_GROK_MODEL")
+    model = (raw_model or "").strip()
+    if model.lower() in {"auto", "default", "cli-default"}:
+        model = ""
+    return (
+        os.environ.get("BABATA_GROK_DISPLAY_MODEL")
+        or model
+        or (Path(_grok_cli_path() or "grok").name)
+    )
+
+
+def _grok_session_dir(sid: str) -> Path:
+    root = urllib.parse.quote(str(Path(__file__).parent), safe="")
+    return Path.home() / ".grok" / "sessions" / root / sid
+
+
+def _grok_session_model(sid: str | None) -> str | None:
+    if not sid:
+        return None
+    session_dir = _grok_session_dir(sid)
+    for filename, keys in (
+        ("summary.json", ("current_model_id",)),
+        ("signals.json", ("primaryModelId", "modelsUsed")),
+    ):
+        try:
+            data = json.loads((session_dir / filename).read_text())
+        except Exception:
+            continue
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, list):
+                for item in reversed(value):
+                    if isinstance(item, str) and item.strip():
+                        return item.strip()
+    return None
+
+
+def _grok_status_model(sid: str | None) -> str:
+    session_model = _grok_session_model(sid)
+    if session_model:
+        return session_model
+    if sid and _last_model:
+        return _last_model
+    return _grok_model_label()
 
 
 def _codex_config() -> dict[str, Any]:
@@ -3587,6 +3690,25 @@ async def _cmd_status_codex(update: Update) -> None:
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+async def _cmd_status_grok(update: Update) -> None:
+    sid = cc.session_id
+    sid_now = sid if sid else "(new)"
+    sids = cc.recent_session_ids()
+    labels = {0: "hidden", 1: "flash", 2: "keep"}
+    model = _grok_status_model(sid)
+    lines = [
+        "<b>📊 Status</b>",
+        "",
+        f"Grok · {html.escape(model)}",
+        "",
+        html.escape(_fmt_review_health_line()),
+        "",
+        f"Grok v{html.escape(_grok_version())} · {labels.get(_verbose, _verbose)}",
+        f"<code>{html.escape(sid_now)}</code> · {len(sids)} recent",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 def _claude_status_lines(
     *,
     bar: str,
@@ -3807,10 +3929,13 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Show current model, context usage, cost, session state."""
     if not _allowed(update):
         return
-    if _current_cpu_name() == "codex":
+    cpu_name = _current_cpu_name()
+    if cpu_name == "codex":
         await _cmd_status_codex(update)
-    else:
+    elif cpu_name == "claude":
         await _cmd_status_claude(update)
+    else:
+        await _cmd_status_grok(update)
 
 
 def _fmt_tok(n: int) -> str:
@@ -3826,8 +3951,9 @@ async def cmd_context(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """TG /context — query the live SDK context-usage control API."""
     if not _allowed(update):
         return
-    if _current_cpu_name() != "claude":
-        await update.message.reply_text("当前 CPU 是 Codex，/context 不支持。")
+    cpu_name = _current_cpu_name()
+    if cpu_name != "claude":
+        await update.message.reply_text(f"当前 CPU 是 {engine_label(cpu_name)}，/context 不支持。")
         return
 
     wait_msg = await update.message.reply_text("查询中…")
@@ -3895,9 +4021,9 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         cpu_name = _current_cpu_name()
         had_work = await worker.has_unfinished_work()
         await worker.interrupt()
-        if cpu_name == "codex" and had_work:
+        if cpu_name != "claude" and had_work:
             return
-        if cpu_name == "codex":
+        if cpu_name != "claude":
             await update.message.reply_text("当前没有正在运行的 turn")
         else:
             await update.message.reply_text("⏸  当前 turn 已请求中断")
@@ -4206,7 +4332,8 @@ async def cmd_provider(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     arg = args[1].strip() if len(args) > 1 else ""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-    if _current_cpu_name() == "codex":
+    cpu_name = _current_cpu_name()
+    if cpu_name == "codex":
         # codex CPU: 切 codex 账号 (symlink swap, 不重启 babata, 下条 message 生效)
         if arg:
             rc, body = await _run_cc_router_codex(arg)
@@ -4225,6 +4352,9 @@ async def cmd_provider(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"Codex 账号 (当前: {current_label}):",
             reply_markup=_codex_main_menu_markup(current_key),
         )
+        return
+    if cpu_name != "claude":
+        await update.message.reply_text(f"当前 CPU 是 {engine_label(cpu_name)}，/provider 不支持。")
         return
 
     # claude CPU: 切 Anthropic 渠道 (改 settings.json + 重启 babata)
@@ -4257,8 +4387,9 @@ async def on_provider_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     if not await _callback_allowed(q):
         return
     await q.answer()
-    if _current_cpu_name() != "claude":
-        await q.edit_message_text("CPU 已切到 Codex, Anthropic 渠道按钮失效。重新 /provider 看 codex 账号选项。")
+    cpu_name = _current_cpu_name()
+    if cpu_name != "claude":
+        await q.edit_message_text(f"CPU 已切到 {engine_label(cpu_name)}, Anthropic 渠道按钮失效。")
         return
     data = q.data or ""
     if ":" not in data:
@@ -4276,8 +4407,9 @@ async def on_codex_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     if not await _callback_allowed(q):
         return
     await q.answer()
-    if _current_cpu_name() != "codex":
-        await q.edit_message_text("CPU 已切到 Claude, Codex 账号按钮失效。重新 /provider 看 Anthropic 渠道选项。")
+    cpu_name = _current_cpu_name()
+    if cpu_name != "codex":
+        await q.edit_message_text(f"CPU 已切到 {engine_label(cpu_name)}, Codex 账号按钮失效。")
         return
     data = q.data or ""
     if ":" not in data:
@@ -4310,6 +4442,10 @@ async def on_codex_add_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     if not await _callback_allowed(q):
         return
     await q.answer()
+    cpu_name = _current_cpu_name()
+    if cpu_name != "codex":
+        await q.edit_message_text(f"CPU 已切到 {engine_label(cpu_name)}, Codex 新增入口失效。")
+        return
     data = q.data or ""
     action = data.split(":", 1)[1] if ":" in data else ""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -4392,8 +4528,9 @@ async def on_codex_del_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     if not await _callback_allowed(q):
         return
     await q.answer()
-    if _current_cpu_name() != "codex":
-        await q.edit_message_text("CPU 已切到 Claude, Codex 删除入口失效。")
+    cpu_name = _current_cpu_name()
+    if cpu_name != "codex":
+        await q.edit_message_text(f"CPU 已切到 {engine_label(cpu_name)}, Codex 删除入口失效。")
         return
     data = q.data or ""
     action_and_arg = data.split(":", 2)
@@ -4754,10 +4891,11 @@ _RESUME_CATEGORIES: list[tuple[str, str, list[str], bool]] = [
 
 
 def _resume_categories_for_current_cpu() -> list[tuple[str, str, list[str], bool]]:
-    if _current_cpu_name() != "codex":
+    cpu_name = _current_cpu_name()
+    if cpu_name not in {"codex", "grok"}:
         return _RESUME_CATEGORIES
     cat_id, _name, labels, scan_all = _RESUME_CATEGORIES[0]
-    return [(cat_id, "当前 Codex", labels, scan_all)]
+    return [(cat_id, f"当前 {engine_label(cpu_name)}", labels, scan_all)]
 
 
 def _render_resume_channel_picker() -> tuple[str, Any]:

@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import time
 from contextlib import suppress
@@ -25,6 +26,7 @@ from blocking_review import (
     run_blocking_review,
     unresolved_review_message,
 )
+from cli_runtime import resolve_cli_command
 from constants import HOOKS_DIR as _HOOKS_DIR
 from cc import CC, Event, Response, StreamCB, _record_session_metadata
 from memory_runtime import (
@@ -35,7 +37,6 @@ from memory_runtime import (
     memory_reflex_mode,
     render_babata_memory_context_event,
 )
-from skill_evolve_nudge import notify_skill_evolve_turn
 from turn_audit import begin_turn, finish_turn, summarize_tool_use
 
 log = logging.getLogger(__name__)
@@ -58,6 +59,20 @@ _CODEX_MEMORY_INJECTED_KEY = "codex_memory_injected_sids"
 # session.json is a resume picker/cache, not the raw transcript authority.
 _CODEX_STATE_TURN_LIMIT = 8
 _CODEX_STATE_TEXT_CHARS = 300
+_CODEX_IMAGE_INTENT_RE = re.compile(
+    r"(生图|出图|改图|修图|p图|真人版|写实化|"
+    r"生成.{0,16}(图|图片|照片|photo|image|picture)|"
+    r"画一张|做.{0,16}(图|图片|照片|真人|写实)|"
+    r"转成.{0,16}(图|图片|照片|真人|写实)|"
+    r"(generate|create|edit|transform).{0,48}(image|photo|picture))",
+    re.IGNORECASE,
+)
+_CODEX_NATIVE_IMAGE_POLICY = """Codex CPU image routing:
+- For image generation/editing/transformation requests, first use Codex's native image tool if an actual callable `image_gen` tool is exposed in this session.
+- Do not silently use shell scripts, `gen-image`, `scripts/image_gen.py`, OpenRouter/Gemini, `image2` endpoint chains, URL/API-key routes, or any other third-party image API as a substitute for native Codex image tools.
+- If no callable native image tool is exposed, or the native tool fails for technical/capability reasons, say that explicitly and ask the user before using any fallback, unless the user already explicitly asked for `gen-image`, `image2`, Gemini/OpenRouter, a custom endpoint, or a URL/API-key route.
+- If the native tool blocks for safety/policy, do not bypass the block through a fallback API."""
+_CODEX_GENERATED_IMAGE_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
 
 
 def _codex_stall_timeout() -> float:
@@ -137,11 +152,7 @@ def _split_error_result(
 
 
 def _codex_cli_path() -> str:
-    return (
-        os.environ.get("BABATA_CODEX_CLI_PATH")
-        or os.environ.get("CODEX_CLI_PATH")
-        or "codex"
-    )
+    return resolve_cli_command("codex", "BABATA_CODEX_CLI_PATH", "CODEX_CLI_PATH")
 
 
 def _codex_sandbox() -> str:
@@ -153,6 +164,80 @@ def _codex_sandbox() -> str:
         if os.environ.get("BABATA_FULL_TRUST") == "1"
         else "workspace-write"
     )
+
+
+def _codex_sandbox_permission_overrides() -> list[str]:
+    configured = os.environ.get("BABATA_CODEX_SANDBOX_PERMISSIONS")
+    if configured:
+        return ["-c", f"sandbox_permissions={configured}"]
+    raw = os.environ.get("BABATA_CODEX_DISK_READ_ACCESS", "1").strip().lower()
+    if raw in {"0", "false", "off", "no"}:
+        return []
+    # Codex skills live under CODEX_HOME, outside the workspace root. Headless
+    # workspace-write must still be able to read them for progressive disclosure.
+    return ["-c", 'sandbox_permissions=["disk-full-read-access"]']
+
+
+def _codex_code_mode_host_path() -> str | None:
+    configured = os.environ.get("CODEX_CODE_MODE_HOST_PATH")
+    if configured:
+        return configured
+
+    candidates: list[Path] = []
+    cli = _codex_cli_path()
+    resolved_cli = shutil.which(cli) if not Path(cli).is_absolute() else cli
+    if resolved_cli:
+        candidates.append(Path(resolved_cli).with_name("codex-code-mode-host"))
+    configured_cli = os.environ.get("CODEX_OFFICIAL_BIN")
+    if configured_cli:
+        candidates.append(Path(configured_cli).expanduser().with_name("codex-code-mode-host"))
+    candidates.extend([
+        Path("/Applications/Codex.app/Contents/Resources/codex-code-mode-host"),
+        Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        / "plugins/.plugin-appserver/codex-code-mode-host",
+    ])
+    discovered = shutil.which("codex-code-mode-host")
+    if discovered:
+        candidates.append(Path(discovered))
+    candidates.append(
+        Path("/Applications/ChatGPT.app/Contents/Resources/codex-code-mode-host")
+    )
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def _codex_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    if not env.get("CODEX_CODE_MODE_HOST_PATH"):
+        host_path = _codex_code_mode_host_path()
+        if host_path:
+            env["CODEX_CODE_MODE_HOST_PATH"] = host_path
+    return env
+
+
+def _codex_generated_images_root() -> Path:
+    configured = os.environ.get("BABATA_CODEX_GENERATED_IMAGES_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    return codex_home / "generated_images"
+
+
+def _codex_generated_images_for_session(sid: str | None) -> set[Path]:
+    if not sid:
+        return set()
+    session_dir = _codex_generated_images_root() / sid
+    try:
+        return {
+            path
+            for path in session_dir.rglob("*")
+            if path.is_file()
+            and path.suffix.lower() in _CODEX_GENERATED_IMAGE_SUFFIXES
+        }
+    except OSError:
+        return set()
 
 
 def _codex_cwd(source: str | None = None) -> str:
@@ -176,6 +261,10 @@ def _render_babata_memory_context_event(
         cwd=_codex_cwd(source_name),
         timeout=memory_inject_timeout("codex"),
     )
+
+
+def _is_codex_image_request(prompt: str) -> bool:
+    return bool(_CODEX_IMAGE_INTENT_RE.search(prompt or ""))
 
 
 def _toml_key(key: str) -> str:
@@ -518,6 +607,12 @@ class CodexEngine(CC):
         os.close(_last_fd)
         last_file = Path(_last_path)
         image_paths: list[Path] = []
+        image_turn = bool(images) or _is_codex_image_request(prompt)
+        generated_before = (
+            _codex_generated_images_for_session(self._session_id)
+            if image_turn
+            else set()
+        )
         try:
             for img in images or []:
                 image_paths.append(_decode_image_to_file(img, image_dir))
@@ -532,6 +627,22 @@ class CodexEngine(CC):
             if content and on_stream:
                 await on_stream(None, None, content, None)
             sid = result["sid"] or self._session_id or ""
+            generated_images = []
+            if image_turn and sid:
+                generated_images = sorted(
+                    _codex_generated_images_for_session(sid) - generated_before,
+                    key=lambda path: (path.stat().st_mtime_ns, path.name),
+                )
+            tools = list(result["tools"])
+            tool_uses = list(result.get("tool_uses", []))
+            if generated_images:
+                if "image_gen" not in tools:
+                    tools.append("image_gen")
+                tool_uses.append({
+                    "name": "image_gen",
+                    "native": True,
+                    "paths": [str(path) for path in generated_images],
+                })
             if sid:
                 old_sid = self._session_id
                 if sid != old_sid:
@@ -540,14 +651,6 @@ class CodexEngine(CC):
                 self._record_codex_turn(sid, prompt, content)
                 if memory_injected:
                     self._mark_codex_memory_injected(sid)
-                notify_skill_evolve_turn(
-                    session_id=sid,
-                    cpu="codex",
-                    source=self._memory_source,
-                    channel=self._channel_label(),
-                    state_file=self._state_file,
-                    metadata={"tools": result["tools"], "engine": "codex"},
-                )
             log_memory_reflex_post_answer(self._memory_reflex_event_id, content)
             self._memory_reflex_event_id = None
 
@@ -555,12 +658,13 @@ class CodexEngine(CC):
                 content=content,
                 session_id=sid,
                 cost=0.0,
-                tools=result["tools"],
-                audit={"tool_uses": result.get("tool_uses", [])},
-                model=os.environ.get("BABATA_CODEX_MODEL") or "codex",
+                tools=tools,
+                audit={"tool_uses": tool_uses},
+                model=os.environ.get("BABATA_CODEX_MODEL") or "gpt-5.6-sol",
                 input_tokens=result["usage"].get("input_tokens", 0),
                 output_tokens=result["usage"].get("output_tokens", 0),
                 cache_read_tokens=result["usage"].get("cached_input_tokens", 0),
+                generated_images=[str(path) for path in generated_images],
             )
         finally:
             with suppress(Exception):
@@ -577,16 +681,21 @@ class CodexEngine(CC):
         image_paths: list[Path],
         last_file: Path,
     ) -> tuple[list[str], str, bool]:
-        full_prompt, memory_injected = self._build_prompt_stdin(prompt)
+        full_prompt, memory_injected = self._build_prompt_stdin(
+            prompt,
+            has_images=bool(image_paths),
+        )
         base = [
             _codex_cli_path(),
             "-c", "notify=[]",
             "-c", 'approval_policy="never"',
+            "-c", "features.memories=false",
+            *_codex_sandbox_permission_overrides(),
             *_codex_mcp_overrides(self._mcp_servers),
         ]
-        model = os.environ.get("BABATA_CODEX_MODEL")
-        if model:
-            base.extend(["-m", model])
+        model = os.environ.get("BABATA_CODEX_MODEL") or "gpt-5.6-sol"
+        reasoning = os.environ.get("BABATA_CODEX_REASONING") or "medium"
+        base.extend(["-m", model, "-c", f'model_reasoning_effort="{reasoning}"'])
         if os.environ.get("BABATA_CODEX_SEARCH") == "1":
             base.append("--search")
         if os.environ.get("BABATA_CODEX_IGNORE_USER_CONFIG") == "1":
@@ -627,7 +736,12 @@ class CodexEngine(CC):
             memory_injected,
         )
 
-    def _build_prompt_stdin(self, prompt: str) -> tuple[str, bool]:
+    def _build_prompt_stdin(
+        self,
+        prompt: str,
+        *,
+        has_images: bool = False,
+    ) -> tuple[str, bool]:
         memory_context = ""
         source = self._memory_source
         if not self._memory_enabled:
@@ -646,13 +760,25 @@ class CodexEngine(CC):
                 cpu="codex",
                 cwd=_codex_cwd(source_name),
             )
-        full_prompt = self._build_full_prompt(prompt, memory_context)
+        full_prompt = self._build_full_prompt(
+            prompt,
+            memory_context,
+            has_images=has_images,
+        )
         return full_prompt, bool(memory_context)
 
-    def _build_full_prompt(self, prompt: str, memory_context: str) -> str:
+    def _build_full_prompt(
+        self,
+        prompt: str,
+        memory_context: str,
+        *,
+        has_images: bool = False,
+    ) -> str:
         parts = []
         if self._source_prompt:
             parts.append(self._source_prompt)
+        if has_images or _is_codex_image_request(prompt):
+            parts.append(_CODEX_NATIVE_IMAGE_POLICY)
         if memory_context:
             parts.append(memory_context)
         parts.append(prompt)
@@ -693,6 +819,7 @@ class CodexEngine(CC):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=_CODEX_STREAM_LIMIT,
+            env=_codex_subprocess_env(),
         )
         assert proc.stdout is not None
         assert proc.stderr is not None

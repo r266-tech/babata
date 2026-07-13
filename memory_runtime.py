@@ -19,13 +19,15 @@ _DEFAULT_MEMORY_REFLEX_LOG = Path.home() / "cc-workspace/state/memory-reflex/eve
 _MEMORY_INJECT_FLAGS = {
     "claude": "BABATA_CC_MEMORY_INJECT",
     "codex": "BABATA_CODEX_MEMORY_INJECT",
+    "grok": "BABATA_GROK_MEMORY_INJECT",
 }
 _MEMORY_INJECT_TIMEOUTS = {
     "claude": "BABATA_CC_MEMORY_INJECT_TIMEOUT",
     "codex": "BABATA_CODEX_MEMORY_INJECT_TIMEOUT",
+    "grok": "BABATA_GROK_MEMORY_INJECT_TIMEOUT",
 }
 _REFLEX_ROUTES = {"none", "lite", "brain", "wx", "code-grounded", "recent", "deep"}
-_REFLEX_PROFILES = {"lite", "recent", "deep"}
+_REFLEX_PROFILES = {"standing", "lite", "recent", "deep"}
 _REFLEX_FLAGS = {"bad_case", "reflection_candidate"}
 _REFLEX_VALUE_MAX_CHARS = 40
 
@@ -217,7 +219,7 @@ def log_memory_reflex_preflight_only(
         source=source,
         cpu=cpu,
         mode=memory_reflex_mode(),
-        actual_profile=os.environ.get("BABATA_MEMORY_PROFILE") or "lite",
+        actual_profile=os.environ.get("BABATA_MEMORY_PROFILE") or "standing",
         memory_injected=False,
     )
 
@@ -247,10 +249,10 @@ def log_memory_reflex_post_answer(event_id: str | None, content: str) -> None:
 def _memory_context_profile(reflex: dict[str, Any], mode: str) -> str:
     configured = os.environ.get("BABATA_MEMORY_PROFILE")
     if configured:
-        return _sanitize_reflex_token(configured, _REFLEX_PROFILES) or "lite"
+        return _sanitize_reflex_token(configured, _REFLEX_PROFILES) or "standing"
     if mode == "enforce":
-        return _sanitize_reflex_token(reflex.get("profile"), _REFLEX_PROFILES) or "lite"
-    return "lite"
+        return _sanitize_reflex_token(reflex.get("profile"), _REFLEX_PROFILES) or "standing"
+    return "standing"
 
 
 def _memory_inject_env(*, profile: str, cpu: str, source: str) -> dict[str, str]:

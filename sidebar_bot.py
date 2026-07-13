@@ -24,7 +24,6 @@ import logging
 import os
 import re
 import secrets
-import shutil
 import signal
 import sys
 import time
@@ -39,6 +38,7 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+from cli_runtime import cli_exists, env_cli_path, resolve_cli_command
 from constants import PROJECT, STATE_DIR
 from engine import (
     VENV_PYTHON,
@@ -490,22 +490,20 @@ def _engine_name_for(obj: Any, state_file: Path) -> str:
 
 
 def _cli_available(configured: str | None, fallback: str) -> bool:
-    raw = (configured or fallback).strip()
-    if not raw:
-        return False
-    if "/" in raw:
-        return Path(raw).expanduser().is_file()
-    return shutil.which(raw) is not None
+    return cli_exists(configured or fallback)
 
 
 def _engine_available(name: str) -> bool:
     normalized = normalize_engine(name)
     if normalized == "codex":
         return _cli_available(
-            os.environ.get("BABATA_CODEX_CLI_PATH") or os.environ.get("CODEX_CLI_PATH"),
+            resolve_cli_command("codex", "BABATA_CODEX_CLI_PATH", "CODEX_CLI_PATH"),
             "codex",
         )
-    return _cli_available(os.environ.get("CLAUDE_CLI_PATH"), "claude")
+    if normalized == "grok":
+        configured = resolve_cli_command("grok", "BABATA_GROK_CLI_PATH", "GROK_CLI_PATH")
+        return _cli_available(configured, "grok")
+    return _cli_available(env_cli_path("CLAUDE_CLI_PATH"), "claude")
 
 
 def _cpu_status_payload() -> dict[str, Any]:

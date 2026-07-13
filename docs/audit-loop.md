@@ -9,9 +9,9 @@ allowed to complete.
 
 1. Turn ledger
 
-   Every Claude/Codex turn records the CPU, channel, cwd, git baseline, prompt
-   preview, tools, changed files, deterministic guard findings, declared check
-   results, review tasks, and final preview.
+   Every Claude/Codex turn records the CPU, channel, cwd, git baseline,
+   prompt/final hashes and byte counts, tools, changed files, deterministic
+   guard findings, declared check results, and review tasks.
 
    Default path:
 
@@ -67,11 +67,13 @@ allowed to complete.
    completion until the next review pass succeeds or the configured repair round
    limit is reached.
 
-   The default reviewer is the counterpart CPU after deterministic local checks:
-   Codex-authored turns are reviewed by Claude Code through `cc-worker`, and
-   Claude-authored turns are reviewed by Codex through `codex exec` in read-only
-   mode. The original CPU still performs any repair in its own session; the
-   reviewer only returns a verdict and findings. babata sets
+   The default reviewer after deterministic local checks is an independent Codex
+   process using `gpt-5.6-sol` with `max` reasoning through `codex exec` in
+   read-only mode. This remains the default regardless of the authoring CPU while
+   Claude is unavailable; `BABATA_BLOCKING_REVIEW_CPU=claude` is an explicit
+   opt-in to the legacy `cc-worker` reviewer. The original CPU still performs any
+   repair in its own session; the reviewer only returns a verdict and findings.
+   babata sets
    `BABATA_BLOCKING_REVIEW=0` and increments `BABATA_BLOCKING_REVIEW_DEPTH` for
    reviewer child processes so review does not recursively call another review.
 
@@ -92,6 +94,11 @@ allowed to complete.
 
    Return `{"status":"passed"}` to allow completion.
 
+   The reviewer may receive the response draft as bounded input, but
+   `blocking-review.jsonl` records only the scrubbed result plus response
+   hash/byte metadata; echoed drafts are omitted before the result is returned or
+   persisted.
+
 5. Review bus
 
    The review bus is now optional audit plumbing, not the default review
@@ -110,6 +117,9 @@ allowed to complete.
 - `BABATA_BLOCKING_REVIEW=0` disables the blocking review gate.
 - `BABATA_BLOCKING_REVIEW_AGENT=deterministic` disables counterpart CPU review.
 - `BABATA_BLOCKING_REVIEW_COUNTERPART=0` also disables counterpart CPU review.
+- `BABATA_BLOCKING_REVIEW_CPU=codex|claude|counterpart` selects the review CPU;
+  default is `codex`, while `counterpart` explicitly restores opposite-CPU routing.
+  Unsupported values fail safely back to Codex instead of skipping model review.
 - `BABATA_BLOCKING_REVIEW_MAX_DEPTH=1` prevents nested counterpart review.
 - `BABATA_BLOCKING_REVIEW_CMD=<command>` runs a synchronous external reviewer.
 - `BABATA_BLOCKING_REVIEW_MAX_ROUNDS=2` bounds internal repair loops.

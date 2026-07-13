@@ -27,40 +27,51 @@ def test_memory_inject_enabled_is_owned_by_runtime(monkeypatch):
     for name in (
         "BABATA_CC_MEMORY_INJECT",
         "BABATA_CODEX_MEMORY_INJECT",
+        "BABATA_GROK_MEMORY_INJECT",
         "BABATA_CRON_AGENT",
     ):
         monkeypatch.delenv(name, raising=False)
 
     assert memory_runtime.memory_inject_enabled("claude") is True
     assert memory_runtime.memory_inject_enabled("codex") is True
+    assert memory_runtime.memory_inject_enabled("grok") is True
 
     monkeypatch.setenv("BABATA_CC_MEMORY_INJECT", "0")
     assert memory_runtime.memory_inject_enabled("claude") is False
     assert memory_runtime.memory_inject_enabled("codex") is True
+    assert memory_runtime.memory_inject_enabled("grok") is True
 
     monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "0")
     assert memory_runtime.memory_inject_enabled("codex") is False
 
+    monkeypatch.setenv("BABATA_GROK_MEMORY_INJECT", "0")
+    assert memory_runtime.memory_inject_enabled("grok") is False
+
     monkeypatch.setenv("BABATA_CRON_AGENT", "1")
     assert memory_runtime.memory_inject_enabled("claude") is False
     assert memory_runtime.memory_inject_enabled("codex") is False
+    assert memory_runtime.memory_inject_enabled("grok") is False
 
 
 def test_memory_inject_timeout_is_owned_by_runtime(monkeypatch):
     for name in (
         "BABATA_CC_MEMORY_INJECT_TIMEOUT",
         "BABATA_CODEX_MEMORY_INJECT_TIMEOUT",
+        "BABATA_GROK_MEMORY_INJECT_TIMEOUT",
     ):
         monkeypatch.delenv(name, raising=False)
 
     assert memory_runtime.memory_inject_timeout("claude") == 5.0
     assert memory_runtime.memory_inject_timeout("codex") == 5.0
+    assert memory_runtime.memory_inject_timeout("grok") == 5.0
 
     monkeypatch.setenv("BABATA_CC_MEMORY_INJECT_TIMEOUT", "2.5")
     monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT_TIMEOUT", "0")
+    monkeypatch.setenv("BABATA_GROK_MEMORY_INJECT_TIMEOUT", "3.5")
 
     assert memory_runtime.memory_inject_timeout("claude") == 2.5
     assert memory_runtime.memory_inject_timeout("codex") == 0.1
+    assert memory_runtime.memory_inject_timeout("grok") == 3.5
 
     monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT_TIMEOUT", "bad")
     assert memory_runtime.memory_inject_timeout("codex") == 5.0
@@ -79,6 +90,7 @@ def test_memory_reflex_is_opt_in(monkeypatch):
 
 
 def test_render_memory_context_event_injects_without_default_reflex(monkeypatch, tmp_path):
+    inject_log = tmp_path / "inject-env.json"
     inject_script = tmp_path / "inject.sh"
     reflex_script = tmp_path / "reflex.py"
     reflex_log = tmp_path / "events.jsonl"
@@ -86,8 +98,13 @@ def test_render_memory_context_event_injects_without_default_reflex(monkeypatch,
     _write_executable(
         inject_script,
         "\n".join([
-            "#!/bin/sh",
-            "printf '%s\\n' '<memory-context>lite</memory-context>'",
+            "#!/usr/bin/env python3",
+            "import json, os",
+            f"open({str(inject_log)!r}, 'w').write(json.dumps({{",
+            "    'profile': os.environ.get('BABATA_MEMORY_PROFILE'),",
+            "    'include_top': os.environ.get('BABATA_MEMORY_INCLUDE_TOP'),",
+            "}, sort_keys=True))",
+            "print('<memory-context>standing</memory-context>')",
         ]),
     )
     _write_executable(
@@ -112,7 +129,8 @@ def test_render_memory_context_event_injects_without_default_reflex(monkeypatch,
         timeout=float(_TEST_REFLEX_TIMEOUT_S),
     )
 
-    assert context == "<memory-context>lite</memory-context>"
+    assert context == "<memory-context>standing</memory-context>"
+    assert json.loads(inject_log.read_text()) == {"include_top": "skip", "profile": "standing"}
     assert event_id is None
     assert not reflex_log.exists()
 
@@ -317,7 +335,7 @@ def test_log_memory_reflex_preflight_only_records_router_without_inject(monkeypa
     events = [json.loads(line) for line in reflex_log.read_text().splitlines()]
     assert events == [
         {
-            "actual_profile": "lite",
+            "actual_profile": "standing",
             "event": "preflight",
             "id": event_id,
             "memory_injected": False,

@@ -7,6 +7,7 @@ conversation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from cli_runtime import env_cli_path
 from constants import NAMESPACE, STATE_DIR
 
 
@@ -50,6 +52,7 @@ _MAX_REPAIR_PROMPT = 6000
 _MAX_REVIEW_CONTEXT = 24000
 _MAX_REVIEW_PROMPT = 32000
 _MAX_RAW_OUTPUT = 4000
+_MIN_RESPONSE_SCRUB_CHARS = 32
 _REVIEW_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -97,19 +100,25 @@ def run_blocking_review(
     if not _needs_review(audit_summary):
         return _result("skipped", reason="no code-changing turn", round_index=round_index)
 
+    response_preview = _trim(response_content, 2000)
     payload = {
         "schema": "babata.blocking_review_payload.v1",
         "cpu": cpu,
         "channel": channel,
         "round_index": round_index,
         "audit": audit_summary or {},
-        "response_preview": _trim(response_content, 2000),
+        "response_preview": response_preview,
     }
     command = os.environ.get("BABATA_BLOCKING_REVIEW_CMD")
     if command:
         result = _run_review_command(command, payload, round_index)
     else:
         result = _review_without_command(payload, round_index)
+    result = _scrub_response_from_review_result(
+        result,
+        response_content=response_content,
+        response_preview=response_preview,
+    )
     _record_review_result(result)
     return result
 
@@ -239,16 +248,21 @@ def _max_review_depth() -> int:
 
 def _run_counterpart_review(payload: dict[str, Any], round_index: int) -> dict[str, Any]:
     source_cpu = str(payload.get("cpu") or "").lower()
-    if source_cpu == "codex":
+    review_cpu = os.environ.get("BABATA_BLOCKING_REVIEW_CPU", "codex").strip().lower()
+    if review_cpu in {"claude", "cc", "claude-code"}:
         return _run_claude_counterpart_review(payload, round_index)
-    if source_cpu == "claude":
+    if review_cpu in {"codex", ""}:
         return _run_codex_counterpart_review(payload, round_index)
-    return _result(
-        "passed",
-        reviewer="deterministic",
-        reason=f"no counterpart reviewer for cpu={source_cpu or '<unknown>'}",
-        round_index=round_index,
-    )
+    # Explicit compatibility mode for the historical opposite-CPU policy.
+    # It is never the default while Claude is unavailable.
+    if review_cpu in {"counterpart", "opposite"}:
+        if source_cpu == "codex":
+            return _run_claude_counterpart_review(payload, round_index)
+        if source_cpu == "claude":
+            return _run_codex_counterpart_review(payload, round_index)
+    # A typo or stale value must not silently disable the model review gate.
+    # Codex is the safe current default while Claude is unavailable.
+    return _run_codex_counterpart_review(payload, round_index)
 
 
 def _run_claude_counterpart_review(payload: dict[str, Any], round_index: int) -> dict[str, Any]:
@@ -310,7 +324,6 @@ def _run_claude_counterpart_review(payload: dict[str, Any], round_index: int) ->
     result["round_index"] = round_index
     result["duration_ms"] = round((time.time() - started) * 1000)
     result["exit_code"] = proc.returncode
-    result["raw_output"] = _trim(text or raw, _MAX_RAW_OUTPUT)
     if proc.returncode != 0 or nested_exit_code not in (None, 0) or nested_timed_out:
         if _looks_like_counterpart_infra_failure(raw or text):
             message = _counterpart_infra_failure_message(
@@ -324,7 +337,6 @@ def _run_claude_counterpart_review(payload: dict[str, Any], round_index: int) ->
             )
             result["duration_ms"] = round((time.time() - started) * 1000)
             result["exit_code"] = proc.returncode
-            result["raw_output"] = _trim(text or raw, _MAX_RAW_OUTPUT)
             return result
         _force_review_failure(
             result,
@@ -366,9 +378,14 @@ def _run_codex_counterpart_review(payload: dict[str, Any], round_index: int) -> 
             "--output-last-message",
             str(output_path),
         ]
-        model = os.environ.get("BABATA_CODEX_REVIEW_MODEL")
-        if model:
-            args.extend(["--model", model])
+        model = os.environ.get("BABATA_CODEX_REVIEW_MODEL") or "gpt-5.6-sol"
+        reasoning = os.environ.get("BABATA_CODEX_REVIEW_REASONING") or "max"
+        args.extend([
+            "--model",
+            model,
+            "-c",
+            f'model_reasoning_effort="{reasoning}"',
+        ])
         args.append("-")
         try:
             proc = subprocess.run(
@@ -390,7 +407,6 @@ def _run_codex_counterpart_review(payload: dict[str, Any], round_index: int) -> 
     result["round_index"] = round_index
     result["duration_ms"] = round((time.time() - started) * 1000)
     result["exit_code"] = proc.returncode
-    result["raw_output"] = _trim(output_text or raw, _MAX_RAW_OUTPUT)
     if proc.returncode != 0:
         if _looks_like_counterpart_infra_failure(raw):
             message = _counterpart_infra_failure_message(
@@ -404,7 +420,6 @@ def _run_codex_counterpart_review(payload: dict[str, Any], round_index: int) -> 
             )
             result["duration_ms"] = round((time.time() - started) * 1000)
             result["exit_code"] = proc.returncode
-            result["raw_output"] = _trim(output_text or raw, _MAX_RAW_OUTPUT)
             return result
         _force_review_failure(
             result,
@@ -509,7 +524,6 @@ def _normalize_review_result(data: dict[str, Any], raw: str) -> dict[str, Any]:
         "status": status,
         "findings": findings if isinstance(findings, list) else [],
         "message": data.get("message"),
-        "raw_output": _trim(raw, _MAX_RAW_OUTPUT),
     }
 
 
@@ -532,6 +546,59 @@ def _result(
         "round_index": round_index,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+
+
+def _scrub_response_from_review_result(
+    result: dict[str, Any],
+    *,
+    response_content: str,
+    response_preview: str,
+) -> dict[str, Any]:
+    marker = _response_marker(response_content)
+    needles = _response_scrub_needles(response_content, response_preview)
+    scrubbed = _scrub_value(result, needles, marker)
+    if not isinstance(scrubbed, dict):
+        scrubbed = dict(result)
+    scrubbed["response_sha256"] = _sha256_text(response_content)
+    scrubbed["response_bytes"] = _text_bytes(response_content)
+    return scrubbed
+
+
+def _response_scrub_needles(response_content: str, response_preview: str) -> list[str]:
+    needles: list[str] = []
+    for value in (response_content, response_preview):
+        if len(value) < _MIN_RESPONSE_SCRUB_CHARS:
+            continue
+        if value not in needles:
+            needles.append(value)
+    return needles
+
+
+def _scrub_value(value: Any, needles: list[str], marker: str) -> Any:
+    if isinstance(value, str):
+        for needle in needles:
+            value = value.replace(needle, marker)
+        return value
+    if isinstance(value, list):
+        return [_scrub_value(item, needles, marker) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _scrub_value(item, needles, marker)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _response_marker(response_content: str) -> str:
+    return f"[response draft omitted sha256={_sha256_text(response_content)}]"
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _text_bytes(text: str) -> int:
+    return len(text.encode("utf-8", errors="replace"))
 
 
 def _build_counterpart_review_prompt(payload: dict[str, Any], *, reviewer: str) -> str:
@@ -684,7 +751,11 @@ def _cc_worker_cli() -> Path | None:
 
 
 def _codex_cli() -> Path | None:
-    configured = os.environ.get("BABATA_CODEX_REVIEW_CLI") or os.environ.get("BABATA_CODEX_CLI_PATH") or os.environ.get("CODEX_CLI_PATH")
+    configured = env_cli_path(
+        "BABATA_CODEX_REVIEW_CLI",
+        "BABATA_CODEX_CLI_PATH",
+        "CODEX_CLI_PATH",
+    )
     if configured:
         path = Path(configured).expanduser()
         return path if path.exists() and os.access(path, os.X_OK) else None

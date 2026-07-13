@@ -131,6 +131,7 @@ class FakeBot:
         self.reactions: list[tuple[int, int, str]] = []
         self.commands: list[tuple[str, str]] = []
         self.sent_messages: list[dict] = []
+        self.sent_documents: list[dict] = []
         self.chat_actions: list[tuple[int, str]] = []
 
     async def set_message_reaction(self, *, chat_id, message_id, reaction):
@@ -145,6 +146,13 @@ class FakeBot:
     async def send_message(self, **kwargs):
         self.sent_messages.append(kwargs)
         return FakeSentMessage(kwargs["text"])
+
+    async def send_document(self, **kwargs):
+        recorded = dict(kwargs)
+        recorded["document_bytes"] = kwargs["document"].read()
+        recorded.pop("document", None)
+        self.sent_documents.append(recorded)
+        return FakeSentMessage(kwargs.get("filename") or "document")
 
 
 class FakeCtx:
@@ -401,6 +409,7 @@ def test_bot_channel_does_not_reach_into_engine_private_session_state():
 def test_bot_commands_are_filtered_by_cpu():
     claude = [name for name, _ in bot._bot_commands_for_cpu("claude")]
     codex = [name for name, _ in bot._bot_commands_for_cpu("codex")]
+    grok = [name for name, _ in bot._bot_commands_for_cpu("grok")]
 
     assert "context" in claude
     assert "stop" in claude
@@ -409,6 +418,10 @@ def test_bot_commands_are_filtered_by_cpu():
     assert "stop" in codex
     assert "provider" in codex
     assert {"new", "resume", "status", "verbose", "cpu", "stop", "restart", "provider"} <= set(codex)
+    assert "context" not in grok
+    assert "stop" in grok
+    assert "provider" not in grok
+    assert {"new", "resume", "status", "verbose", "cpu", "stop", "restart"} <= set(grok)
 
 
 def test_codex_rejects_context_supports_stop_and_shows_provider(monkeypatch, tmp_path):
@@ -468,6 +481,46 @@ def test_codex_rejects_provider_callback(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
+def test_grok_rejects_provider_command(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        monkeypatch.setattr(bot, "ALLOWED_USER", 7)
+        monkeypatch.setattr(bot, "cc", FakeCpuSession("grok"))
+
+        msg = FakeMessage(12, "/provider")
+        await bot.cmd_provider(FakeUpdate(msg, FakeChat(), user_id=7), FakeCtx())
+
+        assert "Grok" in msg.replies[-1].text
+        assert "不支持" in msg.replies[-1].text
+
+    asyncio.run(run())
+
+
+def test_cpu_callback_can_switch_to_grok(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        monkeypatch.setattr(bot, "ALLOWED_USER", 7)
+        monkeypatch.setattr(bot, "cc", FakeCpuSession("claude"))
+
+        async def switch_cpu(target):
+            assert target == "grok"
+            return "CPU: Claude Code → Grok"
+
+        async def sync_commands(_bot):
+            return None
+
+        monkeypatch.setattr(bot, "_switch_cpu", switch_cpu)
+        monkeypatch.setattr(bot, "_sync_bot_commands", sync_commands)
+        query = FakeCallbackQuery(user_id=7, data="cpu:grok")
+
+        await bot.on_cpu_click(FakeCallbackUpdate(query), FakeCtx())
+
+        assert query.answers == [(None, {})]
+        assert query.edits[-1][0] == "CPU: Claude Code → Grok"
+
+    asyncio.run(run())
+
+
 def test_codex_resume_picker_only_shows_current_channel(monkeypatch, tmp_path):
     reset_bot_globals(monkeypatch, tmp_path)
     monkeypatch.setattr(bot, "cc", FakeCpuSession("codex", sid="sid-12345678"))
@@ -478,6 +531,19 @@ def test_codex_resume_picker_only_shows_current_channel(monkeypatch, tmp_path):
     assert len(buttons) == 1
     button = buttons[0][0]
     assert button[0][0] == "当前 Codex"
+    assert button[1]["callback_data"] == "resume-ch:tg"
+
+
+def test_grok_resume_picker_only_shows_current_channel(monkeypatch, tmp_path):
+    reset_bot_globals(monkeypatch, tmp_path)
+    monkeypatch.setattr(bot, "cc", FakeCpuSession("grok", sid="sid-12345678"))
+
+    _header, markup = bot._render_resume_channel_picker()
+
+    buttons = markup[0][0]
+    assert len(buttons) == 1
+    button = buttons[0][0]
+    assert button[0][0] == "当前 Grok"
     assert button[1]["callback_data"] == "resume-ch:tg"
 
 
@@ -572,6 +638,53 @@ def test_codex_status_reads_session_usage(monkeypatch, tmp_path):
         assert "plan prolite" in text
         assert "Codex v0.128.0" in text
         assert "current <code>gpt-5.5</code> · effort <code>xhigh</code>" not in text
+
+    asyncio.run(run())
+
+
+def test_grok_status_new_session_ignores_stale_last_model(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        monkeypatch.setattr(bot, "ALLOWED_USER", 7)
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({"recent_sids": ["old-sid"]}))
+        monkeypatch.setattr(bot, "cc", FakeCpuSession("grok", state_file, None))
+        monkeypatch.setattr(bot, "_last_model", "grok-composer-2.5-fast")
+        monkeypatch.setattr(bot, "_grok_model_label", lambda: "grok-default")
+        monkeypatch.setattr(bot, "_grok_version", lambda: "0.2.93")
+
+        msg = FakeMessage(13, "/status")
+        await bot.cmd_status(FakeUpdate(msg, FakeChat(), user_id=7), FakeCtx())
+
+        text = msg.replies[-1].text
+        assert "grok-default" in text
+        assert "grok-composer-2.5-fast" not in text
+        assert "<code>(new)</code>" in text
+
+    asyncio.run(run())
+
+
+def test_grok_status_reads_current_session_model(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(bot, "ALLOWED_USER", 7)
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({"recent_sids": ["sid-1"]}))
+        monkeypatch.setattr(bot, "cc", FakeCpuSession("grok", state_file, "sid-1"))
+        monkeypatch.setattr(bot, "_last_model", "grok-composer-2.5-fast")
+        monkeypatch.setattr(bot, "_grok_version", lambda: "0.2.93")
+        session_dir = bot._grok_session_dir("sid-1")
+        session_dir.mkdir(parents=True)
+        (session_dir / "summary.json").write_text(json.dumps({"current_model_id": "grok-4.5"}))
+
+        msg = FakeMessage(13, "/status")
+        await bot.cmd_status(FakeUpdate(msg, FakeChat(), user_id=7), FakeCtx())
+
+        text = msg.replies[-1].text
+        assert "grok-4.5" in text
+        assert "grok-composer-2.5-fast" not in text
+        assert "<code>sid-1</code>" in text
 
     asyncio.run(run())
 
@@ -1608,6 +1721,75 @@ def test_turn_end_delivery_failure_does_not_mark_processed(monkeypatch, tmp_path
         await wait_for(lambda: (42, 7, "💔") in ctx.bot.reactions)
 
         await worker.stop()
+
+    asyncio.run(run())
+
+
+def test_native_generated_image_is_delivered_without_no_response(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        generated = tmp_path / "native.png"
+        generated.write_bytes(b"native-image")
+        ctx = FakeCtx()
+        chat = FakeChat(chat_id=42)
+        msg = FakeMessage(7, "generate")
+        payload = bot.Payload(
+            update=FakeUpdate(msg, chat),
+            ctx=ctx,
+            text="generate",
+        )
+        worker = bot.ChannelWorker(FakeSession(), instance_label="test")
+
+        ok = await worker._deliver_response(
+            payload,
+            Response(
+                content="",
+                session_id="sid-image",
+                cost=0.0,
+                generated_images=[str(generated)],
+            ),
+        )
+
+        assert ok is True
+        assert len(ctx.bot.sent_documents) == 1
+        assert ctx.bot.sent_documents[0]["filename"] == "native.png"
+        assert ctx.bot.sent_documents[0]["document_bytes"] == b"native-image"
+        assert ctx.bot.sent_documents[0]["reply_to_message_id"] == 7
+        assert ctx.bot.sent_messages == []
+        assert msg.replies == []
+
+    asyncio.run(run())
+
+
+def test_pending_delivery_preserves_generated_image_paths(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        ctx = FakeCtx()
+        chat = FakeChat(chat_id=42)
+        msg = FakeMessage(7, "generate")
+        payload = bot.Payload(
+            update=FakeUpdate(msg, chat),
+            ctx=ctx,
+            text="generate",
+            update_id=501,
+        )
+
+        delivery_id = await bot._record_pending_delivery(
+            payload=payload,
+            resp=Response(
+                content="",
+                session_id="sid-image",
+                cost=0.0,
+                generated_images=["/tmp/native.png"],
+            ),
+            update_ids=[501],
+        )
+
+        assert delivery_id == "501"
+        raw = bot._pending_delivery_records["501"]
+        assert raw["generated_images"] == ["/tmp/native.png"]
+        parsed = bot._parse_pending_delivery_record(raw)
+        assert parsed.generated_images == ("/tmp/native.png",)
 
     asyncio.run(run())
 

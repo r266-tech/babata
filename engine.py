@@ -9,6 +9,7 @@ from typing import Any
 
 from cc import CC, LiveSession, VENV_PYTHON as VENV_PYTHON
 from codex_engine import CodexEngine, CodexLiveSession
+from grok_engine import GrokEngine, GrokLiveSession
 
 ENGINE_STATE_KEY = "assistant_engine"
 ENGINE_SESSION_IDS_KEY = "engine_session_ids"
@@ -19,11 +20,14 @@ _ALIASES = {
     "claude-code": "claude",
     "codex": "codex",
     "openai-codex": "codex",
+    "grok": "grok",
+    "xai": "grok",
+    "grok-build": "grok",
 }
 
 
 def normalize_engine(raw: str | None) -> str:
-    name = (raw or "claude").strip().lower()
+    name = (raw or "codex").strip().lower()
     normalized = _ALIASES.get(name)
     if not normalized:
         raise ValueError(f"unsupported assistant engine: {raw!r}")
@@ -32,11 +36,15 @@ def normalize_engine(raw: str | None) -> str:
 
 def engine_label(name: str) -> str:
     normalized = normalize_engine(name)
-    return "Claude Code" if normalized == "claude" else "Codex"
+    return {
+        "claude": "Claude Code",
+        "codex": "Codex",
+        "grok": "Grok",
+    }[normalized]
 
 
 def engine_choices() -> list[tuple[str, str]]:
-    return [("Claude Code", "claude"), ("Codex", "codex")]
+    return [("Claude Code", "claude"), ("Codex", "codex"), ("Grok", "grok")]
 
 
 def _load_state(path: Path | None) -> dict[str, Any]:
@@ -57,7 +65,7 @@ def engine_name(state_file: Path | None = None, *, override: str | None = None) 
         with_state = _ALIASES.get(configured.strip().lower())
         if with_state:
             return with_state
-    raw = os.environ.get("BABATA_ENGINE") or os.environ.get("ASSISTANT_ENGINE") or "claude"
+    raw = os.environ.get("BABATA_ENGINE") or os.environ.get("ASSISTANT_ENGINE") or "codex"
     return normalize_engine(raw)
 
 
@@ -91,7 +99,7 @@ def make_engine(
     model: str | None = None,
     memory_source: str | None = None,
     memory_enabled: bool = True,
-) -> CC | LiveSession | CodexEngine | CodexLiveSession:
+) -> CC | LiveSession | CodexEngine | CodexLiveSession | GrokEngine | GrokLiveSession:
     name = engine_name(state_file, override=engine)
     if name == "claude":
         cls = LiveSession if live else CC
@@ -105,6 +113,15 @@ def make_engine(
         )
     elif name == "codex":
         cls = CodexLiveSession if live else CodexEngine
+        obj = cls(
+            state_file=state_file,
+            source_prompt=source_prompt,
+            mcp_servers=mcp_servers,
+            memory_source=memory_source,
+            memory_enabled=memory_enabled,
+        )
+    elif name == "grok":
+        cls = GrokLiveSession if live else GrokEngine
         obj = cls(
             state_file=state_file,
             source_prompt=source_prompt,

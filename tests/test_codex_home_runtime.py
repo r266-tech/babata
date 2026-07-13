@@ -23,7 +23,9 @@ def test_materialize_copies_required_and_optional_files_with_safe_modes(tmp_path
 
     assert synced == ["auth.json", "config.toml", "provider-slots.json"]
     assert (headless_home / "auth.json").read_text() == '{"token":"secret"}'
-    assert (headless_home / "config.toml").read_text() == 'model = "gpt-5.5"\n'
+    assert (headless_home / "config.toml").read_text() == (
+        'model = "gpt-5.5"\n\n[features]\nmemories = false\n'
+    )
     assert _mode(headless_home) == 0o700
     assert _mode(headless_home / "auth.json") == 0o600
     assert _mode(headless_home / "config.toml") == 0o644
@@ -36,6 +38,23 @@ def test_materialize_copies_required_and_optional_files_with_safe_modes(tmp_path
 
 def test_materialize_does_not_copy_desktop_prompt_adapter():
     assert "AGENTS.md" not in codex_home_runtime.OPTIONAL_FILES
+
+
+def test_materialize_disables_existing_desktop_memories_feature(tmp_path):
+    desktop_home = tmp_path / "desktop"
+    headless_home = tmp_path / "headless"
+    desktop_home.mkdir()
+    (desktop_home / "auth.json").write_text("{}")
+    (desktop_home / "config.toml").write_text(
+        'model = "gpt-5.5"\n\n[features]\nhooks = true\nmemories = true\nchronicle = true\n',
+        encoding="utf-8",
+    )
+
+    codex_home_runtime.materialize(headless_home, desktop_home)
+
+    assert (headless_home / "config.toml").read_text(encoding="utf-8") == (
+        'model = "gpt-5.5"\n\n[features]\nhooks = true\nmemories = false\nchronicle = true\n'
+    )
 
 
 def test_materialize_fails_when_required_file_is_missing(tmp_path):

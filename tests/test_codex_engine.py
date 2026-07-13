@@ -350,6 +350,7 @@ def test_codex_engine_uses_explicit_memory_source(monkeypatch, tmp_path):
 def test_codex_build_command_preserves_new_and_resume_cli_flags(monkeypatch, tmp_path):
     monkeypatch.setenv("BABATA_CODEX_CLI_PATH", "codex-bin")
     monkeypatch.setenv("BABATA_CODEX_MODEL", "codex-test")
+    monkeypatch.setenv("BABATA_CODEX_REASONING", "medium")
     monkeypatch.setenv("BABATA_CODEX_IGNORE_USER_CONFIG", "1")
     monkeypatch.setenv("BABATA_CODEX_SEARCH", "1")
     monkeypatch.setenv("BABATA_CODEX_SANDBOX", "read-only")
@@ -370,13 +371,20 @@ def test_codex_build_command_preserves_new_and_resume_cli_flags(monkeypatch, tmp
         "codex-bin",
         "-c", "notify=[]",
         "-c", 'approval_policy="never"',
+        "-c", "features.memories=false",
+        "-c", 'sandbox_permissions=["disk-full-read-access"]',
         "-m", "codex-test",
+        "-c", 'model_reasoning_effort="medium"',
         "--search",
     ]
 
     cmd, prompt_stdin, memory_injected = session._build_command("hello", [image], last_file)
 
-    assert prompt_stdin == "Source: test.\n\nhello"
+    assert prompt_stdin == (
+        "Source: test.\n\n"
+        f"{codex_engine._CODEX_NATIVE_IMAGE_POLICY}\n\n"
+        "hello"
+    )
     assert memory_injected is False
     assert cmd == [
         *common,
@@ -394,7 +402,11 @@ def test_codex_build_command_preserves_new_and_resume_cli_flags(monkeypatch, tmp
     session._session_id = "sid-123"
     resume_cmd, resume_prompt, resume_injected = session._build_command("again", [image], last_file)
 
-    assert resume_prompt == "Source: test.\n\nagain"
+    assert resume_prompt == (
+        "Source: test.\n\n"
+        f"{codex_engine._CODEX_NATIVE_IMAGE_POLICY}\n\n"
+        "again"
+    )
     assert resume_injected is False
     assert resume_cmd == [
         *common,
@@ -408,6 +420,163 @@ def test_codex_build_command_preserves_new_and_resume_cli_flags(monkeypatch, tmp
         "sid-123",
         "-",
     ]
+
+
+def test_codex_image_request_injects_native_first_policy(monkeypatch, tmp_path):
+    monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "0")
+    monkeypatch.setattr(
+        codex_engine,
+        "log_memory_reflex_preflight_only",
+        lambda **_kwargs: "event-1",
+    )
+    session = codex_engine.CodexEngine(
+        state_file=tmp_path / "session.json",
+        source_prompt="Source: test.",
+    )
+
+    _cmd, prompt_stdin, _memory_injected = session._build_command(
+        "生成一张真人版图片给我",
+        [],
+        tmp_path / "last.txt",
+    )
+
+    assert codex_engine._CODEX_NATIVE_IMAGE_POLICY in prompt_stdin
+    assert "Do not silently use shell scripts" in prompt_stdin
+    assert prompt_stdin.endswith("生成一张真人版图片给我")
+
+
+def test_codex_reference_image_injects_native_first_policy(monkeypatch, tmp_path):
+    monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "0")
+    monkeypatch.setattr(
+        codex_engine,
+        "log_memory_reflex_preflight_only",
+        lambda **_kwargs: "event-1",
+    )
+    session = codex_engine.CodexEngine(
+        state_file=tmp_path / "session.json",
+        source_prompt="Source: test.",
+    )
+
+    _cmd, prompt_stdin, _memory_injected = session._build_command(
+        "把他变年轻一点",
+        [tmp_path / "reference.png"],
+        tmp_path / "last.txt",
+    )
+
+    assert codex_engine._CODEX_NATIVE_IMAGE_POLICY in prompt_stdin
+
+
+def test_codex_non_image_request_does_not_inject_image_policy(monkeypatch, tmp_path):
+    monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "0")
+    monkeypatch.setattr(
+        codex_engine,
+        "log_memory_reflex_preflight_only",
+        lambda **_kwargs: "event-1",
+    )
+    session = codex_engine.CodexEngine(
+        state_file=tmp_path / "session.json",
+        source_prompt="Source: test.",
+    )
+
+    _cmd, prompt_stdin, _memory_injected = session._build_command(
+        "解释这个函数",
+        [],
+        tmp_path / "last.txt",
+    )
+
+    assert codex_engine._CODEX_NATIVE_IMAGE_POLICY not in prompt_stdin
+    assert prompt_stdin == "Source: test.\n\n解释这个函数"
+
+
+def test_codex_disk_read_access_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("BABATA_CODEX_DISK_READ_ACCESS", "0")
+
+    assert codex_engine._codex_sandbox_permission_overrides() == []
+
+
+def test_codex_sandbox_permissions_can_be_configured(monkeypatch):
+    monkeypatch.setenv(
+        "BABATA_CODEX_SANDBOX_PERMISSIONS",
+        '["disk-full-read-access", "network-full-access"]',
+    )
+
+    assert codex_engine._codex_sandbox_permission_overrides() == [
+        "-c",
+        'sandbox_permissions=["disk-full-read-access", "network-full-access"]',
+    ]
+
+
+def test_codex_code_mode_host_prefers_cli_sibling(monkeypatch, tmp_path):
+    monkeypatch.delenv("CODEX_CODE_MODE_HOST_PATH", raising=False)
+    monkeypatch.delenv("CODEX_OFFICIAL_BIN", raising=False)
+    cli = tmp_path / "codex"
+    host = tmp_path / "codex-code-mode-host"
+    cli.write_text("")
+    host.write_text("")
+    cli.chmod(0o755)
+    host.chmod(0o755)
+    monkeypatch.setattr(codex_engine, "_codex_cli_path", lambda: str(cli))
+
+    assert codex_engine._codex_code_mode_host_path() == str(host)
+
+
+def test_codex_subprocess_env_injects_code_mode_host(monkeypatch):
+    monkeypatch.delenv("CODEX_CODE_MODE_HOST_PATH", raising=False)
+    monkeypatch.setattr(
+        codex_engine,
+        "_codex_code_mode_host_path",
+        lambda: "/native/codex-code-mode-host",
+    )
+
+    env = codex_engine._codex_subprocess_env()
+
+    assert env["CODEX_CODE_MODE_HOST_PATH"] == "/native/codex-code-mode-host"
+
+
+def test_codex_run_reports_new_native_generated_images(monkeypatch, tmp_path):
+    async def run():
+        codex_home = tmp_path / "codex-home"
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        session = codex_engine.CodexEngine(
+            state_file=tmp_path / "session.json",
+            source_prompt="Source: test.",
+            memory_enabled=False,
+        )
+        monkeypatch.setattr(session, "_fire_hook", lambda *_args: None)
+
+        generated = (
+            codex_home
+            / "generated_images"
+            / "sid-image"
+            / "exec-native.png"
+        )
+
+        async def fake_run_command(_cmd, _prompt_stdin, _on_stream):
+            generated.parent.mkdir(parents=True)
+            generated.write_bytes(b"native-image")
+            return {
+                "sid": "sid-image",
+                "content": "",
+                "tools": [],
+                "tool_uses": [],
+                "usage": {},
+            }
+
+        monkeypatch.setattr(session, "_run_command", fake_run_command)
+
+        resp = await session._run_codex("生成一张图片", None, None)
+
+        assert resp.generated_images == [str(generated)]
+        assert resp.tools == ["image_gen"]
+        assert resp.audit == {
+            "tool_uses": [{
+                "name": "image_gen",
+                "native": True,
+                "paths": [str(generated)],
+            }],
+        }
+
+    asyncio.run(run())
 
 
 def test_codex_engine_streams_tool_results(monkeypatch, tmp_path):
@@ -689,6 +858,44 @@ def test_make_engine_selects_codex(monkeypatch, tmp_path):
         live=True,
     )
     assert isinstance(made, codex_engine.CodexLiveSession)
+
+
+def test_make_engine_defaults_to_codex(monkeypatch, tmp_path):
+    monkeypatch.delenv("BABATA_ENGINE", raising=False)
+    monkeypatch.delenv("ASSISTANT_ENGINE", raising=False)
+
+    made = engine.make_engine(
+        state_file=tmp_path / "session.json",
+        source_prompt="Source: test.",
+        live=True,
+    )
+
+    assert engine.normalize_engine(None) == "codex"
+    assert isinstance(made, codex_engine.CodexLiveSession)
+
+
+def test_codex_build_command_defaults_to_56_sol_medium(monkeypatch, tmp_path):
+    monkeypatch.delenv("BABATA_CODEX_MODEL", raising=False)
+    monkeypatch.delenv("BABATA_CODEX_REASONING", raising=False)
+    monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "0")
+    monkeypatch.setattr(
+        codex_engine,
+        "log_memory_reflex_preflight_only",
+        lambda **_kwargs: "event-1",
+    )
+    session = codex_engine.CodexEngine(
+        state_file=tmp_path / "session.json",
+        source_prompt="Source: test.",
+    )
+
+    cmd, _prompt_stdin, _memory_injected = session._build_command(
+        "hello",
+        [],
+        tmp_path / "last.txt",
+    )
+
+    assert cmd[cmd.index("-m") + 1] == "gpt-5.6-sol"
+    assert 'model_reasoning_effort="medium"' in cmd
 
 
 def test_engine_state_overrides_env_and_keeps_engine_specific_sid(monkeypatch, tmp_path):

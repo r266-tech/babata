@@ -56,9 +56,9 @@ from constants import (
     INSTANCE,
     INSTANCE_LABELS,
     PROJECT,
-    SKILL_HOOKS_DIR as _SKILL_HOOKS_DIR,
     STATE_DIR as _STATE_DIR,
 )
+from cli_runtime import env_cli_path
 from memory_runtime import (
     default_memory_source,
     log_memory_reflex_post_answer,
@@ -66,7 +66,6 @@ from memory_runtime import (
     memory_inject_timeout,
     render_babata_memory_context_event,
 )
-from skill_evolve_nudge import notify_skill_evolve_turn
 from turn_audit import (
     TurnAudit,
     begin_turn,
@@ -76,6 +75,8 @@ from turn_audit import (
 )
 
 VENV_PYTHON = str(Path(__file__).parent / ".venv" / "bin" / "python")
+_REPO_DIR = Path(__file__).resolve().parent
+_REPO_CLAUDE = _REPO_DIR / "CLAUDE.md"
 
 _CC_PROJECTS = Path.home() / ".claude" / "projects" / str(Path.home()).replace("/", "-")
 _NO_BYTECODE_ENV = "PYTHONDONTWRITEBYTECODE"
@@ -211,10 +212,14 @@ def _import_jsonl_to_bucket(source_sid: str) -> str | None:
         with suppress(Exception):
             lock_path.unlink()
 
-# Default isolated mode does not read ~/.claude/{settings.json, CLAUDE.md, skills/}
-# or OAuth keychain state. BABATA_SHARED_CC=1 opts into sharing the local
-# Claude Code profile for trusted personal deployments.
-_SETTING_SOURCES: list[str] = ["user"] if os.environ.get("BABATA_SHARED_CC") == "1" else []
+# Default isolated mode loads repo project instructions but not
+# ~/.claude/{settings.json, CLAUDE.md, skills/} or OAuth keychain state.
+# BABATA_SHARED_CC=1 additionally opts into the user profile.
+_SETTING_SOURCES: list[str] = (
+    ["project", "user"]
+    if os.environ.get("BABATA_SHARED_CC") == "1"
+    else ["project"]
+)
 
 # Default trust boundary keeps cwd at the repo and permission prompts enabled.
 # BABATA_FULL_TRUST=1 opts into cwd=$HOME and auto mode for trusted personal deployments.
@@ -222,15 +227,26 @@ _FULL_TRUST = os.environ.get("BABATA_FULL_TRUST") == "1"
 _DEFAULT_CWD = str(Path.home()) if _FULL_TRUST else str(Path(__file__).parent)
 _PERMISSION_MODE = "auto" if _FULL_TRUST else "default"
 
+
+def _with_repo_project_instructions(prompt: str) -> str:
+    """Keep the transport safety adapter when full-trust cwd moves to $HOME."""
+    if not _FULL_TRUST:
+        return prompt
+    try:
+        instructions = _REPO_CLAUDE.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(
+            f"BABATA_FULL_TRUST requires readable repo instructions: {_REPO_CLAUDE}"
+        ) from exc
+    marker = "<babata-repo-instructions>"
+    if marker in prompt:
+        return prompt
+    return f"{prompt}\n\n{marker}\n{instructions}\n</babata-repo-instructions>"
+
 # _STATE_DIR: all channel state files land here. Cross-channel session picker
 # scans this dir, so it's a soft coupling — cc.py isn't fully channel-agnostic
 # anymore, but /resume can list sessions from every channel (TG / WX / terminal
 # bb) in one picker, sorted by bucket mtime with non-local channels tagged.
-# _SKILL_HOOKS_DIR: SDK doesn't fire settings.json SessionEnd/SessionStart
-# hooks (those are CC CLI-native), so babata fires them explicitly on
-# reset()/init so TG/WeChat channels can plug into skill evolution (v3).
-
-
 def _channel_label_from_state_file(fp: Path) -> str:
     """state file name → human-readable channel label for the /resume picker.
 
@@ -337,7 +353,7 @@ def _spawn_summary_generation(sid: str, source_mtime: float) -> None:
             if not text:
                 return
             prompt = "20字内概括会话主题，只输出一句中文。\n\n" + text
-            cli = os.environ.get("CLAUDE_CLI_PATH") or "claude"
+            cli = env_cli_path("CLAUDE_CLI_PATH") or "claude"
             # Model 不写死, 跟随 ~/.claude/settings.json 全局默认:
             # CC 模型会升级, 代码里写死 'haiku' 将来可能指向弃用 tier.
             # 若总结任务用 opus 太慢, 改 settings.json 或加 env override.
@@ -648,6 +664,9 @@ class Response:
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
     audit: dict[str, Any] | None = None
+    # Local files produced by a CPU-native image tool. Channel transports own
+    # delivery because native image tools may intentionally emit no final text.
+    generated_images: list[str] = field(default_factory=list)
     # True when the SDK ResultMessage reported an error result (rate-limit /
     # max_turns / API 5xx). Surfaced so the bot can show the real failure
     # instead of an empty bubble.
@@ -1000,14 +1019,9 @@ class CC:
     def reset(self) -> None:
         old_sid = self._session_id
         if old_sid:
-            self._fire_hook(_SKILL_HOOKS_DIR, "session-end.sh", old_sid)
             self._fire_hook(_HOOKS_DIR, "session-end.sh", old_sid)
         self._session_id = None
         self._record_sid(None)
-        # skill-evolve SessionStart: 处理 pending + surface 上次 evolve (空
-        # sid, 它不关心新 sid 是啥). babata-local session-start 不在这里 fire —
-        # 新 sid 要等下一次 query 的 ResultMessage 才拿得到, 见 _run().
-        self._fire_hook(_SKILL_HOOKS_DIR, "session-start.sh", "")
 
     def list_recent_sessions(
         self, limit: int = 10, channel_filter: list[str] | None = None,
@@ -1192,20 +1206,12 @@ class CC:
 
     @staticmethod
     def _fire_hook(hook_dir: Path, script: str, session_id: str) -> None:
-        """Fire a lifecycle hook asynchronously (non-blocking).
-
-        Two hook dirs in play (see constants): SKILL_HOOKS_DIR (V-private
-        skill-evolve) and HOOKS_DIR (repo-local babata hooks, e.g. push sid
-        to TG). Fire site picks which dir(s) to hit — skill-evolve has a
-        different "session-start" semantic (fired with empty sid, for pending
-        scan), so we don't auto-fire both on every event.
-        """
+        """Fire a repo-local lifecycle hook asynchronously (non-blocking)."""
         hook_path = hook_dir / script
         if not hook_path.is_file():
             return
         # BABATA_INSTANCE_LABEL: 把当前 bot 的人话昵称 (巴巴塔 / 巴巴塔2 / ...) 暴
-        # 露给 hook 脚本, 省得 shell 层再 import constants 反查映射. skill-evolve
-        # hooks 不用这个 env 但多塞一个无害.
+        # 露给 hook 脚本, 省得 shell 层再 import constants 反查映射.
         env = {
             **os.environ,
             "CLAUDE_SESSION_ID": session_id,
@@ -1235,11 +1241,13 @@ class CC:
             permission_mode=_PERMISSION_MODE,
             can_use_tool=_always_allow,  # auto-approve protected-path prompts that bypassPermissions still forwards
             cwd=_DEFAULT_CWD,
-            cli_path=os.environ.get("CLAUDE_CLI_PATH"),
+            cli_path=env_cli_path("CLAUDE_CLI_PATH"),
             include_partial_messages=include_partial_messages,
-            system_prompt=self._source_prompt_with_memory(user_prompt=user_prompt),
+            system_prompt=_with_repo_project_instructions(
+                self._source_prompt_with_memory(user_prompt=user_prompt)
+            ),
             model=self._model,
-            setting_sources=_SETTING_SOURCES,  # 默认 [] 隔离; BABATA_SHARED_CC=1 → ["user"] 共享
+            setting_sources=_SETTING_SOURCES,  # 默认 project-only; shared mode 再加 user
             mcp_servers=self._mcp_servers,
             # SDK 默认 max_buffer_size = 1MB; PDF/大图 或 resume 含 base64
             # 附件的老 session 时, CLI stdout 单条 JSON message 就超了 → 报
@@ -1444,14 +1452,6 @@ class CC:
                 self._fire_hook(_HOOKS_DIR, "session-start.sh", response.session_id)
             self._session_id = response.session_id
             self._record_sid(response.session_id)
-            notify_skill_evolve_turn(
-                session_id=response.session_id,
-                cpu="claude",
-                source=self._memory_source,
-                channel=_channel_label_from_state_file(self._state_file),
-                state_file=self._state_file,
-                metadata={"tools": tools_seen, "engine": "claude"},
-            )
 
         response.audit = {"tool_uses": tool_uses}
         return response
@@ -1515,9 +1515,11 @@ class LiveSession(CC):
             permission_mode=_PERMISSION_MODE,
             can_use_tool=_always_allow,
             cwd=_DEFAULT_CWD,
-            cli_path=os.environ.get("CLAUDE_CLI_PATH"),
+            cli_path=env_cli_path("CLAUDE_CLI_PATH"),
             include_partial_messages=True,
-            system_prompt=system_prompt if system_prompt is not None else self._source_prompt_with_memory(),
+            system_prompt=_with_repo_project_instructions(
+                system_prompt if system_prompt is not None else self._source_prompt_with_memory()
+            ),
             model=self._model,
             setting_sources=_SETTING_SOURCES,
             mcp_servers=self._mcp_servers,
@@ -1921,14 +1923,6 @@ class LiveSession(CC):
                 changed = (old_sid, sid)
             self._session_id = sid
             self._record_sid(sid)
-            notify_skill_evolve_turn(
-                session_id=sid,
-                cpu="claude",
-                source=self._memory_source,
-                channel=_channel_label_from_state_file(self._state_file),
-                state_file=self._state_file,
-                metadata={"tools": response.tools, "engine": "claude-live"},
-            )
         audit = self._pending_audits.pop(0) if self._pending_audits else None
         response.audit = finish_turn(
             audit,

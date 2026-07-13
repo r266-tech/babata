@@ -82,7 +82,7 @@ def test_turn_audit_records_ledger_guards_checks_and_review_bus(monkeypatch, tmp
     assert review_rows[0]["source_cpu"] == "codex"
 
 
-def test_turn_audit_caps_prompt_and_final_previews(monkeypatch, tmp_path):
+def test_turn_audit_hashes_prompt_and_final_without_raw_previews(monkeypatch, tmp_path):
     audit_dir = tmp_path / "audit"
     monkeypatch.setenv("BABATA_TURN_LEDGER", "1")
     monkeypatch.setenv("BABATA_AUDIT_DIR", str(audit_dir))
@@ -105,13 +105,15 @@ def test_turn_audit_caps_prompt_and_final_previews(monkeypatch, tmp_path):
 
     assert summary is not None
     raw = (audit_dir / "babata-turn-ledger.jsonl").read_text(encoding="utf-8")
+    assert long_prompt not in raw
+    assert long_final not in raw
+    assert "prompt-" not in raw
+    assert "answer-" not in raw
     assert "PROMPT-TAIL" not in raw
     assert "FINAL-TAIL" not in raw
     begin, finish = _jsonl(audit_dir / "babata-turn-ledger.jsonl")
-    assert begin["prompt_preview"].endswith("...")
-    assert finish["final_preview"].endswith("...")
-    assert len(begin["prompt_preview"]) <= turn_audit._MAX_PROMPT_PREVIEW + 3
-    assert len(finish["final_preview"]) <= turn_audit._MAX_FINAL_PREVIEW + 3
+    assert "prompt_preview" not in begin
+    assert "final_preview" not in finish
     assert begin["prompt_sha256"] == turn_audit._sha256_text(long_prompt)
     assert begin["prompt_bytes"] == len(long_prompt.encode("utf-8"))
     assert finish["final_sha256"] == turn_audit._sha256_text(long_final)

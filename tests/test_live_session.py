@@ -1,5 +1,6 @@
 import asyncio
 import json
+from pathlib import Path
 
 import cc
 from claude_agent_sdk import (
@@ -138,11 +139,37 @@ def test_user_message_payload_and_sdk_event_parser_share_cpu_boundary():
     assert response.cache_read_tokens == 2
 
 
+def test_claude_transport_loads_repo_instructions_without_user_profile():
+    assert cc._SETTING_SOURCES[0] == "project"
+    repo_claude = (Path(cc.__file__).parent / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "Raw records and archives are append-only." in repo_claude
+    assert "scripts/self-ops.sh" in repo_claude
+
+
+def test_full_trust_keeps_repo_instructions_when_cwd_moves_home(monkeypatch, tmp_path):
+    monkeypatch.setattr(cc, "_FULL_TRUST", True)
+    monkeypatch.setattr(cc, "_DEFAULT_CWD", str(tmp_path))
+    session = cc.CC(
+        state_file=tmp_path / "session.json",
+        source_prompt="Source: test.",
+        memory_enabled=False,
+    )
+
+    opts = session._make_query_options(
+        user_prompt="hello",
+        include_partial_messages=False,
+    )
+
+    assert opts.cwd == str(tmp_path)
+    assert "<babata-repo-instructions>" in opts.system_prompt
+    assert "scripts/self-ops.sh" in opts.system_prompt
+    assert "Raw records and archives are append-only." in opts.system_prompt
+
+
 def test_cc_query_one_shot_uses_shared_stream_and_response(monkeypatch, tmp_path):
     async def run():
         FakeClaudeSDKClient.instances.clear()
         monkeypatch.setattr(cc, "ClaudeSDKClient", FakeClaudeSDKClient)
-        monkeypatch.setattr(cc, "notify_skill_evolve_turn", lambda **_kwargs: None)
         session = cc.CC(
             state_file=tmp_path / "session.json",
             source_prompt="Source: test.",
@@ -219,6 +246,7 @@ def test_live_session_connect_submit_interrupt_close(monkeypatch, tmp_path):
         assert client.connected
         assert client.options.include_partial_messages is True
         assert client.options.max_turns == 200
+        assert client.options.setting_sources[0] == "project"
         assert client.options.mcp_servers["tg"]["args"] == ["tg_mcp.py"]
         assert client.options.mcp_servers["tg"]["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
 

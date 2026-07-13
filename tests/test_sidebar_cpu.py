@@ -241,6 +241,7 @@ def test_sidebar_cpu_status_reads_public_session_property(monkeypatch):
     assert payload["busy"] is False
     assert payload["chat_busy"] is False
     assert payload["proactive_busy"] is True
+    assert {choice["name"] for choice in payload["choices"]} == {"claude", "codex", "grok"}
 
 
 def test_sidebar_cpu_switch_persists_sessions_with_public_api(monkeypatch, tmp_path):
@@ -365,6 +366,14 @@ def test_sidebar_engine_name_falls_back_without_engine_accessor(tmp_path):
     state_file.write_text('{"assistant_engine": "codex"}')
 
     assert sidebar_bot._engine_name_for(NamelessEngine(), state_file) == "codex"
+
+
+def test_sidebar_engine_available_checks_grok_cli(monkeypatch, tmp_path):
+    grok = tmp_path / "grok-test"
+    grok.write_text("#!/bin/sh\n")
+    monkeypatch.setenv("BABATA_GROK_CLI_PATH", str(grok))
+
+    assert sidebar_bot._engine_available("grok") is True
 
 
 def test_sidebar_chat_input_builds_prompt_boundary(monkeypatch, tmp_path):

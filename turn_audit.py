@@ -22,8 +22,6 @@ from typing import Any
 from constants import NAMESPACE, STATE_DIR
 
 
-_MAX_PROMPT_PREVIEW = 160
-_MAX_FINAL_PREVIEW = 240
 _MAX_ERROR_PREVIEW = 240
 _MAX_COMMAND_PREVIEW = 240
 _MAX_CHECK_OUTPUT = 4000
@@ -182,7 +180,6 @@ def begin_turn(
             "baseline_sensitive_files": sorted(baseline_sensitive_files),
         },
         "declared_checks_config": checks_config_rel,
-        "prompt_preview": _preview(prompt, _MAX_PROMPT_PREVIEW),
         "prompt_sha256": _sha256_text(prompt),
         "prompt_bytes": _text_bytes(prompt),
         "images_count": images_count,
@@ -248,7 +245,6 @@ def finish_turn(
         "declared_checks": check_results,
         "review_bus_mode": _review_bus_mode(),
         "review_tasks": review_tasks,
-        "final_preview": _preview(final_content, _MAX_FINAL_PREVIEW),
         "final_sha256": _sha256_text(final_content),
         "final_bytes": _text_bytes(final_content),
         "error": _error_record(error),

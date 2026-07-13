@@ -2,9 +2,11 @@
 
 This repo is babata's transport shell for Telegram, WeChat, Sidebar, and
 terminal-adjacent channel plumbing. Shared identity, philosophy, memory,
-personal-context routing, and public-action permissions come from
-`~/cc-workspace/AGENTS.md` / `~/cc-workspace/CLAUDE.md` plus rendered memory
-context; do not duplicate them here.
+personal-context routing, and action boundaries are routed through rendered
+memory context and its cited authority files. The sibling
+`~/cc-workspace/AGENTS.md` / `~/cc-workspace/CLAUDE.md` files are workspace-root
+adapters; they are not automatically loaded from this repo. Do not duplicate
+them here.
 
 ## Boundary
 

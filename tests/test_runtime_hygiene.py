@@ -1,5 +1,9 @@
 import ast
+import os
 import re
+import shutil
+import subprocess
+import time
 import tomllib
 from pathlib import Path
 
@@ -14,27 +18,48 @@ def test_auto_update_has_single_canonical_implementation():
     root_text = root_entry.read_text(encoding="utf-8")
     assert root_entry.stat().st_mode & 0o111
     assert len(root_text.splitlines()) <= 8
-    assert 'exec "$SCRIPT_DIR/scripts/auto-update.sh" --upgrade-sdk "$@"' in root_text
+    assert 'exec "$SCRIPT_DIR/scripts/auto-update.sh" "$@"' in root_text
     assert "claude update" not in root_text
     assert "git pull" not in root_text
 
     canonical_text = canonical.read_text(encoding="utf-8")
     assert canonical.stat().st_mode & 0o111
     assert "git pull" in canonical_text
-    assert "claude update" in canonical_text
+    assert '"$CLAUDE_BIN" update' in canonical_text
+    assert '--upgrade-claude) UPGRADE_CLAUDE=1' in canonical_text
+    assert 'if [ "$UPGRADE_CLAUDE" = "1" ]' in canonical_text
     assert "claude-agent-sdk" in canonical_text
+    assert "pip install --python" in canonical_text
+    assert "lock --upgrade-package" not in canonical_text
     assert "running_launchd_labels()" in canonical_text
-    assert "launchctl list" in canonical_text
+    assert 'BABATA_RESTART_LABELS="${BABATA_RESTART_LABELS:-$LABEL_PREFIX}"' in canonical_text
+    assert 'grep -Fqx "$label"' in canonical_text
     assert "for label in $LABELS" in canonical_text
     assert '"$SELF_OPS" restart "$label" "$REASON"' in canonical_text
     assert ("launchctl " + "kickstart") not in canonical_text
     assert "wait_runtime_idle()" not in canonical_text
     assert "runtime_file_for_label()" not in canonical_text
     assert "--delay-restart" not in canonical_text
+    assert 'if [ "$CLI_CHANGED" = "1" ] || [ "$SDK_CHANGED" = "1" ]; then' in canonical_text
+    assert "BABATA_VERSION_WATCH" in canonical_text
+    assert "BABATA_VERSION_WATCH_HARD_TIMEOUT_SECONDS" in canonical_text
+    assert "run_with_process_group_timeout" in canonical_text
+    assert "start_new_session=True" in canonical_text
+    assert "os.killpg(process.pid, signal.SIGTERM)" in canonical_text
+    assert '--cc-old "${OLD_CLI:-}" --cc-new "${NEW_CLI:-}"' in canonical_text
+    assert '--sdk-old "${OLD_SDK:-}" --sdk-new "${NEW_SDK:-}"' in canonical_text
+    assert 'echo "WARN: version-watch failed after CLI/SDK update' in canonical_text
+    assert 'echo "WARN: version-watch timed out after' in canonical_text
 
     self_ops_text = self_ops.read_text(encoding="utf-8")
-    assert '"$REPO_DIR/scripts/auto-update.sh" --upgrade-sdk' in self_ops_text
+    assert '"$REPO_DIR/scripts/auto-update.sh" --upgrade-claude --upgrade-sdk' in self_ops_text
     assert '"$REPO_DIR/auto-update.sh"' not in self_ops_text
+    assert "disable_plist()" in self_ops_text
+    assert 'if ! launchctl disable "$domain/$label"; then' in self_ops_text
+    assert 'ERROR: failed to disable $domain/$label' in self_ops_text
+    assert 'if ! mv "$plist" "$disabled_plist"; then' in self_ops_text
+    assert 'ERROR: failed to preserve disabled plist at $disabled_plist' in self_ops_text
+    assert "left disabled, not killed" in self_ops_text
     for script in (canonical, self_ops, poll_healthcheck):
         text = script.read_text(encoding="utf-8")
         assert "PROJECT_STATE_DIR=$(grep -m1 '^PROJECT_STATE_DIR='" in text
@@ -42,6 +67,208 @@ def test_auto_update_has_single_canonical_implementation():
 
     pyproject_text = (repo / "pyproject.toml").read_text(encoding="utf-8")
     assert 'addopts = "-p no:cacheprovider"' in pyproject_text
+
+
+def test_auto_update_kills_hanging_version_watch_tree_and_still_restarts(tmp_path):
+    repo = Path(__file__).resolve().parents[1]
+    isolated_repo = tmp_path / "babata"
+    isolated_scripts = isolated_repo / "scripts"
+    isolated_scripts.mkdir(parents=True)
+
+    candidate = isolated_scripts / "auto-update.sh"
+    shutil.copy2(repo / "scripts" / "auto-update.sh", candidate)
+
+    def write_executable(path: Path, text: str) -> None:
+        path.write_text(text, encoding="utf-8")
+        path.chmod(0o755)
+
+    fake_claude = tmp_path / "fake-claude"
+    write_executable(
+        fake_claude,
+        """#!/usr/bin/env bash
+set -eu
+case "${1:-}" in
+  --version)
+    if [ -f "$FAKE_CLAUDE_STATE" ]; then
+      printf '2.0.0 (fake)\n'
+    else
+      printf '1.0.0 (fake)\n'
+    fi
+    ;;
+  update)
+    : > "$FAKE_CLAUDE_STATE"
+    printf 'fake update complete\n'
+    ;;
+  *) exit 2 ;;
+esac
+""",
+    )
+
+    fake_version_watch = tmp_path / "fake-version-watch"
+    write_executable(
+        fake_version_watch,
+        """#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$$" > "$FAKE_VERSION_WATCH_PARENT_PID"
+if [ "${FAKE_VERSION_WATCH_MODE:-hang}" = "fail" ]; then
+  exit 23
+fi
+python3 -c 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)' &
+printf '%s\n' "$!" > "$FAKE_VERSION_WATCH_CHILD_PID"
+wait
+""",
+    )
+
+    fake_launchctl = tmp_path / "fake-launchctl"
+    write_executable(
+        fake_launchctl,
+        """#!/usr/bin/env bash
+set -eu
+[ "${1:-}" = "list" ]
+[ "${FAKE_LAUNCHCTL_FAIL:-0}" != "1" ] || exit 44
+printf '4321\t0\tcom.babata\n'
+printf '4322\t0\tcom.babata.sub2api.watchdog\n'
+printf '4323\t0\tcom.babata.podcast\n'
+""",
+    )
+
+    fake_self_ops_log = tmp_path / "self-ops.log"
+    write_executable(
+        isolated_scripts / "self-ops.sh",
+        """#!/usr/bin/env bash
+set -eu
+[ "${FAKE_SELF_OPS_FAIL:-0}" != "1" ] || exit 42
+printf '%s\n' "$*" >> "$FAKE_SELF_OPS_LOG"
+""",
+    )
+
+    home = tmp_path / "home"
+    home.mkdir()
+    parent_pid_file = tmp_path / "version-watch-parent.pid"
+    child_pid_file = tmp_path / "version-watch-child.pid"
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(home),
+            "CLAUDE_CLI_PATH": str(fake_claude),
+            "FAKE_CLAUDE_STATE": str(tmp_path / "claude-updated"),
+            "BABATA_VERSION_WATCH": str(fake_version_watch),
+            # Leave enough startup margin when this runs inside the full suite;
+            # the child itself sleeps for 60s, so 3s still proves hard timeout.
+            "BABATA_VERSION_WATCH_HARD_TIMEOUT_SECONDS": "3",
+            "FAKE_VERSION_WATCH_PARENT_PID": str(parent_pid_file),
+            "FAKE_VERSION_WATCH_CHILD_PID": str(child_pid_file),
+            "BABATA_PLATFORM": "Darwin",
+            "BABATA_LAUNCHCTL": str(fake_launchctl),
+            "FAKE_SELF_OPS_LOG": str(fake_self_ops_log),
+        }
+    )
+
+    started = time.monotonic()
+    result = subprocess.run(
+        [str(candidate), "--upgrade-claude"],
+        cwd=isolated_repo,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 0, result.stderr
+    assert elapsed < 10
+    log_text = (isolated_repo / "logs" / "auto-update.log").read_text(encoding="utf-8")
+    assert (
+        "WARN: version-watch timed out after 3s; process tree terminated; "
+        "continuing to restart"
+    ) in log_text
+    assert "launchd restart queued via self-ops: com.babata" in log_text
+    assert fake_self_ops_log.read_text(encoding="utf-8").startswith("restart com.babata ")
+    assert "sub2api.watchdog" not in fake_self_ops_log.read_text(encoding="utf-8")
+    assert "podcast" not in fake_self_ops_log.read_text(encoding="utf-8")
+
+    watched_pids = [
+        int(parent_pid_file.read_text(encoding="utf-8")),
+        int(child_pid_file.read_text(encoding="utf-8")),
+    ]
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if all(not Path(f"/proc/{pid}").exists() for pid in watched_pids) and os.uname().sysname == "Linux":
+            break
+        alive = []
+        for pid in watched_pids:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            alive.append(pid)
+        if not alive:
+            break
+        time.sleep(0.05)
+    for pid in watched_pids:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        raise AssertionError(f"timed-out version-watch process still alive: {pid}")
+
+    # A normal non-zero version-watch result must be distinguished from a hard
+    # timeout and must still reach the same restart path.
+    Path(env["FAKE_CLAUDE_STATE"]).unlink()
+    env["FAKE_VERSION_WATCH_MODE"] = "fail"
+    failed_watch = subprocess.run(
+        [str(candidate), "--upgrade-claude"],
+        cwd=isolated_repo,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    assert failed_watch.returncode == 0, failed_watch.stderr
+    log_text = (isolated_repo / "logs" / "auto-update.log").read_text(encoding="utf-8")
+    assert (
+        "WARN: version-watch failed after CLI/SDK update (exit=23); "
+        "continuing to restart"
+    ) in log_text
+    assert fake_self_ops_log.read_text(encoding="utf-8").count("restart com.babata ") == 2
+
+    # Restart dispatch failures are real failures, not optimistic success logs.
+    Path(env["FAKE_CLAUDE_STATE"]).unlink()
+    env["FAKE_SELF_OPS_FAIL"] = "1"
+    failed_restart = subprocess.run(
+        [str(candidate), "--upgrade-claude"],
+        cwd=isolated_repo,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    assert failed_restart.returncode == 1
+    assert "ERROR: self-ops restart failed for com.babata" in (
+        isolated_repo / "logs" / "auto-update.log"
+    ).read_text(encoding="utf-8")
+
+    # Enumeration failure must also fail closed; otherwise a provider/runtime
+    # update can leave old channel processes running while reporting success.
+    Path(env["FAKE_CLAUDE_STATE"]).unlink()
+    env.pop("FAKE_SELF_OPS_FAIL")
+    env["FAKE_LAUNCHCTL_FAIL"] = "1"
+    failed_list = subprocess.run(
+        [str(candidate), "--upgrade-claude"],
+        cwd=isolated_repo,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    assert failed_list.returncode == 1
+    assert "ERROR: cannot enumerate launchd restart targets" in (
+        isolated_repo / "logs" / "auto-update.log"
+    ).read_text(encoding="utf-8")
 
 
 def test_pytest_hygiene_removes_local_cache_artifacts():

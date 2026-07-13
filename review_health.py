@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from cli_runtime import env_cli_path
+
 
 _CACHE: tuple[float, dict[str, Any]] | None = None
 
@@ -28,6 +30,11 @@ def review_health_snapshot(*, force: bool = False, probe: bool = True) -> dict[s
 def _compute_snapshot(*, probe: bool = True) -> dict[str, Any]:
     enabled = os.environ.get("BABATA_BLOCKING_REVIEW", "1") != "0"
     counterpart_enabled = _counterpart_enabled()
+    configured_review_cpu = os.environ.get("BABATA_BLOCKING_REVIEW_CPU", "codex").strip().lower() or "codex"
+    supported_review_cpus = {
+        "codex", "claude", "cc", "claude-code", "counterpart", "opposite",
+    }
+    review_cpu = configured_review_cpu if configured_review_cpu in supported_review_cpus else "codex"
     strict = os.environ.get("BABATA_BLOCKING_REVIEW_INFRA_STRICT", "0") == "1"
     if not enabled:
         status = "disabled"
@@ -39,10 +46,14 @@ def _compute_snapshot(*, probe: bool = True) -> dict[str, Any]:
         status = "not-checked"
         probes = {}
     else:
-        probes = {
-            "cc_worker": _probe_cc_worker(),
-            "codex": _probe_codex(),
-        }
+        if review_cpu in {"codex"}:
+            probes = {"codex": _probe_codex()}
+        elif review_cpu in {"claude", "cc", "claude-code"}:
+            probes = {"cc_worker": _probe_cc_worker()}
+        elif review_cpu in {"counterpart", "opposite"}:
+            probes = {"cc_worker": _probe_cc_worker(), "codex": _probe_codex()}
+        else:  # normalized values above make this unreachable; keep fail-safe.
+            probes = {"codex": _probe_codex()}
         ok = all(item.get("ok") for item in probes.values())
         if ok:
             status = "ok"
@@ -54,6 +65,8 @@ def _compute_snapshot(*, probe: bool = True) -> dict[str, Any]:
         "status": status,
         "enabled": enabled,
         "counterpart_enabled": counterpart_enabled,
+        "review_cpu": review_cpu,
+        "configured_review_cpu": configured_review_cpu,
         "strict": strict,
         "probes": probes,
         "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -135,10 +148,10 @@ def _cc_worker_cli() -> Path | None:
 
 
 def _codex_cli() -> Path | None:
-    configured = (
-        os.environ.get("BABATA_CODEX_REVIEW_CLI")
-        or os.environ.get("BABATA_CODEX_CLI_PATH")
-        or os.environ.get("CODEX_CLI_PATH")
+    configured = env_cli_path(
+        "BABATA_CODEX_REVIEW_CLI",
+        "BABATA_CODEX_CLI_PATH",
+        "CODEX_CLI_PATH",
     )
     if configured:
         path = Path(configured).expanduser()
