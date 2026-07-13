@@ -166,6 +166,44 @@ def test_full_trust_keeps_repo_instructions_when_cwd_moves_home(monkeypatch, tmp
     assert "Raw records and archives are append-only." in opts.system_prompt
 
 
+def test_full_trust_one_shot_resume_retry_keeps_repo_instructions(monkeypatch, tmp_path):
+    async def run():
+        monkeypatch.setattr(cc, "_FULL_TRUST", True)
+        monkeypatch.setattr(cc, "_DEFAULT_CWD", str(tmp_path))
+        monkeypatch.setenv("BABATA_IDLE_RESET_MINUTES", "0")
+        state_file = tmp_path / "session.json"
+        state_file.write_text(
+            json.dumps({"session_id": "old-session", "recent_sids": ["old-session"]}),
+            encoding="utf-8",
+        )
+        session = cc.CC(
+            state_file=state_file,
+            source_prompt="Source: test.",
+            memory_enabled=False,
+        )
+        monkeypatch.setattr(session, "_fire_hook", lambda *_: None)
+        monkeypatch.setattr(session, "_recent_turns_summary", lambda: "restored history")
+        prompts = []
+
+        async def fake_run(opts, *_args):
+            prompts.append(opts.system_prompt)
+            if len(prompts) == 1:
+                raise RuntimeError("resume failed")
+            return cc.Response(content="ok", session_id="fresh-session", cost=0.0)
+
+        monkeypatch.setattr(session, "_run", fake_run)
+
+        response = await session.query("hello")
+
+        assert response.content == "ok"
+        assert len(prompts) == 2
+        assert all("<babata-repo-instructions>" in prompt for prompt in prompts)
+        assert "restored history" in prompts[1]
+        assert "scripts/self-ops.sh" in prompts[1]
+
+    asyncio.run(run())
+
+
 def test_cc_query_one_shot_uses_shared_stream_and_response(monkeypatch, tmp_path):
     async def run():
         FakeClaudeSDKClient.instances.clear()

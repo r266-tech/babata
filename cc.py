@@ -1269,7 +1269,7 @@ class CC:
     ) -> Response:
         # Channel-agnostic reset command. Any channel (TG/WX/future) whose
         # transport layer doesn't have its own command dispatch still gets
-        # /new for free — and reset() fires the skill-evolve hooks.
+        # /new for free — and reset() fires the repo lifecycle hooks.
         if prompt.strip() == "/new" and not images:
             self.reset()
             return Response(content="会话已重置。", session_id="", cost=0.0)
@@ -1317,7 +1317,9 @@ class CC:
             opts.resume = None
             ctx = self._recent_turns_summary()
             if ctx:
-                opts.system_prompt = self._source_prompt_with_memory(ctx, user_prompt=prompt)
+                opts.system_prompt = _with_repo_project_instructions(
+                    self._source_prompt_with_memory(ctx, user_prompt=prompt)
+                )
                 note = f"⚠️ 会话重置 ({type(e).__name__}), 已从归档注入最近 {_RESUME_INJECT_PAIRS} 轮"
             else:
                 note = f"⚠️ 会话重置 ({type(e).__name__}), 历史归档也没找到"
