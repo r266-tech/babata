@@ -671,6 +671,12 @@ class Response:
     # max_turns / API 5xx). Surfaced so the bot can show the real failure
     # instead of an empty bubble.
     is_error: bool = False
+    # True when the CLI reported a usage/billing/auth failure (AssistantMessage.error),
+    # so a channel can hand the turn to a fallback CPU.
+    cpu_unavailable: bool = False
+
+
+_UNAVAILABLE_ERRORS = frozenset({"rate_limit", "billing_error", "authentication_failed"})
 
 
 def _result_error_text(subtype: str | None, result: Any) -> str:
@@ -848,6 +854,7 @@ class CC:
         source_prompt: str,
         mcp_servers: dict[str, Any] | None = None,
         model: str | None = None,
+        effort: str | None = None,
         memory_source: str | None = None,
         memory_enabled: bool = True,
     ) -> None:
@@ -857,6 +864,7 @@ class CC:
         self._memory_enabled = memory_enabled
         self._mcp_servers = _mcp_servers_without_repo_bytecode(mcp_servers)
         self._model = model
+        self._effort = effort
         self._session_id: str | None = self._load_state().get("session_id")
         self._memory_reflex_event_id: str | None = None
 
@@ -1259,6 +1267,8 @@ class CC:
         )
         if self._session_id:
             opts.resume = self._session_id
+        if self._effort:
+            opts.effort = self._effort
         return opts
 
     async def query(
@@ -1408,6 +1418,7 @@ class CC:
         client = ClaudeSDKClient(opts)
         messages = []
         tools_seen: list[str] = []
+        cpu_unavailable = False
 
         try:
             await client.connect()
@@ -1424,6 +1435,11 @@ class CC:
 
                 if isinstance(msg, ResultMessage):
                     break
+
+                # Limit/auth notices are not answers: keep them off the channel.
+                if getattr(msg, "error", None) in _UNAVAILABLE_ERRORS:
+                    cpu_unavailable = True
+                    continue
 
                 if not on_stream:
                     continue
@@ -1444,6 +1460,8 @@ class CC:
         tool_uses = _extract_tool_uses(messages)
         tools_seen = _ordered_tool_names(tools_seen, tool_uses)
         response = _response_from_messages(messages, tools_seen)
+        # A notice the CLI recovered from is not a failed turn.
+        response.cpu_unavailable = cpu_unavailable and response.is_error
 
         if response.session_id:
             # Detect session boundary: SDK starts a fresh sid on first turn,
@@ -1478,6 +1496,7 @@ class LiveSession(CC):
         source_prompt: str,
         mcp_servers: dict[str, Any] | None = None,
         model: str | None = None,
+        effort: str | None = None,
         memory_source: str | None = None,
         memory_enabled: bool = True,
     ) -> None:
@@ -1486,6 +1505,7 @@ class LiveSession(CC):
             source_prompt=source_prompt,
             mcp_servers=mcp_servers,
             model=model,
+            effort=effort,
             memory_source=memory_source,
             memory_enabled=memory_enabled,
         )
@@ -1531,6 +1551,8 @@ class LiveSession(CC):
         )
         if resume and self._session_id:
             opts.resume = self._session_id
+        if self._effort:
+            opts.effort = self._effort
         return opts
 
     async def connect(self) -> None:

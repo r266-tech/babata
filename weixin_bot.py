@@ -31,7 +31,8 @@ sys.dont_write_bytecode = True
 
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+# Explicit service configuration wins; shared .env only supplies defaults.
+load_dotenv(override=False)
 
 from constants import PROJECT, STATE_DIR, WEIXIN_DATA_DIR
 from engine import VENV_PYTHON, make_engine
@@ -103,17 +104,42 @@ _WX_SOURCE_PROMPT = (
     "Max 4000."
 )
 
+_WX_MCP_SERVERS = {
+    "weixin": {
+        "command": VENV_PYTHON,
+        "args": [_WEIXIN_MCP_SCRIPT],
+    },
+}
+
+# Same CPU vocabulary as bin/babata-cpu: BABATA_PRIMARY_CPU answers (Claude
+# tuned by BABATA_CLAUDE_{MODEL,EFFORT}); when it reports a usage limit or auth
+# failure the turn goes to BABATA_FALLBACK_CPU (Codex tuned by BABATA_CODEX_*).
+# Each CPU keeps its own state file so session ids never cross CPUs.
+_WX_ENGINE = os.environ.get("BABATA_PRIMARY_CPU") or None
+_WX_FALLBACK_ENGINE = os.environ.get("BABATA_FALLBACK_CPU") or None
+
+
+def _wx_state_file(engine: str | None) -> Path:
+    suffix = f"-{engine}" if engine else ""
+    return STATE_DIR / f"{PROJECT}-weixin{suffix}-session.json"
+
+
 cc = make_engine(
-    state_file=STATE_DIR / f"{PROJECT}-weixin-session.json",
+    state_file=_wx_state_file(_WX_ENGINE),
     source_prompt=_WX_SOURCE_PROMPT,
     memory_source="wechat",
-    mcp_servers={
-        "weixin": {
-            "command": VENV_PYTHON,
-            "args": [_WEIXIN_MCP_SCRIPT],
-        },
-    },
+    mcp_servers=_WX_MCP_SERVERS,
+    engine=_WX_ENGINE,
+    model=os.environ.get("BABATA_CLAUDE_MODEL") or None,
+    effort=os.environ.get("BABATA_CLAUDE_EFFORT") or None,
 )
+fallback_cc = make_engine(
+    state_file=_wx_state_file(_WX_FALLBACK_ENGINE),
+    source_prompt=_WX_SOURCE_PROMPT,
+    memory_source="wechat",
+    mcp_servers=_WX_MCP_SERVERS,
+    engine=_WX_FALLBACK_ENGINE,
+) if _WX_FALLBACK_ENGINE else None
 
 # ── markdown handling ────────────────────────────────────────────────
 
@@ -854,11 +880,19 @@ async def _query_wx_turn_with_recovery(
                 _WX_MAX_TURN_RECOVERY_ATTEMPTS,
             )
         try:
-            return await cc.query(
+            resp = await cc.query(
                 prompt,
                 images=images or None,
                 on_stream=coalescer.on_stream,
             )
+            if fallback_cc and getattr(resp, "cpu_unavailable", False):
+                log.warning("primary CPU unavailable (quota/auth); WeChat turn → fallback")
+                resp = await fallback_cc.query(
+                    prompt,
+                    images=images or None,
+                    on_stream=coalescer.on_stream,
+                )
+            return resp
         except Exception as e:
             log.exception("CC query failed")
             if attempt < _WX_MAX_TURN_RECOVERY_ATTEMPTS:

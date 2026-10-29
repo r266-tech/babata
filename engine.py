@@ -97,6 +97,7 @@ def make_engine(
     live: bool = False,
     engine: str | None = None,
     model: str | None = None,
+    effort: str | None = None,
     memory_source: str | None = None,
     memory_enabled: bool = True,
 ) -> CC | LiveSession | CodexEngine | CodexLiveSession | GrokEngine | GrokLiveSession:
@@ -110,6 +111,7 @@ def make_engine(
             model=model,
             memory_source=memory_source,
             memory_enabled=memory_enabled,
+            effort=effort,
         )
     elif name == "codex":
         cls = CodexLiveSession if live else CodexEngine
