@@ -114,6 +114,8 @@ def test_translate_prompt_stays_compact_without_losing_boundaries():
         "Introducing Hermes Agent v0.13.0",
     ):
         assert marker in prompt
+    assert "Preserve all [[BBT_LINK_n]] and [[BBT_FMT_n]] marker tokens exactly" in prompt
+    assert "preserve each standalone [[BBT_KEEP_n]] token exactly" in prompt
     for marker in (
         "immersive bilingual reading experience",
         "the user wants the page",
@@ -169,6 +171,98 @@ def test_translation_raw_content_records_final_transport_failure(monkeypatch):
 
 def test_validated_marker_results_preserves_all_empty_parse():
     assert st._validated_marker_results("not marker output", ["hello"], "model") == [""]
+
+
+def test_complete_marker_results_rejects_missing_and_duplicate_items():
+    assert st._parse_marker_results(
+        "<<<RESULT 1>>>\n你好\n<<<RESULT 3>>>\n再见", 3, require_complete=True
+    ) == ["", "", ""]
+    assert st._parse_marker_results(
+        "<<<RESULT 1>>>\n你好\n<<<RESULT 2>>>\n二\n<<<RESULT 2>>>\n重复", 3, require_complete=True
+    ) == ["", "", ""]
+    assert st._parse_marker_results(
+        "<<<RESULT 2>>>\n二\n<<<RESULT 1>>>\n你好\n<<<RESULT 3>>>\n三", 3, require_complete=True
+    ) == ["", "", ""]
+    assert st._parse_marker_results(
+        "<<<RESULT 1>>>\n你好\n<<<RESULT 2>>>\n二\n<<<RESULT 3>>>\n三", 3, require_complete=True
+    ) == ["你好", "二", "三"]
+
+
+def test_translation_provider_checks_complete_batch_and_protected_markers(monkeypatch):
+    provider = {"base_url": "https://example.test/v1", "api_key": "key", "model": "model"}
+    submitted: dict[str, object] = {}
+    results = [
+        "你好，世界。",
+        "阅读 [[BBT_LINK_1]]简介[[/BBT_LINK_1]] 并 [[BBT_FMT_1]]继续学习[[/BBT_FMT_1]]。",
+        "保持此代码不变：[[BBT_KEEP_1]]，数字是 42。",
+    ]
+
+    monkeypatch.setattr(st, "_resolve_provider", lambda _payload, require_model: provider)
+
+    async def fake_http_translate(target, texts, *, url, provider, require_complete=False):
+        submitted.update({"target": target, "texts": texts, "url": url, "provider": provider, "require_complete": require_complete})
+        return results
+
+    monkeypatch.setattr(st, "_http_translate", fake_http_translate)
+
+    response = asyncio.run(st.test_translation_provider({"model": "model"}))
+
+    assert submitted["target"] == "zh"
+    assert submitted["url"] == "settings-test"
+    assert submitted["texts"] == [
+        "Hello, world.",
+        "Read [[BBT_LINK_1]]the introduction[[/BBT_LINK_1]] and [[BBT_FMT_1]]keep learning[[/BBT_FMT_1]].",
+        "Keep this code unchanged: [[BBT_KEEP_1]] and the number 42.",
+    ]
+    assert submitted["require_complete"] is True
+    assert response == {
+        "model": "model",
+        "translated": results[0],
+        "checked_items": 3,
+        "marker_protocol": "LINK/FMT/KEEP",
+    }
+
+
+def test_translation_provider_rejects_missing_protected_markers(monkeypatch):
+    provider = {"base_url": "https://example.test/v1", "api_key": "key", "model": "model"}
+    monkeypatch.setattr(st, "_resolve_provider", lambda _payload, require_model: provider)
+
+    async def fake_http_translate(_target, _texts, *, url, provider, require_complete=False):
+        return [
+            "你好，世界。",
+            "阅读 简介 并 继续学习。",
+            "保持此代码不变：[[BBT_KEEP_1]]，数字是 42。",
+        ]
+
+    monkeypatch.setattr(st, "_http_translate", fake_http_translate)
+
+    try:
+        asyncio.run(st.test_translation_provider({"model": "model"}))
+    except st.TranslateConfigError as error:
+        assert "protected markers" in str(error)
+    else:
+        raise AssertionError("the capability check must reject a provider that drops link/format markers")
+
+
+def test_translation_provider_rejects_incomplete_batch(monkeypatch):
+    provider = {"base_url": "https://example.test/v1", "api_key": "key", "model": "model"}
+    monkeypatch.setattr(st, "_resolve_provider", lambda _payload, require_model: provider)
+
+    async def fake_http_translate(_target, _texts, *, url, provider, require_complete=False):
+        return [
+            "你好，世界。",
+            "阅读 [[BBT_LINK_1]]简介[[/BBT_LINK_1]] 并 [[BBT_FMT_1]]继续学习[[/BBT_FMT_1]]。",
+            "",
+        ]
+
+    monkeypatch.setattr(st, "_http_translate", fake_http_translate)
+
+    try:
+        asyncio.run(st.test_translation_provider({"model": "model"}))
+    except st.TranslateConfigError as error:
+        assert "complete batch" in str(error)
+    else:
+        raise AssertionError("the capability check must reject a missing batch result")
 
 
 def test_translate_batch_dedupes_hits_and_caches_misses(monkeypatch):
