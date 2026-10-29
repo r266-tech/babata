@@ -56,11 +56,21 @@ babata loads both the repo project instructions and your existing logged-in CC p
 **Codex CPU** (`.env`: `BABATA_ENGINE=codex`):
 babata keeps the same TG/WeChat/sidebar transport but runs turns through `codex exec --json`. Current first cut supports query, resume within babata's own Codex state, images, MCP server wiring, `/stop`, and final-message streaming. Telegram `/cpu` overrides the `.env` default for that channel and persists in the channel state. Codex does not yet expose the same hot-input control path as Claude Code here, so ordinary TG cut-in messages queue until the active Codex turn ends; `/stop` cancels the active Codex exec turn.
 
+Codex starts and resumes from this repository so its native `AGENTS.md` loading stays consistent. `BABATA_FULL_TRUST=1` expands its sandbox access without changing that instruction root; an explicit `BABATA_CODEX_SANDBOX` still takes precedence. Every invocation, including resume, applies the current sandbox policy and disables interactive approvals.
+
+If WeChat Codex turns fail with disconnected WebSocket streams, set `BABATA_WEIXIN_CODEX_WEBSOCKETS=0` to use HTTP streaming for that channel's selected provider, including resumed sessions. Pending replay skips repeated message IDs across failed polls and preserves later new messages.
+
 **Grok CPU** (`.env`: `BABATA_ENGINE=grok`):
 babata runs turns through the local Grok CLI in headless `streaming-json` mode. It uses `BABATA_GROK_CLI_PATH` / `GROK_CLI_PATH` when set, otherwise `grok`. Set `BABATA_GROK_CLI_PATH=~/.local/bin/grok43-high` only when that local Sub2API route is healthy. Current first cut supports query, resume within babata's own Grok state, `/stop`, final-message streaming, image input through Grok content blocks, and babata memory injection.
 
 **Full trust** (`.env`: `BABATA_FULL_TRUST=1`):
-babata's CC subprocess runs with `cwd=$HOME` and `permission_mode=auto` (CC official auto mode, status shows "auto mode on") — can read your home, run any command without prompts for low-risk work. Because project discovery now starts at `$HOME`, babata explicitly appends this repo's `CLAUDE.md` safety adapter in this mode. ⚠️ Only when `ALLOWED_USER_ID` is strictly correct, since anyone who can DM the bot effectively gets shell access.
+babata's Claude subprocess runs with `cwd=$HOME`, `permission_mode=bypassPermissions`, and command sandboxing disabled. Codex uses `danger-full-access`; Grok uses `bypassPermissions`. Because Claude project discovery starts at `$HOME`, babata explicitly appends this repo's `CLAUDE.md` adapter. Channel sender authorization still applies.
+
+For an existing macOS TG or WeChat service, `scripts/self-ops.sh enable-full-trust <label>` enables full trust for that service only. It validates the entrypoint, privately backs up and updates its plist, waits for idle before reloading, verifies the loaded permissions and a stable process, and restores the old configuration if reload fails. The command returns a private JSON receipt path; queueing is not completion. Repeated calls with an already-loaded matching configuration do not reload the service. Explicit service environment variables take precedence over shared `.env` defaults in both channels. Other services and fresh-install defaults are unchanged.
+
+Use `scripts/self-ops.sh set-reasoning <label> low` to set the lowest GPT-6 Astra reasoning level for one TG or WeChat service. It uses the same backup, idle reload, read-back, and rollback transaction without changing the model or trust configuration.
+
+Use `scripts/self-ops.sh set-model <label> <model> [<reasoning>]` to change one channel's Codex default model and optionally its reasoning effort in the same transaction. Existing sessions apply the defaults on their next turn.
 
 ## Multi-instance
 
