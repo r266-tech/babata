@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 import uuid
@@ -393,8 +394,32 @@ def _tool_content_guard_findings(
     return findings
 
 
+# rg flags that run another program over the searched files.
+_SEARCH_EXEC_FLAGS = ("--pre", "--pre-glob", "--hostname-bin", "--search-zip", "-z")
+
+
+def _is_read_only_search_command(command: str) -> bool:
+    # Newlines chain commands; $ and ` substitute them.
+    if any(ch in command for ch in "\n\r$`"):
+        return False
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    if not tokens or any(re.fullmatch(r"[;&|<>()]+", token) for token in tokens):
+        return False
+    if any(token.split("=", 1)[0] in _SEARCH_EXEC_FLAGS for token in tokens[1:]):
+        return False
+    return Path(tokens[0]).name in {"rg", "grep"}
+
+
 def _tool_command_guard_findings(command: str) -> list[dict[str, Any]]:
     lowered = command.lower()
+    if _is_read_only_search_command(command):
+        lowered = ""
     findings: list[dict[str, Any]] = []
     if _is_dangerous_git_command(command):
         findings.append(_finding(

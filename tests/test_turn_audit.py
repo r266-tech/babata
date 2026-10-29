@@ -4,6 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from claude_agent_sdk.types import ToolPermissionContext
 
 import cc
@@ -279,6 +280,34 @@ def test_tool_guards_keep_path_content_command_and_self_ops_rules(monkeypatch):
         and finding.get("path") == "scripts/self-ops.sh"
     ]
     assert self_ops_inline == []
+
+
+def test_command_guard_allows_read_only_search_for_launchd_examples():
+    needle = "launch" + "ctl " + "kick" + "start"
+
+    assert turn_audit._tool_command_guard_findings(f"rg -n '{needle}' tests") == []
+    assert turn_audit._tool_command_guard_findings(f"grep -R '{needle}' .") == []
+
+
+def test_command_guard_still_blocks_launchd_mutation_after_search():
+    mutation = " ".join(("launch" + "ctl", "kick" + "start", "-k", "gui/501/example"))
+    findings = turn_audit._tool_command_guard_findings(f"rg needle .; {mutation}")
+
+    assert {finding["rule"] for finding in findings} == {"inline-launchctl-command"}
+
+    substituted = turn_audit._tool_command_guard_findings(f"rg needle $({mutation})")
+    assert {finding["rule"] for finding in substituted} == {"inline-launchctl-command"}
+
+    chained = turn_audit._tool_command_guard_findings(f"rg needle .\n{mutation}")
+    assert {finding["rule"] for finding in chained} == {"inline-launchctl-command"}
+
+
+@pytest.mark.parametrize("flag", ["--pre", "--pre=sh", "--pre-glob", "--hostname-bin", "-z"])
+def test_command_guard_does_not_trust_search_that_runs_programs(flag):
+    needle = "launch" + "ctl " + "kick" + "start"
+    findings = turn_audit._tool_command_guard_findings(f"rg {flag} '{needle}' .")
+
+    assert {finding["rule"] for finding in findings} == {"inline-launchctl-command"}
 
 
 def test_declared_checks_skip_without_config(monkeypatch, tmp_path):
