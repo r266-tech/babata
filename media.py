@@ -48,15 +48,50 @@ async def _stt_local(wav_path: Path) -> str:
     return await loop.run_in_executor(None, _do_transcribe)
 
 
+def _media_ai_bin() -> str | None:
+    """babata-media-ai: Gemini via Google free tier first, babata relay when that's busy/out."""
+    return os.environ.get("BABATA_MEDIA_AI") or shutil.which("babata-media-ai")
+
+
+async def gemini_media(path: Path, prompt: str, timeout: float = 240) -> str:
+    """Audio/video/image file → text via Gemini (babata-media-ai). Raises on failure."""
+    exe = _media_ai_bin()
+    if not exe:
+        raise RuntimeError("babata-media-ai 不在 PATH")
+    proc = await asyncio.create_subprocess_exec(
+        exe, str(path), prompt,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise RuntimeError(f"Gemini 超时 (>{timeout:.0f}s)") from None
+    if proc.returncode != 0:
+        raise RuntimeError(f"Gemini 失败: {err.decode(errors='replace').strip()[-200:]}")
+    header, _, text = out.decode(errors="replace").partition("\n")
+    log.info("media understood by %s", header.strip("[]"))
+    if not text.strip():
+        raise RuntimeError("Gemini 返回空结果")
+    return text.strip()
+
+
 async def _stt_wav(wav_path: Path) -> str:
-    """STT dispatcher: MiMo when configured; local whisper only by explicit opt-in."""
+    """STT dispatcher: Gemini → MiMo when configured → local whisper only by explicit opt-in."""
+    gemini_err = ""
+    if _media_ai_bin():
+        try:
+            return await gemini_media(wav_path, _STT_PROMPT, timeout=120)
+        except RuntimeError as e:
+            gemini_err = f"{e}; "
+            log.warning("Gemini STT failed, trying next: %s", e)
     api_url = os.environ.get("MIMO_API_URL")
     api_key = os.environ.get("MIMO_API_KEY")
     if not api_url or not api_key:
         if os.environ.get("BABATA_STT_LOCAL") == "1":
             return await _stt_local(wav_path)
         raise RuntimeError(
-            "STT 未配置: 设置 MIMO_API_URL/MIMO_API_KEY; "
+            f"{gemini_err}STT 无备用: 设置 MIMO_API_URL/MIMO_API_KEY; "
             "或显式 BABATA_STT_LOCAL=1 并安装 babata[stt-local]."
         )
 
@@ -170,9 +205,15 @@ async def understand_video(video_path: Path, question: str = "") -> str | None:
     """Send video to an OpenAI-compatible multimodal endpoint → text description.
 
     Physical: CC SDK doesn't accept video. Delegate to a video-native model
-    (e.g. mimo-v2-omni), feed the textual summary back to CC.
+    (Gemini via babata-media-ai first, else mimo-v2-omni), feed the textual summary back to CC.
     Returns None if no endpoint configured or call fails.
     """
+    prompt = question or "请详细描述这段视频的画面和声音内容；有人说话就逐字转写。"
+    if _media_ai_bin():
+        try:
+            return await gemini_media(video_path, prompt)
+        except RuntimeError as e:
+            log.warning("Gemini video understanding failed: %s", e)
     api_url = os.environ.get("MIMO_API_URL")
     api_key = os.environ.get("MIMO_API_KEY")
     if not api_url:
@@ -183,7 +224,6 @@ async def understand_video(video_path: Path, question: str = "") -> str | None:
 
     import httpx
     data_url = f"data:video/mp4;base64,{base64.b64encode(video_path.read_bytes()).decode()}"
-    prompt = question or "请详细描述这段视频的画面和声音内容。"
 
     headers = {"Content-Type": "application/json"}
     if api_key:

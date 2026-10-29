@@ -30,6 +30,13 @@ def pytest_sessionfinish(session, exitstatus):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_gemini_media(monkeypatch):
+    """babata-media-ai is on the dev PATH; tests must never hit Gemini for real."""
+    import media
+    monkeypatch.setattr(media, "_media_ai_bin", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _disable_codex_memory_inject_by_default(monkeypatch):
     monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "0")
     monkeypatch.setenv("BABATA_CC_MEMORY_INJECT", "0")
