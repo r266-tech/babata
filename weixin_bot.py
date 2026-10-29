@@ -36,18 +36,19 @@ load_dotenv(override=False)
 
 from constants import PROJECT, STATE_DIR, WEIXIN_DATA_DIR
 from engine import VENV_PYTHON, make_engine
-from media import transcribe_silk, understand_video
+from media import transcribe_silk, transcribe_voice, understand_video
 from weixin_account import (
     add_allow_from, clear_stale_for_user, get_context_token, is_allowed,
     list_account_ids, load_account, load_allow_from, load_sync_buf,
-    register_account, save_account, save_sync_buf, set_context_token,
+    recall_message, register_account, remember_message, save_account,
+    save_sync_buf, set_context_token,
 )
 from weixin_bridge import bridge
 from weixin_ilink import (
     ITEM_FILE, ITEM_IMAGE, ITEM_TEXT, ITEM_VIDEO, ITEM_VOICE,
-    MEDIA_IMAGE, image_item,
     WeixinClient, WeixinSessionExpired,
-    normalize_account_id, start_qr_login, text_item, wait_qr_login,
+    normalize_account_id, send_image, start_qr_login, text_item, wait_qr_login,
+    wechat_markdown,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
@@ -99,7 +100,10 @@ _WEIXIN_MCP_SCRIPT = str(Path(__file__).parent / "weixin_mcp.py")
 
 _WX_SOURCE_PROMPT = (
     "Source: WeChat. "
-    "Markdown ok; bare URLs visible, [text](url) hides URL. "
+    "Renders Markdown: # to ####, **bold**, lists, > quote, tables, `code`, fences; "
+    "no italics on Chinese. "
+    "bare URLs visible, [text](url) hides URL. "
+    "![](local path or https URL) arrives as a real image. "
     "New bubble: \\n\\n\\n. "
     "No edit-message; "
     "Max 4000."
@@ -314,15 +318,29 @@ class WxBubbleSendResult:
     ok: bool
 
 
+async def _send_wx_image(
+    client: WeixinClient,
+    to_user: str,
+    ctx_token: str | None,
+    target: str | Path,
+) -> None:
+    await send_image(client, to_user, str(target), context_token=ctx_token)
+
+
 async def _send_wx_bubble(
     client: WeixinClient,
     from_user: str,
     ctx_token: str | None,
     text: str,
+    account_id: str = "",
 ) -> WxBubbleSendResult:
-    """Send one logical WeChat bubble, with markdown stripping, chunking, and one retry."""
+    """Send one logical WeChat bubble, with markdown stripping, chunking, and one retry.
+
+    Markdown images are pulled out of the text and delivered as image messages.
+    """
+    text, image_targets = wechat_markdown(text)
     text = _strip_markdown(text)
-    if not text:
+    if not text and not image_targets:
         return WxBubbleSendResult(sent_any=False, ok=True)
     sent_any = False
     ok = True
@@ -330,9 +348,10 @@ async def _send_wx_bubble(
         success = False
         for attempt in range(2):
             try:
-                await client.send_message(
+                resp = await client.send_message(
                     from_user, [text_item(chunk)], context_token=ctx_token,
                 )
+                remember_message(account_id, (resp or {}).get("message_id"), chunk)
                 sent_any = True
                 success = True
                 break
@@ -344,6 +363,20 @@ async def _send_wx_bubble(
                     log.error("wx send failed (gave up)", exc_info=True)
         if not success:
             ok = False
+    for target in image_targets:
+        try:
+            await _send_wx_image(client, from_user, ctx_token, target)
+            sent_any = True
+        except Exception as e:
+            log.warning("markdown image delivery failed: %s: %s", target, e)
+            try:
+                await client.send_message(
+                    from_user, [text_item(f"[图片发送失败: {target}]")],
+                    context_token=ctx_token,
+                )
+                sent_any = True
+            except Exception:
+                ok = False
     return WxBubbleSendResult(sent_any=sent_any, ok=ok)
 
 
@@ -504,13 +537,52 @@ def _sniff_image_mime(data: bytes) -> str:
     return "image/jpeg"
 
 
+# Claude rejects inline images above ~5 MB base64; larger ones are shrunk with
+# macOS sips first, and fall back to path-only when that is not enough.
+_INLINE_IMAGE_MAX = 3_750_000
+_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".tif", ".tiff"}
+# VoiceItem.encode_type → file suffix ffmpeg can read; None / 6 are SILK.
+_VOICE_SUFFIXES = {1: ".pcm", 2: ".adpcm", 4: ".spx", 5: ".amr", 7: ".mp3", 8: ".ogg"}
+
+
+async def _inline_image(path: Path, raw: bytes) -> list[dict[str, str]]:
+    mime = _sniff_image_mime(raw)
+    if len(raw) <= _INLINE_IMAGE_MAX and path.suffix.lower() not in {".heic", ".bmp", ".tif", ".tiff"}:
+        return [{"media_type": mime, "data": base64.b64encode(raw).decode()}]
+    small = path.with_name(path.stem + "-inline.jpg")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "sips", "-s", "format", "jpeg", "-Z", "2048", str(path), "--out", str(small),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=30)
+        data = small.read_bytes()
+    except Exception as e:
+        log.warning("image shrink failed for %s: %s", path, e)
+        return []
+    finally:
+        small.unlink(missing_ok=True)
+    if len(data) > _INLINE_IMAGE_MAX:
+        return []
+    return [{"media_type": "image/jpeg", "data": base64.b64encode(data).decode()}]
+
+
+def _human_size(n: int) -> str:
+    for unit in ("B", "KB", "MB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}"
+        n /= 1024
+    return f"{n:.1f}GB"
+
+
 async def _decode_item(
     client: WeixinClient, item: dict[str, Any]
 ) -> tuple[str, list[dict[str, str]]]:
     """One inbound MessageItem → (text_body, images_for_cc).
 
-    Returns text that goes into the CC prompt + base64 image blocks.
-    Voice/video are converted to text descriptions; files are saved locally.
+    Returns text that goes into the CC prompt + base64 image blocks. Voice is
+    transcribed; images are inlined; video and files stay on disk with their
+    path in the text so the CPU can open, convert or forward them.
     """
     itype = item.get("type")
 
@@ -520,57 +592,65 @@ async def _decode_item(
     if itype == ITEM_VOICE:
         voice = item.get("voice_item") or {}
         media = voice.get("media") or {}
+        secs = round((voice.get("playtime") or 0) / 1000)
+        label = f"[语音 {secs}s]" if secs else "[语音]"
         if voice.get("text"):  # server-provided transcription (fast path, no download)
-            return (f"[语音] {voice['text']}", [])
-        silk_path: Path | None = None
+            return (f"{label} {voice['text']}", [])
         try:
             raw = await client.download_media(media)
-            silk_path = _inbound_tmp(".silk")
-            silk_path.write_bytes(raw)
-            text = await transcribe_silk(silk_path)
-            return (f"[语音] {text}", [])
         except Exception as e:
-            log.warning("voice decode failed: %s", e)
-            return (f"[语音转文字失败: {e}]", [])
-        finally:
-            if silk_path:
-                silk_path.unlink(missing_ok=True)
+            log.warning("voice download failed: %s", e)
+            return (f"[语音下载失败: {e}]", [])
+        audio_path = _inbound_tmp(_VOICE_SUFFIXES.get(voice.get("encode_type"), ".silk"))
+        audio_path.write_bytes(raw)
+        try:
+            if audio_path.suffix == ".silk":
+                text = await transcribe_silk(audio_path)
+            else:
+                text = await transcribe_voice(audio_path)
+        except Exception as e:
+            log.warning("voice transcribe failed: %s", e)
+            return (f"[语音转文字失败: {e}; 原始音频: {audio_path}]", [])
+        audio_path.unlink(missing_ok=True)
+        return (f"{label} {text}", [])
 
     if itype == ITEM_IMAGE:
         image = item.get("image_item") or {}
-        media = image.get("media") or {}
         aeskey_hex = image.get("aeskey")
-        try:
-            raw = await client.download_media(media, aeskey_hex_override=aeskey_hex)
-        except Exception as e:
-            log.warning("image download failed: %s", e)
-            return (f"[图片下载失败: {e}]", [])
+        raw = None
+        err: Exception | None = None
+        # Original first, then the thumbnail when the original is unavailable.
+        for media in (image.get("media"), image.get("thumb_media")):
+            if media is None:
+                continue
+            try:
+                raw = await client.download_media(media, aeskey_hex_override=aeskey_hex)
+                break
+            except Exception as e:
+                err = e
+        if raw is None:
+            log.warning("image download failed: %s", err)
+            return (f"[图片下载失败: {err or '消息没有媒体引用'}]", [])
         mime = _sniff_image_mime(raw)
         ext = "jpg" if mime == "image/jpeg" else mime.split("/")[-1]
         img_path = _inbound_tmp(f".{ext}")
         img_path.write_bytes(raw)
-        return (
-            f"[图片: {img_path}]",
-            [{"media_type": mime,
-              "data": base64.b64encode(raw).decode()}],
-        )
+        return (f"[图片: {img_path}]", await _inline_image(img_path, raw))
 
     if itype == ITEM_VIDEO:
         video = item.get("video_item") or {}
         media = video.get("media") or {}
-        video_path: Path | None = None
         try:
             raw = await client.download_media(media)
-            video_path = _inbound_tmp(".mp4")
-            video_path.write_bytes(raw)
-            desc = await understand_video(video_path)
-            return (f"[视频] {desc}" if desc else "[视频：无法理解内容]", [])
         except Exception as e:
-            log.warning("video handle failed: %s", e)
-            return (f"[视频处理失败: {e}]", [])
-        finally:
-            if video_path:
-                video_path.unlink(missing_ok=True)
+            log.warning("video download failed: %s", e)
+            return (f"[视频下载失败: {e}]", [])
+        video_path = _inbound_tmp(".mp4")
+        video_path.write_bytes(raw)
+        secs = round((video.get("play_length") or 0))
+        head = f"[视频: {video_path}{f', {secs}s' if secs else ''}, {_human_size(len(raw))}]"
+        desc = await understand_video(video_path)
+        return (f"{head} {desc}" if desc else head, [])
 
     if itype == ITEM_FILE:
         f = item.get("file_item") or {}
@@ -578,39 +658,51 @@ async def _decode_item(
         file_name = f.get("file_name") or "file"
         try:
             raw = await client.download_media(media)
-            safe_name = re.sub(r"[/\\\x00]", "_", file_name)
-            _INBOUND_DIR.mkdir(parents=True, exist_ok=True)
-            path = _INBOUND_DIR / f"{int(time.time())}-{safe_name}"
-            path.write_bytes(raw)
-            return (f"[用户发来文件: {path}]", [])
         except Exception as e:
             log.warning("file download failed: %s", e)
-            return (f"[文件下载失败: {e}]", [])
+            return (f"[文件下载失败: {file_name}: {e}]", [])
+        safe_name = re.sub(r"[/\\\x00]", "_", file_name)
+        _INBOUND_DIR.mkdir(parents=True, exist_ok=True)
+        path = _INBOUND_DIR / f"{int(time.time())}-{safe_name}"
+        path.write_bytes(raw)
+        images = await _inline_image(path, raw) if path.suffix.lower() in _IMAGE_SUFFIXES else []
+        return (f"[用户发来文件: {path} ({_human_size(len(raw))})]", images)
 
-    return (f"[未知消息类型 type={itype}]", [])
+    raw_item = json.dumps(item, ensure_ascii=False)[:1500]
+    return (f"[未知消息类型 type={itype}: {raw_item}]", [])
 
 
-def _describe_ref(ref: dict[str, Any] | None) -> str:
+_REF_LABELS = {ITEM_IMAGE: "图片", ITEM_VOICE: "语音", ITEM_FILE: "文件", ITEM_VIDEO: "视频"}
+
+
+def _describe_ref(ref: dict[str, Any] | None, account_id: str = "") -> str:
     if not ref:
         return ""
     title = (ref.get("title") or "").strip()
     item = ref.get("message_item") or {}
     t = item.get("type")
     if t == ITEM_TEXT:
-        body = ((item.get("text_item") or {}).get("text") or "").strip()[:80]
+        body = ((item.get("text_item") or {}).get("text") or "").strip()[:500]
         return f"[引用: {body}]" if body else "[引用了一条文本]"
-    labels = {ITEM_IMAGE: "图片", ITEM_VOICE: "语音", ITEM_FILE: "文件", ITEM_VIDEO: "视频"}
-    label = labels.get(t, "消息")
-    return f"[引用 {label}: {title}]" if title else f"[引用了一条{label}]"
+    if t in _REF_LABELS:
+        label = _REF_LABELS[t]
+        return f"[引用 {label}: {title}]" if title else f"[引用了一条{label}]"
+    # Newer clients quote by server id only; resolve from the local cache.
+    cached = recall_message(account_id, ref.get("svr_id") or item.get("msg_id"))
+    if cached:
+        return f"[引用: {cached[:500]}]"
+    return f"[引用: {title}]" if title else "[引用了一条消息，原文未缓存]"
 
 
-# ── per-user burst coalescing ────────────────────────────────────────
-# WeChat has no album grouping (unlike TG's media_group_id), so image +
-# caption arrive as separate msgs. Rule: image is a "comma" (wait for
-# follow-up), any non-image (text/voice/video/file) is a "period" (end of
-# burst). Non-image without a pending burst bypasses debounce entirely.
-_MESSAGE_DEBOUNCE_S = 3.0
-_pending: dict[tuple[str, str], dict[str, Any]] = {}
+# ── turn gathering ───────────────────────────────────────────────────
+# WeChat has no album grouping and media lands only after its CDN upload, so a
+# caption or "看这个文件" can arrive before the image/file it refers to. Polling
+# is paused while a turn runs, so the poll loop keeps listening briefly after a
+# batch and merges stragglers into the same turn.
+_WX_GRACE_S = float(os.environ.get("BABATA_WX_GRACE_S", "2.5"))
+_WX_MEDIA_GRACE_S = 8.0   # text mentions media that has not arrived yet
+_WX_GRACE_MAX_S = 15.0
+_MEDIA_HINT_RE = re.compile(r"图|照片|截图|文件|附件|视频|语音|录音|pdf|PDF|发了|发你|看下这|看看这")
 # A recoverable CPU failure must not permanently drop the inbound WeChat turn.
 # Retry the same decoded burst before the caller advances to later updates.
 _WX_MAX_TURN_RECOVERY_ATTEMPTS = int(
@@ -619,8 +711,40 @@ _WX_MAX_TURN_RECOVERY_ATTEMPTS = int(
         os.environ.get("BABATA_TURN_RECOVERY_ATTEMPTS", "2"),
     )
 )
-_wx_processing_tasks: set[asyncio.Task] = set()
 _pending_wx_lock = asyncio.Lock()
+
+
+def _awaits_media(msgs: list[dict[str, Any]]) -> bool:
+    items = [it for m in msgs if m.get("message_type") == 1 for it in (m.get("item_list") or [])]
+    if any(it.get("type") != ITEM_TEXT for it in items):
+        return False
+    return any(
+        _MEDIA_HINT_RE.search((it.get("text_item") or {}).get("text") or "") for it in items
+    )
+
+
+async def _gather_stragglers(
+    client: WeixinClient, buf: str, msgs: list[dict[str, Any]],
+) -> str:
+    """Short follow-up polls appending late messages to `msgs`. Returns the newest buf."""
+    if _WX_GRACE_S <= 0:
+        return buf
+    deadline = time.monotonic() + _WX_GRACE_MAX_S
+    while (remaining := deadline - time.monotonic()) > 0:
+        wait = _WX_MEDIA_GRACE_S if _awaits_media(msgs) else _WX_GRACE_S
+        try:
+            more = await asyncio.wait_for(client.get_updates(buf), timeout=min(wait, remaining))
+        except asyncio.TimeoutError:
+            break  # the cursor is client-held, so an abandoned poll loses nothing
+        except Exception as e:
+            log.debug("straggler poll stopped: %s", e)
+            break
+        late = more.get("msgs") or []
+        buf = more.get("get_updates_buf", buf)
+        if not late:
+            break
+        msgs.extend(late)
+    return buf
 
 
 def _load_pending_wx_updates() -> dict[str, dict[str, Any]]:
@@ -696,21 +820,15 @@ async def _pending_wx_batches_for_account(account_id: str) -> list[dict[str, Any
 _cc_lock = asyncio.Lock()
 
 
-def _track_wx_processing_task(task: asyncio.Task) -> asyncio.Task:
-    _wx_processing_tasks.add(task)
-    task.add_done_callback(_wx_processing_tasks.discard)
-    return task
-
-
 async def _enqueue_inbound_msg(
     client: WeixinClient, msg: dict[str, Any], account_id: str
-) -> asyncio.Task | bool:
+) -> bool:
     return await _enqueue_inbound_msgs(client, [msg], account_id)
 
 
 async def _enqueue_inbound_msgs(
     client: WeixinClient, msgs: list[dict[str, Any]], account_id: str
-) -> asyncio.Task | bool:
+) -> bool:
     if not msgs:
         return True
 
@@ -724,77 +842,11 @@ async def _enqueue_inbound_msgs(
         log.warning("ignoring unauthorized from=%s", from_user)
         return True
 
-    has_image = any(
-        item.get("type") == ITEM_IMAGE
-        for msg in msgs
-        for item in (msg.get("item_list") or [])
-    )
-    has_non_image = any(
-        item.get("type") != ITEM_IMAGE
-        for msg in msgs
-        for item in (msg.get("item_list") or [])
-    )
-
-    key = (account_id, from_user)
-    pending = _pending.get(key)
-
-    if pending is not None:
-        # Inside an active burst: always append, and if this is non-image
-        # (text/voice/video/file) mark the burst complete for immediate flush.
-        pending["msgs"].extend(msgs)
-        pending["last_arrival_at"] = time.monotonic()
-        if has_non_image:
-            pending["non_image_arrived"].set()
-        return pending.get("task")
-
-    if not has_image or has_non_image:
-        # No pending burst + no image — straight to CC, no debounce.
-        async with _cc_lock:
-            try:
-                return await _process_combined_msgs(client, msgs, account_id)
-            except Exception:
-                log.exception("msg processing crashed")
-                return False
-
-    # Image starts a burst that waits for the follow-up.
-    pending = {
-        "msgs": list(msgs),
-        "client": client,
-        "account_id": account_id,
-        "last_arrival_at": time.monotonic(),
-        "non_image_arrived": asyncio.Event(),
-    }
-    task = _track_wx_processing_task(asyncio.create_task(_flush_pending(key)))
-    pending["task"] = task
-    _pending[key] = pending
-    return task
-
-
-async def _flush_pending(key: tuple[str, str]) -> bool:
-    pending = _pending.get(key)
-    if pending is None:
-        return True
-    event = pending["non_image_arrived"]
-    while True:
-        try:
-            await asyncio.wait_for(event.wait(), timeout=_MESSAGE_DEBOUNCE_S)
-            break  # non-image arrived → burst complete
-        except asyncio.TimeoutError:
-            pending = _pending.get(key)
-            if pending is None:
-                return True
-            if time.monotonic() - pending["last_arrival_at"] < _MESSAGE_DEBOUNCE_S:
-                continue  # more images still arriving, keep waiting
-            break  # true quiet window — flush what we have
-
-    _pending.pop(key, None)
     async with _cc_lock:
         try:
-            return await _process_combined_msgs(
-                pending["client"], pending["msgs"], pending["account_id"],
-            )
+            return await _process_combined_msgs(client, msgs, account_id)
         except Exception:
-            log.exception("combined msg processing crashed")
+            log.exception("msg processing crashed")
             return False
 
 
@@ -825,6 +877,7 @@ def _truncate_wx_input(text: str) -> str:
 async def _collect_wx_turn_inputs(
     client: WeixinClient,
     msgs: list[dict[str, Any]],
+    account_id: str = "",
 ) -> tuple[str, str | None, str, list[dict[str, str]]]:
     from_user = msgs[0].get("from_user_id") or ""
     ctx_token = next(
@@ -837,13 +890,21 @@ async def _collect_wx_turn_inputs(
         texts: list[str] = []
         ref_note = ""
         for item in msg.get("item_list") or []:
-            if item.get("ref_msg"):
-                ref_note = _describe_ref(item.get("ref_msg"))
+            ref = item.get("ref_msg")
+            if ref:
+                ref_note = _describe_ref(ref, account_id)
+                ref_item = ref.get("message_item") or {}
+                if ref_item.get("type") in _REF_LABELS:
+                    # Quoted media is downloaded so the CPU sees what was quoted.
+                    ref_text, ref_imgs = await _decode_item(client, ref_item)
+                    ref_note = f"{ref_note} {ref_text}".strip()
+                    images.extend(ref_imgs)
             text, imgs = await _decode_item(client, item)
             if text:
                 texts.append(text)
             images.extend(imgs)
         body = "\n".join(t for t in texts if t).strip()
+        remember_message(account_id, msg.get("message_id"), body)
         if ref_note:
             body = f"{ref_note}\n{body}" if body else ref_note
         if body:
@@ -927,7 +988,9 @@ async def _process_combined_msgs(
     if not msgs:
         return True
 
-    from_user, ctx_token, combined, images = await _collect_wx_turn_inputs(client, msgs)
+    from_user, ctx_token, combined, images = await _collect_wx_turn_inputs(
+        client, msgs, account_id,
+    )
     if not combined and not images:
         log.info("inbound from %s: no decodable content", from_user)
         return True
@@ -949,7 +1012,7 @@ async def _process_combined_msgs(
     # split at safe boundaries (paragraph / line / sentence-end) rather than
     # mid-word, and only hard-cut at end-of-stream when nothing safe exists.
     async def send_bubble(text: str) -> WxBubbleSendResult:
-        return await _send_wx_bubble(client, from_user, ctx_token, text)
+        return await _send_wx_bubble(client, from_user, ctx_token, text, account_id)
 
     coalescer = WxStreamCoalescer(send_bubble)
 
@@ -965,12 +1028,7 @@ async def _process_combined_msgs(
     for raw_path in resp.generated_images:
         path = Path(raw_path).expanduser()
         try:
-            uploaded = await client.upload_media(
-                path.read_bytes(), to_user_id=from_user, media_type=MEDIA_IMAGE,
-            )
-            await client.send_message(
-                from_user, [image_item(uploaded)], context_token=ctx_token,
-            )
+            await _send_wx_image(client, from_user, ctx_token, path)
         except Exception as e:
             log.warning("generated image delivery failed: %s: %s", path, e)
             await _set_wx_typing(client, from_user, ticket, 2)
@@ -1016,28 +1074,17 @@ async def _process_wx_units(
     units: list[list[dict[str, Any]]],
 ) -> bool:
     batch_ok = True
-    processing_tasks: list[asyncio.Task] = []
     for msg_unit in units:
         try:
             if len(msg_unit) == 1:
                 result = await _enqueue_inbound_msg(client, msg_unit[0], account_id)
             else:
                 result = await _enqueue_inbound_msgs(client, msg_unit, account_id)
-            if isinstance(result, asyncio.Task):
-                processing_tasks.append(result)
-            elif result is False:
+            if result is False:
                 batch_ok = False
         except Exception:
             batch_ok = False
             log.exception("msg enqueue crashed")
-    if processing_tasks:
-        unique_tasks = list(dict.fromkeys(processing_tasks))
-        results = await asyncio.gather(*unique_tasks, return_exceptions=True)
-        for result in results:
-            if result is False or isinstance(result, Exception):
-                batch_ok = False
-                if isinstance(result, Exception):
-                    log.warning("async wx processing failed: %s", result)
     return batch_ok
 
 
@@ -1197,7 +1244,10 @@ async def _run_account(account_id: str) -> None:
 
         fails = 0
         new_buf = resp.get("get_updates_buf", buf)
-        units = _coalesce_update_msgs(resp.get("msgs") or [])
+        msgs = list(resp.get("msgs") or [])
+        if _coalesce_update_msgs(msgs):
+            new_buf = await _gather_stragglers(client, new_buf, msgs)
+        units = _coalesce_update_msgs(msgs)
         pending_record_id = ""
         batch_ok = True
         if units:

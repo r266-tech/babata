@@ -58,7 +58,7 @@ _WX_TOOL_SPECS = (
     (
         "wx_send_image",
         (
-            "Send jpg/png/gif/webp/bmp to WeChat; caption sends separate text first."
+            "Send image (local path or https URL) to WeChat; caption sent first."
         ),
         {
             "path": {

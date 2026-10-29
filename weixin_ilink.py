@@ -11,6 +11,7 @@ import base64
 import hashlib
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 import secrets
@@ -35,7 +36,7 @@ ILINK_APP_ID = os.environ.get("WEIXIN_ILINK_APP_ID", "bot")
 
 # Mirror the upstream plugin version so the server-side client-version gate
 # behaves the same. Bump when the iLink protocol changes materially.
-CLIENT_VERSION_STR = "2.1.8"  # mirror npm openclaw-weixin; "1.0.0" 直接 CDN 404
+CLIENT_VERSION_STR = "2.4.10"  # mirror npm openclaw-weixin; "1.0.0" 直接 CDN 404
 CLIENT_VERSION_INT = (
     ((int(CLIENT_VERSION_STR.split(".")[0]) & 0xFF) << 16)
     | ((int(CLIENT_VERSION_STR.split(".")[1]) & 0xFF) << 8)
@@ -58,6 +59,8 @@ LOGIN_TOTAL_TIMEOUT_S = 480
 MEDIA_IMAGE = 1
 MEDIA_VIDEO = 2
 MEDIA_FILE = 3
+
+IMAGE_FETCH_MAX = 20 * 1024 * 1024
 
 # Inbound MessageItem type values (proto: MessageItemType).
 ITEM_TEXT = 1
@@ -360,7 +363,7 @@ class WeixinClient:
         item_list: list[dict[str, Any]],
         *,
         context_token: str | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Send one message. `item_list` is 1+ MessageItem dicts.
 
         Every call auto-generates a fresh `client_id` and carries an empty
@@ -396,6 +399,12 @@ class WeixinClient:
             [it.get("type") for it in item_list],
             resp,
         )
+        # HTTP 200 with non-zero ret is a rejected send, not a delivered one.
+        if resp.get("ret"):
+            raise WeixinApiError(
+                f"sendmessage ret={resp.get('ret')} errmsg={resp.get('errmsg') or ''}"
+            )
+        return resp
 
     async def get_upload_url(
         self,
@@ -578,9 +587,10 @@ class WeixinClient:
                     key = None
             except ValueError:
                 key = None
+        raw_key = cdn_media.get("aes_key")
         if key is None:
-            key = _parse_inbound_aes_key(cdn_media.get("aes_key"))
-        if key is None:
+            key = _parse_inbound_aes_key(raw_key)
+        if key is None and raw_key:
             raise WeixinApiError("download_media: could not parse aes_key")
 
         full_url = (cdn_media.get("full_url") or "").strip()
@@ -588,14 +598,65 @@ class WeixinClient:
             qp = cdn_media.get("encrypt_query_param")
             if not qp:
                 raise WeixinApiError("download_media: no full_url or encrypt_query_param")
-            full_url = f"{self.cdn_base_url}/{qp.lstrip('/')}"
+            full_url = (
+                f"{self.cdn_base_url}/download"
+                f"?encrypted_query_param={quote(qp, safe='')}"
+            )
 
         async with httpx.AsyncClient(timeout=120) as c:
             r = await c.get(full_url)
             r.raise_for_status()
-            ciphertext = r.content
+            content = r.content
 
-        return _decrypt_aes_ecb(ciphertext, key)
+        # Some images arrive without any key: the CDN serves them in plaintext.
+        return _decrypt_aes_ecb(content, key) if key else content
+
+
+# ── WeChat Markdown compat (mirror of plugin markdown-filter.ts) ───────
+# The WeChat client renders headings H1-H4, bold, lists, quotes, tables,
+# inline code and fences. It garbles italics around CJK text, ignores
+# H5/H6, and cannot render images inline, so those are rewritten here.
+
+_MD_PROTECTED_RE = re.compile(r"```.*?(?:```|\Z)|`[^`\n]+`", re.DOTALL)
+_MD_IMAGE_RE = re.compile(r'!\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)')
+_MD_DEEP_HEADING_RE = re.compile(r"^#{5,6}[ \t]+", re.MULTILINE)
+_MD_EMPHASIS_RE = re.compile(
+    r"(?<![*_\\])(\*{3}|_{3}|\*|_)(?=[^\s*_])([^\n]+?)(?<=[^\s*_])\1(?![*_])"
+)
+_CJK_RE = re.compile(r"[\u2E80-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF]")
+
+
+def _unwrap_cjk_emphasis(m: re.Match) -> str:
+    marker, body = m.group(1), m.group(2)
+    if "_" in marker and re.search(r"\w", m.string[m.start() - 1:m.start()] or ""):
+        return m.group(0)  # snake_case identifiers are not emphasis
+    return body if _CJK_RE.search(body) else m.group(0)
+
+
+def wechat_markdown(text: str) -> tuple[str, list[str]]:
+    """Adapt Markdown for the WeChat client. Returns (text, image_targets).
+
+    image_targets are the `![alt](target)` paths/URLs removed from the text;
+    the caller uploads them as real image messages. Code is left untouched.
+    """
+    images: list[str] = []
+
+    def outside(seg: str) -> str:
+        def take_image(m: re.Match) -> str:
+            images.append(m.group(2))
+            return ""
+        seg = _MD_IMAGE_RE.sub(take_image, seg)
+        seg = _MD_DEEP_HEADING_RE.sub("", seg)
+        return _MD_EMPHASIS_RE.sub(_unwrap_cjk_emphasis, seg)
+
+    out: list[str] = []
+    pos = 0
+    for m in _MD_PROTECTED_RE.finditer(text):
+        out.append(outside(text[pos:m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(outside(text[pos:]))
+    return "".join(out), images
 
 
 # ── item builders (convenience for send_message) ──────────────────────
@@ -632,6 +693,30 @@ def video_item(uploaded: dict[str, Any]) -> dict[str, Any]:
             "video_size": uploaded["cipher_size"],
         },
     }
+
+
+async def send_image(
+    client: "WeixinClient",
+    to_user_id: str,
+    source: str,
+    *,
+    context_token: str | None = None,
+) -> dict[str, Any]:
+    """Upload a local image path or http(s) URL, then send it as an image."""
+    if source.startswith(("http://", "https://")):
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
+            r = await c.get(source)
+            r.raise_for_status()
+            data = r.content
+        if len(data) > IMAGE_FETCH_MAX:
+            raise WeixinApiError(f"image too large: {len(data)} bytes")
+    else:
+        with open(os.path.expanduser(source.removeprefix("file://")), "rb") as fh:
+            data = fh.read()
+    uploaded = await client.upload_media(data, to_user_id=to_user_id, media_type=MEDIA_IMAGE)
+    return await client.send_message(
+        to_user_id, [image_item(uploaded)], context_token=context_token,
+    )
 
 
 def file_item(uploaded: dict[str, Any], file_name: str) -> dict[str, Any]:

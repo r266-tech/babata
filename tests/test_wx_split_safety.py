@@ -19,6 +19,7 @@ from cc import Response
 
 
 def reset_wx_pending(monkeypatch, tmp_path):
+    monkeypatch.setattr(wb, "_WX_GRACE_S", 0)
     monkeypatch.setattr(wb, "PENDING_WX_UPDATES_FILE", tmp_path / "wx-pending.json")
     wb._pending_wx_records = {}
 

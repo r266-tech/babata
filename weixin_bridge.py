@@ -167,16 +167,24 @@ class WeixinBridge:
     # ── handlers ──────────────────────────────────────────────────────
 
     async def _handle_send_text(self, request, writer) -> None:
-        from weixin_ilink import text_item
+        from weixin_account import remember_message
+        from weixin_ilink import send_image, text_item, wechat_markdown
 
-        text = request.get("text", "")
-        if not text:
+        text, images = wechat_markdown(request.get("text", ""))
+        text = text.strip()
+        if not text and not images:
             await self._respond(writer, "Error: empty text")
             return
-        await self.client.send_message(
-            self.to, [text_item(text)], context_token=self.context_token,
-        )
-        await self._respond(writer, "Text sent")
+        if images and await self._reject_restored_media_context(writer):
+            return
+        if text:
+            resp = await self.client.send_message(
+                self.to, [text_item(text)], context_token=self.context_token,
+            )
+            remember_message(self.account_id or "", (resp or {}).get("message_id"), text)
+        for source in images:
+            await send_image(self.client, self.to, source, context_token=self.context_token)
+        await self._respond(writer, f"Text sent (+{len(images)} images)" if images else "Text sent")
 
     async def _upload_and_send(
         self,
@@ -214,11 +222,22 @@ class WeixinBridge:
 
         if await self._reject_restored_media_context(writer):
             return
+        caption = (request.get("caption") or "").strip()
+        if str(request["path"]).startswith(("http://", "https://")):
+            from weixin_ilink import send_image, text_item
+            if caption:
+                await self.client.send_message(
+                    self.to, [text_item(caption)], context_token=self.context_token,
+                )
+            await send_image(
+                self.client, self.to, request["path"], context_token=self.context_token,
+            )
+            await self._respond(writer, "Image sent from URL")
+            return
         path = Path(request["path"]).expanduser()
         if not path.exists():
             await self._respond(writer, f"Error: file not found: {path}")
             return
-        caption = (request.get("caption") or "").strip()
         await self._upload_and_send(
             path=path, caption=caption,
             media_type=MEDIA_IMAGE, build_item=image_item,
