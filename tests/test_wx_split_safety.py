@@ -578,7 +578,7 @@ def test_weixin_process_sends_final_content_when_stream_has_no_delta(monkeypatch
 @pytest.mark.parametrize("content", ["", "图片已生成。"])
 def test_weixin_process_delivers_native_generated_image(monkeypatch, tmp_path, content):
     image = tmp_path / "generated.png"
-    image.write_bytes(b"native-image-bytes")
+    image.write_bytes(b"\x89PNG native-image-bytes")
 
     class FakeCC:
         async def query(self, *_args, **_kwargs):
@@ -612,7 +612,7 @@ def test_weixin_process_delivers_native_generated_image(monkeypatch, tmp_path, c
 
         assert await wb._process_combined_msgs(client, [msg], "image-account") is True
         assert len(client.uploads) == 1
-        assert client.uploads[0][0] == b"native-image-bytes"
+        assert client.uploads[0][0] == b"\x89PNG native-image-bytes"
         assert client.uploads[0][1]["to_user_id"] == "image-user"
         media_messages = [sent for sent in client.sent if sent[1][0]["type"] == wb.ITEM_IMAGE]
         assert len(media_messages) == 1
@@ -631,7 +631,7 @@ def test_weixin_process_delivers_native_generated_image(monkeypatch, tmp_path, c
 def test_weixin_generated_image_failure_keeps_turn_unconsumed(monkeypatch, tmp_path, failure):
     image = tmp_path / "generated.png"
     if failure != "missing":
-        image.write_bytes(b"native-image-bytes")
+        image.write_bytes(b"\x89PNG native-image-bytes")
 
     class FakeCC:
         async def query(self, *_args, **_kwargs):

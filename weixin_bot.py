@@ -371,7 +371,7 @@ async def _send_wx_bubble(
             log.warning("markdown image delivery failed: %s: %s", target, e)
             try:
                 await client.send_message(
-                    from_user, [text_item(f"[图片发送失败: {target}]")],
+                    from_user, [text_item("[图片发送失败]")],
                     context_token=ctx_token,
                 )
                 sent_any = True

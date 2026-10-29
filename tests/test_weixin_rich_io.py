@@ -277,3 +277,23 @@ def test_send_message_raises_on_nonzero_ret(monkeypatch):
     monkeypatch.setattr(client, "_post", fake_post)
     with pytest.raises(wi.WeixinApiError, match="ret=-2"):
         asyncio.run(client.send_message("u", [wi.text_item("x")]))
+
+
+def test_markdown_image_refuses_non_image_file(tmp_path):
+    secret = tmp_path / "id_rsa"
+    secret.write_text("-----BEGIN KEY-----")
+
+    class FakeClient:
+        def __init__(self):
+            self.texts = []
+
+        async def upload_media(self, *_a, **_k):
+            raise AssertionError("must not upload")
+
+        async def send_message(self, _to, items, **_k):
+            self.texts.append(items[0]["text_item"]["text"])
+            return {}
+
+    client = FakeClient()
+    asyncio.run(wb._send_wx_bubble(client, "u1", "ctx", f"![x]({secret})"))
+    assert client.texts == ["[图片发送失败]"]

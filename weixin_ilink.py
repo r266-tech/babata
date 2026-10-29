@@ -695,6 +695,13 @@ def video_item(uploaded: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_IMAGE_MAGIC = (b"\x89PNG", b"\xff\xd8\xff", b"GIF8", b"BM")
+
+
+def _is_image_bytes(data: bytes) -> bool:
+    return data.startswith(_IMAGE_MAGIC) or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+
+
 async def send_image(
     client: "WeixinClient",
     to_user_id: str,
@@ -702,17 +709,31 @@ async def send_image(
     *,
     context_token: str | None = None,
 ) -> dict[str, Any]:
-    """Upload a local image path or http(s) URL, then send it as an image."""
+    """Upload a local image path or http(s) URL, then send it as an image.
+
+    Only real image bytes are sent, so a Markdown image pointing at some other
+    file can never upload that file.
+    """
     if source.startswith(("http://", "https://")):
         async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
-            r = await c.get(source)
-            r.raise_for_status()
-            data = r.content
-        if len(data) > IMAGE_FETCH_MAX:
-            raise WeixinApiError(f"image too large: {len(data)} bytes")
+            async with c.stream("GET", source) as r:
+                r.raise_for_status()
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in r.aiter_bytes():
+                    size += len(chunk)
+                    if size > IMAGE_FETCH_MAX:
+                        raise WeixinApiError(f"image larger than {IMAGE_FETCH_MAX} bytes")
+                    chunks.append(chunk)
+        data = b"".join(chunks)
     else:
-        with open(os.path.expanduser(source.removeprefix("file://")), "rb") as fh:
+        path = os.path.realpath(os.path.expanduser(source.removeprefix("file://")))
+        if os.path.getsize(path) > IMAGE_FETCH_MAX:
+            raise WeixinApiError(f"image larger than {IMAGE_FETCH_MAX} bytes")
+        with open(path, "rb") as fh:
             data = fh.read()
+    if not _is_image_bytes(data):
+        raise WeixinApiError("not an image (jpg/png/gif/webp/bmp)")
     uploaded = await client.upload_media(data, to_user_id=to_user_id, media_type=MEDIA_IMAGE)
     return await client.send_message(
         to_user_id, [image_item(uploaded)], context_token=context_token,
