@@ -218,6 +218,7 @@ def reset_bot_globals(monkeypatch, tmp_path):
     bot._processed_set = set()
     bot._pending_update_records = {}
     bot._pending_delivery_records = {}
+    bot._delivery_in_progress = set()
     bot._state = {}
     bot._verbose = 1
     bot._in_flight = 0
@@ -826,6 +827,8 @@ def test_codex_status_snapshot_reads_collaboration_settings(monkeypatch, tmp_pat
         "_codex_config",
         lambda: {"model": "configured-model", "model_reasoning_effort": "medium"},
     )
+    monkeypatch.delenv("BABATA_CODEX_MODEL", raising=False)
+    monkeypatch.delenv("BABATA_CODEX_REASONING", raising=False)
 
     snap = bot._codex_status_snapshot("sid-2")
 
@@ -2231,5 +2234,114 @@ def test_channel_worker_reset_shortcut(monkeypatch, tmp_path):
         assert bot._in_flight == 0
 
         await worker.stop()
+
+    asyncio.run(run())
+
+
+def test_pending_delivery_retries_after_network_recovers_without_cpu(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        monkeypatch.setattr(bot, "_DELIVERY_RETRY_INITIAL_S", 0.001)
+        monkeypatch.setattr(bot, "_DELIVERY_RETRY_MAX_S", 0.01)
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        monkeypatch.setattr(bot, "_channel_worker", worker)
+        ctx = FakeCtx()
+        payload = bot.Payload(update=FakeUpdate(FakeMessage(7), FakeChat()),
+                              ctx=ctx, text="question", update_id=501)
+        await bot._record_pending_payload(payload)
+        await bot._record_pending_delivery(
+            payload=payload, resp=Response(content="saved answer", session_id="sid", cost=0),
+            update_ids=[501],
+        )
+        attempts = []
+        send_message = ctx.bot.send_message
+
+        async def flaky_send(**kwargs):
+            attempts.append(kwargs["text"])
+            if len(attempts) <= 2:  # formatted and plain sends both fail
+                raise OSError("temporary network failure")
+            return await send_message(**kwargs)
+
+        monkeypatch.setattr(ctx.bot, "send_message", flaky_send)
+        app = type("FakeApp", (), {"bot": ctx.bot})()
+        task = asyncio.create_task(bot._retry_pending_deliveries_loop(app))
+        try:
+            await wait_for(lambda: 501 in bot._processed_set)
+            assert len(attempts) >= 3
+            assert [m["text"] for m in ctx.bot.sent_messages] == ["saved answer"]
+            assert not bot._pending_update_records
+            assert not bot._pending_delivery_records
+            assert session.submitted == []
+            assert not session.connected
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(run())
+
+
+def test_pending_delivery_retry_preserves_live_stream_anchor(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        monkeypatch.setattr(bot, "_channel_worker", worker)
+        live_bubble = FakeSentMessage("current partial")
+        worker._text_message = live_bubble
+        worker._streamed_bubble_count = 2
+        ctx = FakeCtx()
+        payload = bot.Payload(update=FakeUpdate(FakeMessage(7), FakeChat()),
+                              ctx=ctx, text="old question", update_id=501)
+        await bot._record_pending_delivery(
+            payload=payload, resp=Response(content="old answer", session_id="sid", cost=0),
+            update_ids=[501],
+        )
+        summary = await bot._replay_pending_deliveries(type("FakeApp", (), {"bot": ctx.bot})())
+        assert summary.delivered == 1
+        assert ctx.bot.sent_messages[-1]["text"] == "old answer"
+        assert ctx.bot.sent_messages[-1]["reply_to_message_id"] == 7
+        assert live_bubble.text == "current partial"
+        assert live_bubble.edits == []
+        assert worker._streamed_bubble_count == 2
+        assert session.submitted == []
+
+    asyncio.run(run())
+
+
+def test_pending_delivery_retry_does_not_duplicate_initial_send(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        worker = bot.ChannelWorker(FakeSession(), instance_label="test")
+        monkeypatch.setattr(bot, "_channel_worker", worker)
+        ctx = FakeCtx()
+        payload = bot.Payload(update=FakeUpdate(FakeMessage(7), FakeChat()),
+                              ctx=ctx, text="question", update_id=501)
+        sending = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_delivery(payload, response):
+            sending.set()
+            await release.wait()
+            return True
+
+        monkeypatch.setattr(worker, "_deliver_response", delayed_delivery)
+        task = asyncio.create_task(worker._deliver_turn_response(
+            payload, Response(content="answer", session_id="sid", cost=0), [501],
+        ))
+        try:
+            await sending.wait()
+            summary = await bot._replay_pending_deliveries(type("FakeApp", (), {"bot": ctx.bot})())
+            assert summary.delivered == 0
+            assert ctx.bot.sent_messages == []
+            assert "501" in bot._pending_delivery_records
+        finally:
+            release.set()
+            assert await task is True
+        assert not bot._pending_delivery_records
+        assert not bot._delivery_in_progress
 
     asyncio.run(run())

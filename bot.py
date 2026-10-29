@@ -258,6 +258,10 @@ def _load_pending_deliveries() -> dict[str, dict[str, Any]]:
 
 _pending_deliveries_lock = asyncio.Lock()
 _pending_delivery_records: dict[str, dict[str, Any]] = _load_pending_deliveries()
+_delivery_in_progress: set[str] = set()
+_delivery_retry_task: asyncio.Task[None] | None = None
+_DELIVERY_RETRY_INITIAL_S = 5.0
+_DELIVERY_RETRY_MAX_S = 300.0
 
 
 def _write_pending_deliveries_locked() -> None:
@@ -633,6 +637,11 @@ async def _graceful_shutdown(app: "Application", reason: str) -> None:
             log.warning("Pre-shutdown notice failed: %s", e)
 
     await _wait_inflight_drain()
+
+    if _delivery_retry_task is not None:
+        _delivery_retry_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _delivery_retry_task
 
     if _channel_worker is not None:
         try:
@@ -2077,19 +2086,26 @@ class ChannelWorker:
         resp: Response,
         update_ids: list[int | None],
     ) -> bool:
-        delivery_id = await _record_pending_delivery(
-            payload=payload,
-            resp=resp,
-            update_ids=update_ids,
-        )
+        delivery_key = _delivery_id_for_update_ids(update_ids)
+        if delivery_key:
+            _delivery_in_progress.add(delivery_key)
         try:
-            delivery_ok = await self._deliver_response(payload, resp)
-        except Exception as e:
-            log.exception("deliver_response failed: %s", e)
-            delivery_ok = False
-        if delivery_ok:
-            await _ack_pending_delivery(delivery_id)
-        else:
+            delivery_id = await _record_pending_delivery(
+                payload=payload,
+                resp=resp,
+                update_ids=update_ids,
+            )
+            try:
+                delivery_ok = await self._deliver_response(payload, resp)
+            except Exception as e:
+                log.exception("deliver_response failed: %s", e)
+                delivery_ok = False
+            if delivery_ok:
+                await _ack_pending_delivery(delivery_id)
+        finally:
+            if delivery_key:
+                _delivery_in_progress.discard(delivery_key)
+        if not delivery_ok:
             log.warning(
                 "turn_end response not acknowledged by TG delivery; "
                 "leaving update_ids=%s pending",
@@ -2679,7 +2695,10 @@ async def _replay_pending_delivery_record(
         return "malformed"
 
     try:
-        ok = await _worker()._deliver_response(
+        # A cached reply must not edit or consume the active turn's streaming
+        # bubbles. This delivery-only worker never connects or calls the CPU.
+        delivery_worker = ChannelWorker(_worker().session, instance_label=_CURRENT_LABEL)
+        ok = await delivery_worker._deliver_response(
             payload,
             Response(
                 content=record.content,
@@ -2712,6 +2731,8 @@ async def _replay_pending_deliveries(app: Application) -> DeliveryReplaySummary:
     malformed = 0
     failed = 0
     for raw_record in sorted(records, key=_pending_delivery_sort_key):
+        if _shutdown_requested:
+            break
         try:
             record = _parse_pending_delivery_record(raw_record)
         except (KeyError, TypeError, ValueError, IndexError):
@@ -2719,7 +2740,13 @@ async def _replay_pending_deliveries(app: Application) -> DeliveryReplaySummary:
             log.warning("pending delivery record is malformed: delivery_id=%s", delivery_id)
             malformed += 1
             continue
-        result = await _replay_pending_delivery_record(app, record)
+        if record.delivery_id in _delivery_in_progress:
+            continue
+        _delivery_in_progress.add(record.delivery_id)
+        try:
+            result = await _replay_pending_delivery_record(app, record)
+        finally:
+            _delivery_in_progress.discard(record.delivery_id)
         if result == "delivered":
             delivered += 1
         elif result == "skipped_processed":
@@ -2737,6 +2764,24 @@ async def _replay_pending_deliveries(app: Application) -> DeliveryReplaySummary:
         malformed=malformed,
         failed=failed,
     )
+
+
+async def _retry_pending_deliveries_loop(app: Application) -> None:
+    """Retry saved replies after network recovery without restarting the CPU."""
+    delay = _DELIVERY_RETRY_INITIAL_S
+    while not _shutdown_requested:
+        await asyncio.sleep(delay)
+        if _shutdown_requested:
+            return
+        try:
+            summary = await _replay_pending_deliveries(app)
+            failed = bool(summary.failed or summary.malformed)
+            if summary.total and not _in_flight:
+                _write_runtime_status("delivery_retry")
+        except Exception:
+            log.exception("pending TG delivery retry failed")
+            failed = True
+        delay = min(delay * 2, _DELIVERY_RETRY_MAX_S) if failed else _DELIVERY_RETRY_INITIAL_S
 
 
 # ── Handlers ──────────────────────────────────────────────────────────
@@ -5199,7 +5244,7 @@ def _with_transcript(source: str, handler):
 # ── Main ──────────────────────────────────────────────────────────────
 
 async def _post_init(app: Application) -> None:
-    global _channel_worker
+    global _channel_worker, _delivery_retry_task
     install_bot_transcript(app.bot)
     _write_runtime_status("post_init")
     await bridge.start()
@@ -5214,6 +5259,7 @@ async def _post_init(app: Application) -> None:
     _install_signal_handlers(app)
     await _sync_bot_commands(app.bot)
     delivery_replay = await _replay_pending_deliveries(app)
+    _delivery_retry_task = asyncio.create_task(_retry_pending_deliveries_loop(app))
     pending_replay = await _replay_pending_updates(app)
 
     # 意外重启 / launchd kickstart / 任务中 /restart → bot 重连后主动告知用户当

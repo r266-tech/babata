@@ -216,6 +216,9 @@ def test_tg_instance_schema_stays_compact_without_losing_route_values():
 
 def test_tg_mcp_schema_helper_keeps_tool_contracts(monkeypatch):
     monkeypatch.setenv("BABATA_TG_ENABLE_PUBLIC_PAGE", "1")
+    # The voice description follows the local TTS backend; budget the default.
+    monkeypatch.delenv("TTS_BACKEND", raising=False)
+    monkeypatch.delenv("TTS_URL", raising=False)
     tools = {tool.name: tool for tool in asyncio.run(tg_mcp.list_tools())}
     descriptions = [tool.description for tool in tools.values()]
     schema_descriptions = [
