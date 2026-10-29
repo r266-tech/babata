@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import os
 
+import pytest
+
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:test")
 os.environ.setdefault("ALLOWED_USER_ID", "0")
 
@@ -572,6 +574,96 @@ def test_weixin_process_sends_final_content_when_stream_has_no_delta(monkeypatch
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("content", ["", "图片已生成。"])
+def test_weixin_process_delivers_native_generated_image(monkeypatch, tmp_path, content):
+    image = tmp_path / "generated.png"
+    image.write_bytes(b"native-image-bytes")
+
+    class FakeCC:
+        async def query(self, *_args, **_kwargs):
+            return Response(
+                content=content, session_id="sid-image", cost=0.0,
+                generated_images=[str(image)],
+            )
+
+    class FakeClient:
+        def __init__(self):
+            self.sent = []
+            self.uploads = []
+
+        async def get_config(self, *_args, **_kwargs):
+            return {}
+
+        async def upload_media(self, data, **kwargs):
+            self.uploads.append((data, kwargs))
+            return {"encrypt_query_param": "image-cdn", "aes_key": "image-key", "cipher_size": 32}
+
+        async def send_message(self, peer, items, **kwargs):
+            self.sent.append((peer, items, kwargs))
+
+    async def run():
+        client = FakeClient()
+        monkeypatch.setattr(wb, "cc", FakeCC())
+        msg = {
+            "from_user_id": "image-user", "context_token": "image-context",
+            "item_list": [{"type": wb.ITEM_TEXT, "text_item": {"text": "画一张图"}}],
+        }
+
+        assert await wb._process_combined_msgs(client, [msg], "image-account") is True
+        assert len(client.uploads) == 1
+        assert client.uploads[0][0] == b"native-image-bytes"
+        assert client.uploads[0][1]["to_user_id"] == "image-user"
+        media_messages = [sent for sent in client.sent if sent[1][0]["type"] == wb.ITEM_IMAGE]
+        assert len(media_messages) == 1
+        assert media_messages[0][0] == "image-user"
+        assert media_messages[0][2]["context_token"] == "image-context"
+        text_messages = [
+            item["text_item"]["text"]
+            for _, items, _ in client.sent for item in items if item["type"] == wb.ITEM_TEXT
+        ]
+        assert text_messages == ([content] if content else [])
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["missing", "upload", "send"])
+def test_weixin_generated_image_failure_keeps_turn_unconsumed(monkeypatch, tmp_path, failure):
+    image = tmp_path / "generated.png"
+    if failure != "missing":
+        image.write_bytes(b"native-image-bytes")
+
+    class FakeCC:
+        async def query(self, *_args, **_kwargs):
+            return Response(
+                content="", session_id="sid-image", cost=0.0,
+                generated_images=[str(image)],
+            )
+
+    class FakeClient:
+        async def get_config(self, *_args, **_kwargs):
+            return {}
+
+        async def upload_media(self, *_args, **_kwargs):
+            if failure == "upload":
+                raise OSError("CDN temporarily unavailable")
+            return {"encrypt_query_param": "image-cdn", "aes_key": "image-key", "cipher_size": 32}
+
+        async def send_message(self, *_args, **_kwargs):
+            if failure == "send":
+                raise OSError("WeChat temporarily unavailable")
+
+    async def run():
+        monkeypatch.setattr(wb, "cc", FakeCC())
+        msg = {
+            "from_user_id": "image-user", "context_token": "image-context",
+            "item_list": [{"type": wb.ITEM_TEXT, "text_item": {"text": "画一张图"}}],
+        }
+
+        assert await wb._process_combined_msgs(FakeClient(), [msg], "image-account") is False
+
+    asyncio.run(run())
+
+
 def test_collect_wx_turn_inputs_preserves_prompt_contract():
     class FakeClient:
         pass
@@ -902,3 +994,92 @@ def test_weixin_pending_journal_keeps_unconsumed_batch(monkeypatch, tmp_path):
         assert "r1" in wb._pending_wx_records
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("initial_buf", ["old-buf", "buf-1"])
+def test_weixin_pending_replay_deduplicates_messages_across_cursors(monkeypatch, tmp_path, initial_buf):
+    reset_wx_pending(monkeypatch, tmp_path)
+    first = {"message_id": 1, "from_user_id": "u1"}
+    second = {"message_id": 2, "from_user_id": "u1"}
+    other_peer = {"message_id": 1, "from_user_id": "u2"}
+    no_id = {"from_user_id": "u2"}
+    batches = [
+        [[first, first]],
+        [[first]],
+        [[first, second]],
+        [[other_peer, no_id, no_id]],
+    ]
+    wb._pending_wx_records = {
+        f"r{i}": {
+            "id": f"r{i}", "account_id": "acc", "received_at": i,
+            "new_buf": f"buf-{i}", "units": units,
+        }
+        for i, units in enumerate(batches, 1)
+    }
+    current_buf = {"value": initial_buf}
+    received = []
+
+    async def process(_client, _account_id, units):
+        received.extend(msg for unit in units for msg in unit)
+        return True
+
+    def save_buf(_account_id, buf):
+        current_buf["value"] = buf
+
+    monkeypatch.setattr(wb, "load_sync_buf", lambda _account_id: current_buf["value"])
+    monkeypatch.setattr(wb, "save_sync_buf", save_buf)
+    monkeypatch.setattr(wb, "_process_wx_units", process)
+
+    asyncio.run(wb._replay_pending_wx_updates(object(), "acc"))
+
+    expected = [second, other_peer, no_id, no_id]
+    if initial_buf == "old-buf":
+        expected.insert(0, first)
+    assert received == expected
+    assert current_buf["value"] == "buf-4"
+    assert wb._pending_wx_records == {}
+
+
+def test_weixin_failed_replay_keeps_overlapping_records(monkeypatch, tmp_path):
+    reset_wx_pending(monkeypatch, tmp_path)
+    first = {"message_id": 1, "from_user_id": "u1"}
+    second = {"message_id": 2, "from_user_id": "u1"}
+    wb._pending_wx_records = {
+        "r1": {"id": "r1", "account_id": "acc", "received_at": 1,
+               "new_buf": "buf-1", "units": [[first]]},
+        "r2": {"id": "r2", "account_id": "acc", "received_at": 2,
+               "new_buf": "buf-2", "units": [[first, second]]},
+    }
+    saved = []
+    calls = []
+
+    async def process(_client, _account_id, units):
+        calls.append(units)
+        return False
+
+    monkeypatch.setattr(wb, "load_sync_buf", lambda _account_id: "old-buf")
+    monkeypatch.setattr(wb, "save_sync_buf", lambda _account_id, buf: saved.append(buf))
+    monkeypatch.setattr(wb, "_process_wx_units", process)
+
+    asyncio.run(wb._replay_pending_wx_updates(object(), "acc"))
+
+    assert calls == [[[first]]]
+    assert saved == []
+    assert set(wb._pending_wx_records) == {"r1", "r2"}
+
+
+@pytest.mark.parametrize("units", [[None], [[None]]])
+def test_weixin_replay_keeps_malformed_units_for_processing_failure(monkeypatch, tmp_path, units):
+    reset_wx_pending(monkeypatch, tmp_path)
+    wb._pending_wx_records = {
+        "r1": {"id": "r1", "account_id": "acc", "received_at": 1,
+               "new_buf": "new-buf", "units": units},
+    }
+    saved = []
+    monkeypatch.setattr(wb, "load_sync_buf", lambda _account_id: "old-buf")
+    monkeypatch.setattr(wb, "save_sync_buf", lambda _account_id, buf: saved.append(buf))
+
+    asyncio.run(wb._replay_pending_wx_updates(object(), "acc"))
+
+    assert saved == []
+    assert "r1" in wb._pending_wx_records

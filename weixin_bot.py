@@ -45,6 +45,7 @@ from weixin_account import (
 from weixin_bridge import bridge
 from weixin_ilink import (
     ITEM_FILE, ITEM_IMAGE, ITEM_TEXT, ITEM_VIDEO, ITEM_VOICE,
+    MEDIA_IMAGE, image_item,
     WeixinClient, WeixinSessionExpired,
     normalize_account_id, start_qr_login, text_item, wait_qr_login,
 )
@@ -959,6 +960,22 @@ async def _process_combined_msgs(
     # End-of-stream drain: ship any held tail now that nothing more is coming.
     await coalescer.drain(allow_hard_cut=True)
 
+    # Native Codex image generation returns local files separately from text.
+    # WeChat must upload them; a local Markdown path is not a visible image.
+    for raw_path in resp.generated_images:
+        path = Path(raw_path).expanduser()
+        try:
+            uploaded = await client.upload_media(
+                path.read_bytes(), to_user_id=from_user, media_type=MEDIA_IMAGE,
+            )
+            await client.send_message(
+                from_user, [image_item(uploaded)], context_token=ctx_token,
+            )
+        except Exception as e:
+            log.warning("generated image delivery failed: %s: %s", path, e)
+            await _set_wx_typing(client, from_user, ticket, 2)
+            return False
+
     if not await _replay_wx_final_if_needed(coalescer, resp.content or ""):
         return False
 
@@ -1024,10 +1041,21 @@ async def _process_wx_units(
     return batch_ok
 
 
+def _wx_message_key(msg: Any) -> tuple[str, str] | None:
+    if not isinstance(msg, dict):
+        return None
+    message_id = msg.get("message_id")
+    from_user = msg.get("from_user_id")
+    if message_id is None or message_id == "" or not from_user:
+        return None
+    return str(from_user), str(message_id)
+
+
 async def _replay_pending_wx_updates(
     client: WeixinClient,
     account_id: str,
 ) -> None:
+    consumed: set[tuple[str, str]] = set()
     for record in await _pending_wx_batches_for_account(account_id):
         record_id = str(record.get("id") or "")
         new_buf = str(record.get("new_buf") or "")
@@ -1038,12 +1066,35 @@ async def _replay_pending_wx_updates(
                 await _ack_pending_wx_batch(record_id)
             continue
         if new_buf and load_sync_buf(account_id) == new_buf:
+            consumed.update(
+                key for unit in units if isinstance(unit, list) for msg in unit
+                if (key := _wx_message_key(msg)) is not None
+            )
             await _ack_pending_wx_batch(record_id)
             continue
-        ok = await _process_wx_units(client, account_id, units)
+        # Failed polls can journal the same message under different cursors.
+        # Replay each known message once while retaining later new messages.
+        fresh_units = []
+        batch_keys: set[tuple[str, str]] = set()
+        for unit in units:
+            if not isinstance(unit, list):
+                fresh_units.append(unit)
+                continue
+            fresh = []
+            for msg in unit:
+                key = _wx_message_key(msg)
+                if key is not None:
+                    if key in consumed or key in batch_keys:
+                        continue
+                    batch_keys.add(key)
+                fresh.append(msg)
+            if fresh:
+                fresh_units.append(fresh)
+        ok = not fresh_units or await _process_wx_units(client, account_id, fresh_units)
         if not ok:
             log.warning("wx pending replay still unconsumed: %s", record_id)
             break
+        consumed.update(batch_keys)
         if new_buf:
             save_sync_buf(account_id, new_buf)
         await _ack_pending_wx_batch(record_id)
