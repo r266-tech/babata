@@ -44,7 +44,7 @@ def test_wechat_markdown_extracts_images():
 
 def test_send_bubble_delivers_markdown_image_and_remembers_text(tmp_path):
     img = tmp_path / "chart.png"
-    img.write_bytes(b"\x89PNG-bytes")
+    img.write_bytes(b"\x89PNG\r\n\x1a\n-bytes")
 
     class FakeClient:
         def __init__(self):
@@ -64,7 +64,7 @@ def test_send_bubble_delivers_markdown_image_and_remembers_text(tmp_path):
         result = await wb._send_wx_bubble(client, "u1", "ctx", f"图如下 ![c]({img})", "acc")
         assert result == wb.WxBubbleSendResult(sent_any=True, ok=True)
         assert client.sent == [wi.ITEM_TEXT, wi.ITEM_IMAGE]
-        assert client.uploads == [b"\x89PNG-bytes"]
+        assert client.uploads == [b"\x89PNG\r\n\x1a\n-bytes"]
         assert weixin_account.recall_message("acc", 43) == "图如下"
 
     asyncio.run(run())
@@ -297,3 +297,10 @@ def test_markdown_image_refuses_non_image_file(tmp_path):
     client = FakeClient()
     asyncio.run(wb._send_wx_bubble(client, "u1", "ctx", f"![x]({secret})"))
     assert client.texts == ["[图片发送失败]"]
+
+
+def test_image_signatures_are_strict():
+    assert wi._is_image_bytes(b"\x89PNG\r\n\x1a\nrest")
+    assert not wi._is_image_bytes(b"BM secret that starts with BM")
+    bmp = b"BM" + (10).to_bytes(4, "little") + b"\0" * 4
+    assert wi._is_image_bytes(bmp)

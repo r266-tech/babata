@@ -15,6 +15,7 @@ import re
 import time
 from dataclasses import dataclass
 import secrets
+import stat
 from secrets import token_bytes
 from typing import Any
 from urllib.parse import quote
@@ -695,11 +696,16 @@ def video_item(uploaded: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-_IMAGE_MAGIC = (b"\x89PNG", b"\xff\xd8\xff", b"GIF8", b"BM")
+_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")
 
 
 def _is_image_bytes(data: bytes) -> bool:
-    return data.startswith(_IMAGE_MAGIC) or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+    if data.startswith(_IMAGE_MAGIC):
+        return True
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return True
+    # BMP: "BM" alone is too weak; its header also carries the exact file size.
+    return data[:2] == b"BM" and int.from_bytes(data[2:6], "little") == len(data)
 
 
 async def send_image(
@@ -728,10 +734,12 @@ async def send_image(
         data = b"".join(chunks)
     else:
         path = os.path.realpath(os.path.expanduser(source.removeprefix("file://")))
-        if os.path.getsize(path) > IMAGE_FETCH_MAX:
-            raise WeixinApiError(f"image larger than {IMAGE_FETCH_MAX} bytes")
         with open(path, "rb") as fh:
-            data = fh.read()
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                raise WeixinApiError("not a regular file")
+            data = fh.read(IMAGE_FETCH_MAX + 1)
+        if len(data) > IMAGE_FETCH_MAX:
+            raise WeixinApiError(f"image larger than {IMAGE_FETCH_MAX} bytes")
     if not _is_image_bytes(data):
         raise WeixinApiError("not an image (jpg/png/gif/webp/bmp)")
     uploaded = await client.upload_media(data, to_user_id=to_user_id, media_type=MEDIA_IMAGE)
