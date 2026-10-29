@@ -111,7 +111,9 @@ def run_blocking_review(
     }
     command = os.environ.get("BABATA_BLOCKING_REVIEW_CMD")
     if command:
-        result = _run_review_command(command, payload, round_index)
+        result = _deterministic_review(payload, round_index)
+        if result.get("status") != "needs_fix":
+            result = _run_review_command(command, payload, round_index)
     else:
         result = _review_without_command(payload, round_index)
     result = _scrub_response_from_review_result(
@@ -130,8 +132,9 @@ def build_repair_prompt(review: dict[str, Any]) -> str:
     prompt = f"""<blocking-review>
 Previous code-changing turn failed blocking review.
 
-Fix findings in the same repository/session. Do not ask implementation details.
-Rerun relevant checks, then answer only with the final result.
+Fix supported findings in the same repository/session within the current task and authorization.
+Resolve routine choices; ask only for material missing information or authority.
+Rerun relevant checks; report the final result and any unresolved findings.
 
 Findings:
 {findings}
@@ -215,7 +218,7 @@ def _review_without_command(payload: dict[str, Any], round_index: int) -> dict[s
     result = _deterministic_review(payload, round_index)
     if result.get("status") == "needs_fix":
         return result
-    if not _counterpart_review_enabled():
+    if not counterpart_review_enabled():
         return result
     if _current_review_depth() >= _max_review_depth():
         result["reason"] = "counterpart review skipped inside delegated reviewer"
@@ -223,11 +226,12 @@ def _review_without_command(payload: dict[str, Any], round_index: int) -> dict[s
     return _run_counterpart_review(payload, round_index)
 
 
-def _counterpart_review_enabled() -> bool:
-    mode = os.environ.get("BABATA_BLOCKING_REVIEW_AGENT", "counterpart").strip().lower()
+def counterpart_review_enabled() -> bool:
+    """Model review is opt-in; local guards and declared checks always remain."""
+    mode = os.environ.get("BABATA_BLOCKING_REVIEW_AGENT", "").strip().lower()
     if mode in {"0", "off", "false", "disabled", "none", "deterministic"}:
         return False
-    return os.environ.get("BABATA_BLOCKING_REVIEW_COUNTERPART", "1") != "0"
+    return os.environ.get("BABATA_BLOCKING_REVIEW_COUNTERPART", "1" if mode else "0") != "0"
 
 
 def _current_review_depth() -> int:
@@ -369,8 +373,8 @@ def _run_codex_counterpart_review(payload: dict[str, Any], round_index: int) -> 
             str(repo_root),
             "--sandbox",
             os.environ.get("BABATA_CODEX_REVIEW_SANDBOX", "read-only"),
-            "--ask-for-approval",
-            "never",
+            "-c",
+            'approval_policy="never"',
             "--skip-git-repo-check",
             "--ephemeral",
             "--output-schema",
@@ -476,13 +480,19 @@ def _run_review_command(command: str, payload: dict[str, Any], round_index: int)
 def _parse_command_result(raw: str) -> dict[str, Any]:
     data = _extract_json_object(raw)
     if isinstance(data, dict):
-        return _normalize_review_result(data, raw)
-    upper = raw.upper()
-    status = "needs_fix" if any(marker in upper for marker in ("NEEDS_FIX", "NEEDS-FIX", "BLOCKER", "FAIL")) else "passed"
-    findings = []
-    if status == "needs_fix":
-        findings = [{"severity": "high", "rule": "review", "message": _trim(raw, _MAX_FINDING_TEXT)}]
-    return {"status": status, "findings": findings, "raw_output": _trim(raw, _MAX_FINDING_TEXT)}
+        return _normalize_review_result(data)
+    return _invalid_review_result()
+
+
+def _invalid_review_result() -> dict[str, Any]:
+    return _result(
+        "needs_fix",
+        findings=[{
+            "severity": "high",
+            "rule": "review-output-invalid",
+            "message": "Reviewer returned no valid JSON verdict; review did not complete.",
+        }],
+    )
 
 
 def _extract_json_object(raw: str) -> dict[str, Any] | None:
@@ -509,17 +519,26 @@ def _extract_json_object(raw: str) -> dict[str, Any] | None:
     return None
 
 
-def _normalize_review_result(data: dict[str, Any], raw: str) -> dict[str, Any]:
+def _normalize_review_result(data: dict[str, Any]) -> dict[str, Any]:
     status = str(data.get("status") or data.get("verdict") or "").lower()
     if status in {"pass", "passed", "ok", "approve", "approved"}:
         status = "passed"
     elif status in {"needs_fix", "needs-fix", "fail", "failed", "block", "blocked"}:
         status = "needs_fix"
     else:
-        status = "needs_fix" if data.get("findings") else "passed"
-    findings = data.get("findings") or []
-    if isinstance(findings, str):
-        findings = [{"severity": "medium", "rule": "review", "message": findings}]
+        return _invalid_review_result()
+    findings = data.get("findings", [])
+    if not isinstance(findings, list) or any(not isinstance(item, dict) for item in findings):
+        return _invalid_review_result()
+    if any(
+        not isinstance(item.get("severity"), str)
+        or not isinstance(item.get("message"), str)
+        or ("blocking" in item and not isinstance(item["blocking"], bool))
+        for item in findings
+    ):
+        return _invalid_review_result()
+    if any(item.get("blocking") or item.get("severity") in {"high", "critical"} for item in findings):
+        status = "needs_fix"
     return {
         "status": status,
         "findings": findings if isinstance(findings, list) else [],
@@ -824,7 +843,7 @@ def _review_infra_failure(reviewer: str, message: str, round_index: int) -> dict
             findings=[{"severity": "high", "rule": "review-infra", "message": message}],
             round_index=round_index,
         )
-    return _result("passed", reviewer=reviewer, reason=message, round_index=round_index)
+    return _result("skipped", reviewer=reviewer, reason=message, round_index=round_index)
 
 
 def _looks_like_counterpart_infra_failure(output: str) -> bool:

@@ -1,7 +1,26 @@
 import review_health
 
 
+def test_default_review_health_needs_no_model_probe(monkeypatch):
+    monkeypatch.delenv("BABATA_BLOCKING_REVIEW_AGENT", raising=False)
+    monkeypatch.delenv("BABATA_BLOCKING_REVIEW_COUNTERPART", raising=False)
+    monkeypatch.setattr(review_health, "_probe_codex", lambda: (_ for _ in ()).throw(AssertionError("unexpected probe")))
+    snap = review_health.review_health_snapshot(force=True)
+    assert snap["status"] == "deterministic-only"
+    assert snap["probes"] == {}
+
+
+def test_custom_reviewer_health_is_not_deterministic_only(monkeypatch):
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW_CMD", "user-review-command")
+    monkeypatch.setattr(review_health, "_run_probe", lambda *_: (_ for _ in ()).throw(AssertionError("unexpected command")))
+    snap = review_health.review_health_snapshot(force=True)
+    assert snap["status"] == "custom-command-not-checked"
+    assert snap["custom_command_configured"] is True
+    assert snap["probes"] == {}
+
+
 def test_review_health_ok_when_default_codex_reviewer_available(monkeypatch, tmp_path):
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW_AGENT", "counterpart")
     codex = tmp_path / "codex"
     codex.write_text("#!/bin/sh\necho codex 1.0\n")
     codex.chmod(0o755)
@@ -20,6 +39,7 @@ def test_review_health_ok_when_default_codex_reviewer_available(monkeypatch, tmp
 
 
 def test_review_health_blocks_when_strict_and_default_codex_missing(monkeypatch, tmp_path):
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW_AGENT", "counterpart")
     monkeypatch.setenv("BABATA_CODEX_REVIEW_CLI", str(tmp_path / "missing-codex"))
     monkeypatch.setenv("BABATA_BLOCKING_REVIEW_INFRA_STRICT", "1")
     monkeypatch.setenv("BABATA_REVIEW_HEALTH_TTL", "0")
@@ -31,6 +51,7 @@ def test_review_health_blocks_when_strict_and_default_codex_missing(monkeypatch,
 
 
 def test_review_health_degrades_when_soft_and_tool_missing(monkeypatch, tmp_path):
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW_AGENT", "counterpart")
     monkeypatch.setenv("BABATA_CODEX_REVIEW_CLI", str(tmp_path / "missing-codex"))
     monkeypatch.setenv("BABATA_BLOCKING_REVIEW_INFRA_STRICT", "0")
     monkeypatch.setenv("BABATA_REVIEW_HEALTH_TTL", "0")
@@ -41,6 +62,7 @@ def test_review_health_degrades_when_soft_and_tool_missing(monkeypatch, tmp_path
 
 
 def test_review_health_explicit_claude_reviewer_probes_only_cc_worker(monkeypatch, tmp_path):
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW_AGENT", "counterpart")
     cc_worker = tmp_path / "cc-worker"
     cc_worker.write_text("#!/bin/sh\necho cc-worker\n")
     cc_worker.chmod(0o755)
@@ -58,6 +80,7 @@ def test_review_health_explicit_claude_reviewer_probes_only_cc_worker(monkeypatc
 
 
 def test_review_health_unknown_cpu_falls_back_to_codex_probe(monkeypatch, tmp_path):
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW_AGENT", "counterpart")
     codex = tmp_path / "codex"
     codex.write_text("#!/bin/sh\necho codex 1.0\n")
     codex.chmod(0o755)
@@ -107,6 +130,7 @@ def test_review_health_disabled_skips_external_probes(monkeypatch):
 
 
 def test_review_health_no_probe_reports_not_checked_without_external_calls(monkeypatch):
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW_AGENT", "counterpart")
     monkeypatch.setenv("BABATA_REVIEW_HEALTH_TTL", "0")
     monkeypatch.setattr(
         review_health,

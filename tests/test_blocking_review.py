@@ -7,6 +7,7 @@ from pathlib import Path
 import codex_engine
 import cc
 import blocking_review
+import pytest
 from claude_agent_sdk import ResultMessage
 
 from test_codex_engine import FakeProcess, _json_line
@@ -20,6 +21,52 @@ IDENTITY_PROMPT_MARKERS = (
     "共同进化",
     "身份认同",
 )
+
+
+def test_default_review_does_not_call_a_model(monkeypatch, tmp_path):
+    for key in ("BABATA_BLOCKING_REVIEW_AGENT", "BABATA_BLOCKING_REVIEW_COUNTERPART", "BABATA_BLOCKING_REVIEW_CMD"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("BABATA_AUDIT_DIR", str(tmp_path / "audit"))
+    monkeypatch.setattr(blocking_review, "_run_counterpart_review", lambda *_: pytest.fail("unexpected model call"))
+    result = blocking_review.run_blocking_review(
+        {"changed_files": ["app.py"]}, cpu="codex", channel="test",
+        response_content="done", round_index=0,
+    )
+    assert (result["status"], result["reviewer"]) == ("passed", "deterministic")
+
+
+@pytest.mark.parametrize("audit", [
+    {"guard_findings": [{"severity": "high", "rule": "secret", "message": "redacted"}]},
+    {"declared_checks": [{"name": "unit", "status": "failed", "exit_code": 1}]},
+])
+def test_failed_local_evidence_blocks_even_with_custom_reviewer(monkeypatch, tmp_path, audit):
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW_CMD", "configured-reviewer")
+    monkeypatch.setenv("BABATA_AUDIT_DIR", str(tmp_path / "audit"))
+    monkeypatch.setattr(blocking_review, "_run_review_command", lambda *_: pytest.fail("local failure bypassed"))
+    result = blocking_review.run_blocking_review(
+        audit, cpu="codex", channel="test", response_content="done", round_index=0,
+    )
+    assert (result["status"], result["reviewer"]) == ("needs_fix", "deterministic")
+
+
+@pytest.mark.parametrize("raw", [
+    "", "looks good", "{}", '{"status":"unknown"}',
+    '{"status":"passed","findings":["bug"]}',
+    '{"status":"passed","findings":{}}',
+    '{"status":"passed","findings":"bug"}',
+    '{"status":"passed","findings":[{"severity":["high"],"message":"bug"}]}',
+])
+def test_invalid_reviewer_output_cannot_pass(raw):
+    result = blocking_review._parse_command_result(raw)
+    assert result["status"] == "needs_fix"
+    assert result["findings"][0]["rule"] == "review-output-invalid"
+
+
+def test_blocking_finding_cannot_be_overridden_by_pass_label():
+    result = blocking_review._parse_command_result(json.dumps({
+        "status": "passed", "findings": [{"severity": "high", "message": "concrete bug"}],
+    }))
+    assert result["status"] == "needs_fix"
 
 
 def _init_repo(path: Path) -> None:
@@ -252,6 +299,8 @@ def test_codex_turn_routes_default_review_to_codex_counterpart(monkeypatch, tmp_
     codex_call = next(call for call in calls if call[0][0] == "/bin/codex" and call[0][1] == "exec")
     assert "--sandbox" in codex_call[0]
     assert "read-only" in codex_call[0]
+    assert "--ask-for-approval" not in codex_call[0]
+    assert 'approval_policy="never"' in codex_call[0]
     assert "--model" in codex_call[0]
     assert codex_call[0][codex_call[0].index("--model") + 1] == "gpt-5.6-sol"
     assert "-c" in codex_call[0]
@@ -314,6 +363,7 @@ def test_unknown_review_cpu_falls_back_to_codex(monkeypatch):
 
 
 def test_counterpart_review_skips_when_already_inside_reviewer(monkeypatch, tmp_path):
+    monkeypatch.setenv("BABATA_BLOCKING_REVIEW_COUNTERPART", "1")
     repo = tmp_path / "repo"
     repo.mkdir()
     _init_repo(repo)
@@ -366,7 +416,9 @@ def test_review_result_scrubs_echoed_response_draft_from_return_and_ledger(monke
     )
 
     raw_result = json.dumps(result, ensure_ascii=False)
-    ledger = (audit_dir / "babata-blocking-review.jsonl").read_text(encoding="utf-8")
+    ledger = (audit_dir / f"{blocking_review.NAMESPACE}-blocking-review.jsonl").read_text(
+        encoding="utf-8"
+    )
     for text in (raw_result, ledger):
         assert response not in text
         assert "PRIVATE-DRAFT-" not in text
@@ -416,7 +468,7 @@ def test_counterpart_auth_failure_degrades_when_not_strict(monkeypatch, tmp_path
         round_index=0,
     )
 
-    assert result["status"] == "passed"
+    assert result["status"] == "skipped"
     assert result["reviewer"] == "claude-counterpart"
     assert "Invalid API key" in result["reason"]
     assert result["findings"] == []
@@ -472,17 +524,11 @@ def test_repair_prompt_stays_compact_without_losing_repair_boundary():
         ]
     })
 
-    assert len(prompt) <= 360
-    for marker in (
-        "<blocking-review>",
-        "same repository/session",
-        "Do not ask implementation details",
-        "Rerun relevant checks",
-        "fix regression",
-    ):
-        assert marker in prompt
-    for marker in ("previous code-changing turn did not pass", "confirm implementation details"):
-        assert marker not in prompt
+    assert len(prompt) <= blocking_review._MAX_REPAIR_PROMPT
+    assert prompt.startswith("<blocking-review>")
+    assert prompt.endswith("</blocking-review>")
+    assert "fix regression" in prompt
+    assert "app.py" in prompt
     for marker in IDENTITY_PROMPT_MARKERS:
         assert marker not in prompt
 

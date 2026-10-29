@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from cli_runtime import env_cli_path
+from blocking_review import counterpart_review_enabled
 
 
 _CACHE: tuple[float, dict[str, Any]] | None = None
@@ -29,7 +30,7 @@ def review_health_snapshot(*, force: bool = False, probe: bool = True) -> dict[s
 
 def _compute_snapshot(*, probe: bool = True) -> dict[str, Any]:
     enabled = os.environ.get("BABATA_BLOCKING_REVIEW", "1") != "0"
-    counterpart_enabled = _counterpart_enabled()
+    counterpart_enabled = counterpart_review_enabled()
     configured_review_cpu = os.environ.get("BABATA_BLOCKING_REVIEW_CPU", "codex").strip().lower() or "codex"
     supported_review_cpus = {
         "codex", "claude", "cc", "claude-code", "counterpart", "opposite",
@@ -38,6 +39,10 @@ def _compute_snapshot(*, probe: bool = True) -> dict[str, Any]:
     strict = os.environ.get("BABATA_BLOCKING_REVIEW_INFRA_STRICT", "0") == "1"
     if not enabled:
         status = "disabled"
+        probes = {}
+    elif os.environ.get("BABATA_BLOCKING_REVIEW_CMD"):
+        # Never execute a user-supplied reviewer as a health probe.
+        status = "custom-command-not-checked"
         probes = {}
     elif not counterpart_enabled:
         status = "deterministic-only"
@@ -65,19 +70,13 @@ def _compute_snapshot(*, probe: bool = True) -> dict[str, Any]:
         "status": status,
         "enabled": enabled,
         "counterpart_enabled": counterpart_enabled,
+        "custom_command_configured": bool(os.environ.get("BABATA_BLOCKING_REVIEW_CMD")),
         "review_cpu": review_cpu,
         "configured_review_cpu": configured_review_cpu,
         "strict": strict,
         "probes": probes,
         "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-
-
-def _counterpart_enabled() -> bool:
-    mode = os.environ.get("BABATA_BLOCKING_REVIEW_AGENT", "counterpart").strip().lower()
-    if mode in {"0", "off", "false", "disabled", "none", "deterministic"}:
-        return False
-    return os.environ.get("BABATA_BLOCKING_REVIEW_COUNTERPART", "1") != "0"
 
 
 def _probe_cc_worker() -> dict[str, Any]:

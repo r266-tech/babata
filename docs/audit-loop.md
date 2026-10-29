@@ -67,15 +67,16 @@ allowed to complete.
    completion until the next review pass succeeds or the configured repair round
    limit is reached.
 
-   The default reviewer after deterministic local checks is an independent Codex
-   process using `gpt-5.6-sol` with `max` reasoning through `codex exec` in
-   read-only mode. This remains the default regardless of the authoring CPU while
-   Claude is unavailable; `BABATA_BLOCKING_REVIEW_CPU=claude` is an explicit
-   opt-in to the legacy `cc-worker` reviewer. The original CPU still performs any
-   repair in its own session; the reviewer only returns a verdict and findings.
-   babata sets
-   `BABATA_BLOCKING_REVIEW=0` and increments `BABATA_BLOCKING_REVIEW_DEPTH` for
-   reviewer child processes so review does not recursively call another review.
+   The default gate uses local deterministic guards and declared checks. It does
+   not start a second model for every code edit. The authoring agent chooses
+   additional review when the task's complexity or consequences justify it.
+
+   Workloads can explicitly enable a read-only model reviewer with
+   `BABATA_BLOCKING_REVIEW_AGENT=counterpart` or the legacy
+   `BABATA_BLOCKING_REVIEW_COUNTERPART=1`. The configured default review CPU is
+   Codex; Claude and opposite-CPU routing remain explicit options. A separate
+   process is not proof of a different or independent model. Reviewer children
+   disable recursive blocking review; the original session applies any repairs.
 
    Deterministic guard failures and failed declared checks block before the
    counterpart CPU is called. With `BABATA_BLOCKING_REVIEW_CMD`, babata uses that
@@ -92,7 +93,9 @@ allowed to complete.
    }
    ```
 
-   Return `{"status":"passed"}` to allow completion.
+   Return `{"status":"passed"}` to allow completion. Empty, malformed, or
+   unknown verdicts cannot count as a pass. An unavailable optional reviewer
+   reports `skipped`; strict mode reports a blocking infrastructure failure.
 
    The reviewer may receive the response draft as bounded input, but
    `blocking-review.jsonl` records only the scrubbed result plus response
@@ -115,7 +118,8 @@ allowed to complete.
 - `BABATA_DETERMINISTIC_GUARDS=observe|enforce|off` controls guard behavior.
 - `BABATA_DECLARED_CHECKS=0` disables `.babata/checks.json`.
 - `BABATA_BLOCKING_REVIEW=0` disables the blocking review gate.
-- `BABATA_BLOCKING_REVIEW_AGENT=deterministic` disables counterpart CPU review.
+- `BABATA_BLOCKING_REVIEW_AGENT=counterpart` enables optional model review;
+  the default is deterministic checks only.
 - `BABATA_BLOCKING_REVIEW_COUNTERPART=0` also disables counterpart CPU review.
 - `BABATA_BLOCKING_REVIEW_CPU=codex|claude|counterpart` selects the review CPU;
   default is `codex`, while `counterpart` explicitly restores opposite-CPU routing.
@@ -133,8 +137,8 @@ allowed to complete.
 - `BABATA_REVIEW_BUS=queue|off` controls optional review task enqueueing.
 
 `/status` and `state/runtime-status-<instance>.json` include blocking-review
-health. Health status is `ok`, `degraded`, `block`, `disabled`, or
-`deterministic-only`; `block` means strict mode is enabled and a counterpart
+health. Health status is `ok`, `degraded`, `block`, `disabled`,
+`custom-command-not-checked`, or `deterministic-only`; `block` means strict mode is enabled and a counterpart
 reviewer probe failed.
 
 ## Isolation
