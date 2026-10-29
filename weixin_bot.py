@@ -67,12 +67,14 @@ PENDING_WX_UPDATES_FILE = STATE_DIR / f"{PROJECT}-weixin-pending-updates.json"
 async def _heartbeat_loop(client: "WeixinClient", account_id: str) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     alerted = False
+    peer_alive = False  # a peer that was never alive this run is retired, not down
     while True:
         try:
             _HEARTBEAT_ME.touch()
             if _HEARTBEAT_PEER.exists():
                 age = time.time() - _HEARTBEAT_PEER.stat().st_mtime
-                if age > _HEARTBEAT_STALE_S and not alerted:
+                peer_alive = peer_alive or age <= _HEARTBEAT_STALE_S
+                if age > _HEARTBEAT_STALE_S and peer_alive and not alerted:
                     allow = load_allow_from(account_id)
                     target = allow[0] if allow else None
                     if target:
@@ -947,13 +949,20 @@ async def _query_wx_turn_with_recovery(
                 images=images or None,
                 on_stream=coalescer.on_stream,
             )
-            if fallback_cc and getattr(resp, "cpu_unavailable", False):
-                log.warning("primary CPU unavailable (quota/auth); WeChat turn → fallback")
-                resp = await fallback_cc.query(
-                    prompt,
-                    images=images or None,
-                    on_stream=coalescer.on_stream,
-                )
+            if getattr(resp, "cpu_unavailable", False):
+                if fallback_cc:
+                    log.warning("primary CPU unavailable (quota/auth); WeChat turn → fallback")
+                    resp = await fallback_cc.query(
+                        prompt,
+                        images=images or None,
+                        on_stream=coalescer.on_stream,
+                    )
+                else:
+                    log.warning("primary CPU unavailable (quota/auth); no fallback configured")
+                    resp.content = (
+                        "⚠️ Claude 暂时不可用（额度或登录），这条消息没有处理，恢复后请重发。\n\n"
+                        f"{resp.content or ''}"
+                    ).strip()
             return resp
         except Exception as e:
             log.exception("CC query failed")

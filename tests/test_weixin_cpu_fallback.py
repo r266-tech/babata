@@ -126,3 +126,15 @@ def test_weixin_turn_falls_back_only_when_primary_unavailable(
 
     assert resp.content == expected
     assert fallback.calls == int(unavailable)
+
+
+def test_weixin_turn_without_fallback_tells_user_in_chinese(weixin_bot, monkeypatch):
+    primary = _Engine(_Resp("You've hit your limit", True))
+    monkeypatch.setattr(weixin_bot, "cc", primary)
+    monkeypatch.setattr(weixin_bot, "fallback_cc", None)
+
+    resp = asyncio.run(weixin_bot._query_wx_turn_with_recovery("hi", [], _Coalescer()))
+
+    assert resp.content.startswith("⚠️ Claude 暂时不可用")
+    assert resp.content.endswith("You've hit your limit")
+    assert primary.calls == 1

@@ -304,3 +304,46 @@ def test_image_signatures_are_strict():
     assert not wi._is_image_bytes(b"BM secret that starts with BM")
     bmp = b"BM" + (10).to_bytes(4, "little") + b"\0" * 4
     assert wi._is_image_bytes(bmp)
+
+
+# ── heartbeat ────────────────────────────────────────────────────────
+
+
+def _run_heartbeat(monkeypatch, tmp_path, ages):
+    """Drive _heartbeat_loop through one tick per peer age; return alerts sent."""
+    import time as _time
+
+    me, peer = tmp_path / "me", tmp_path / "peer"
+    peer.touch()
+    monkeypatch.setattr(wb, "_HEARTBEAT_ME", me)
+    monkeypatch.setattr(wb, "_HEARTBEAT_PEER", peer)
+    monkeypatch.setattr(wb, "load_allow_from", lambda _a: ["u"])
+    ticks = iter(ages)
+
+    async def tick(_s):
+        try:
+            age = next(ticks)
+        except StopIteration:
+            raise asyncio.CancelledError
+        os.utime(peer, (_time.time() - age, _time.time() - age))
+
+    sent = []
+
+    class Client:
+        async def send_message(self, to, items, **_k):
+            sent.append(items[0]["text_item"]["text"])
+
+    monkeypatch.setattr(wb.asyncio, "sleep", tick)
+    os.utime(peer, (_time.time() - ages[0],) * 2)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(wb._heartbeat_loop(Client(), "acc"))
+    return sent
+
+
+def test_retired_peer_never_alerts(monkeypatch, tmp_path):
+    assert _run_heartbeat(monkeypatch, tmp_path, [9999, 9999, 9999]) == []
+
+
+def test_peer_that_dies_mid_run_alerts_once(monkeypatch, tmp_path):
+    sent = _run_heartbeat(monkeypatch, tmp_path, [10, 500, 600, 700])
+    assert len(sent) == 1 and "心跳" in sent[0]

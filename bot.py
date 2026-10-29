@@ -693,13 +693,15 @@ _HEARTBEAT_INTERVAL_S = 30
 async def _heartbeat_loop(app: "Application") -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     alerted = False
+    peer_alive = False  # a peer that was never alive this run is retired, not down
     is_primary = not INSTANCE
     while True:
         try:
             _HEARTBEAT_ME.touch()
             if is_primary and _HEARTBEAT_PEER.exists():
                 age = time.time() - _HEARTBEAT_PEER.stat().st_mtime
-                if age > _HEARTBEAT_STALE_S and not alerted and ALLOWED_USER:
+                peer_alive = peer_alive or age <= _HEARTBEAT_STALE_S
+                if age > _HEARTBEAT_STALE_S and peer_alive and not alerted and ALLOWED_USER:
                     try:
                         await app.bot.send_message(
                             ALLOWED_USER,
