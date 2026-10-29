@@ -1,7 +1,8 @@
 import asyncio
 import base64
 import hashlib
-import inspect
+import subprocess
+import threading
 import json
 import os
 import time
@@ -36,6 +37,12 @@ def test_cc_exposes_public_session_helpers(tmp_path):
 def test_sidebar_evidence_bound_helpers_opt_out_of_memory():
     assert sidebar_bot.agent_view_cc._memory_enabled is False
     assert sidebar_bot.clean_read_cc._memory_enabled is False
+    assert sidebar_bot.agent_view_cc.assistant_engine_name == "codex"
+    assert sidebar_bot.clean_read_cc.assistant_engine_name == "codex"
+    assert sidebar_bot.agent_view_cc._codex_model_override == "gpt-6.1-sol"
+    assert sidebar_bot.clean_read_cc._codex_model_override == "gpt-6.1-sol"
+    assert sidebar_bot.agent_view_cc._codex_reasoning_override == "low"
+    assert sidebar_bot.clean_read_cc._codex_reasoning_override == "low"
     assert sidebar_bot.cc._memory_enabled is True
     assert sidebar_bot.proactive_cc._memory_enabled is True
 
@@ -44,7 +51,7 @@ def test_cc_memory_opt_out_skips_context_render(monkeypatch, tmp_path):
     def fail_render(*_args, **_kwargs):
         raise AssertionError("memory context should not render")
 
-    monkeypatch.setattr(cc_module, "_render_babata_memory_context_event", fail_render)
+    monkeypatch.setattr(cc_module, "_render_babata_memory_context", fail_render)
     session = cc_module.CC(
         state_file=tmp_path / "session.json",
         source_prompt="Source: evidence-bound.",
@@ -52,7 +59,7 @@ def test_cc_memory_opt_out_skips_context_render(monkeypatch, tmp_path):
         memory_enabled=False,
     )
 
-    assert session._source_prompt_with_memory(user_prompt="hello") == "Source: evidence-bound."
+    assert session._source_prompt_with_memory() == "Source: evidence-bound."
 
 
 def test_recent_session_files_scans_buckets_and_excludes_summary_sandbox(monkeypatch, tmp_path):
@@ -76,9 +83,6 @@ def test_recent_session_files_scans_buckets_and_excludes_summary_sandbox(monkeyp
 
     assert cc_module._recent_session_files(scan_all_buckets=False) == [own_file]
     assert cc_module._recent_session_files(scan_all_buckets=True) == [other_file, own_file]
-    source = inspect.getsource(cc_module._spawn_summary_generation)
-    assert "20字内概括会话主题，只输出一句中文。" in source
-    assert "不加任何前缀" not in source
 
 
 def test_first_real_user_and_entrypoint_skips_synthetic_user_records(tmp_path):
@@ -148,19 +152,23 @@ def _write_session_jsonl(path: Path, text: str, *, entrypoint: str = "cli", mtim
     os.utime(path, (mtime, mtime))
 
 
-def test_list_recent_sessions_filters_before_summary_generation(monkeypatch, tmp_path):
+def test_list_recent_sessions_filters_without_starting_background_work(monkeypatch, tmp_path):
     owned = tmp_path / "owned.jsonl"
     oneshot = tmp_path / "oneshot.jsonl"
     term = tmp_path / "term.jsonl"
     _write_session_jsonl(owned, "owned prompt", entrypoint="cli", mtime=30)
     _write_session_jsonl(oneshot, "oneshot prompt", entrypoint="sdk-cli", mtime=20)
     _write_session_jsonl(term, "term prompt", entrypoint="cli", mtime=10)
-    spawned: list[tuple[str, float]] = []
+    def unexpected_background_work(*_args, **_kwargs):
+        pytest.fail("session listing started background work")
+
+    monkeypatch.setattr(threading, "Thread", unexpected_background_work)
+    monkeypatch.setattr(subprocess, "run", unexpected_background_work)
+    monkeypatch.setattr(subprocess, "Popen", unexpected_background_work)
 
     monkeypatch.setattr(cc_module, "_recent_session_files", lambda **_kw: [owned, oneshot, term])
     monkeypatch.setattr(cc_module, "_scan_peer_sids", lambda: {"owned": ["巴巴塔"]})
     monkeypatch.setattr(cc_module, "_load_summary_cache", lambda: {})
-    monkeypatch.setattr(cc_module, "_spawn_summary_generation", lambda sid, mtime: spawned.append((sid, mtime)))
     monkeypatch.setattr(cc_module, "_channel_label_from_state_file", lambda _fp: "巴巴塔")
 
     session = cc_module.CC(state_file=tmp_path / "babata-session.json", source_prompt="Source: test.")
@@ -168,7 +176,6 @@ def test_list_recent_sessions_filters_before_summary_generation(monkeypatch, tmp
 
     assert [row["sid"] for row in rows] == ["term"]
     assert rows[0]["preview"] == "term prompt"
-    assert spawned == [("term", term.stat().st_mtime)]
 
 
 def test_list_recent_sessions_uses_cached_preview_and_owner_flags(monkeypatch, tmp_path):
@@ -176,14 +183,12 @@ def test_list_recent_sessions_uses_cached_preview_and_owner_flags(monkeypatch, t
     oneshot = tmp_path / "oneshot.jsonl"
     _write_session_jsonl(owned, "owned prompt", entrypoint="cli", mtime=30)
     _write_session_jsonl(oneshot, "oneshot prompt", entrypoint="sdk-cli", mtime=20)
-    spawned: list[str] = []
 
     monkeypatch.setattr(cc_module, "_recent_session_files", lambda **_kw: [owned, oneshot])
     monkeypatch.setattr(cc_module, "_scan_peer_sids", lambda: {"owned": ["巴巴塔2", "巴巴塔"]})
     monkeypatch.setattr(cc_module, "_load_summary_cache", lambda: {
         "owned": {"summary": "cached summary", "source_mtime": owned.stat().st_mtime}
     })
-    monkeypatch.setattr(cc_module, "_spawn_summary_generation", lambda sid, _mtime: spawned.append(sid))
     monkeypatch.setattr(cc_module, "_channel_label_from_state_file", lambda _fp: "巴巴塔")
 
     state_file = tmp_path / "babata-session.json"
@@ -202,7 +207,6 @@ def test_list_recent_sessions_uses_cached_preview_and_owner_flags(monkeypatch, t
     }
     assert rows[1]["channel"] == "oneshot"
     assert rows[1]["preview"] == "oneshot prompt"
-    assert spawned == ["oneshot"]
 
 
 def test_sidebar_cpu_status_reads_public_session_property(monkeypatch):

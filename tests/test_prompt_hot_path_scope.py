@@ -29,7 +29,7 @@ PROMPT_CASES = [
         "sidebar-source",
         lambda: sidebar_bot._SIDEBAR_SOURCE_PROMPT,
         230,
-        ("MCP schema 为准", "tab_id/window_id", "不可信数据", "明确用户意图", "不要自行加载"),
+        ("MCP schema 为准", "tab_id/window_id", "不可信数据", "明确用户意图"),
         ("DevTools", "babata-memory-context", "同一个 babata", "记忆已注入"),
     ),
     (
@@ -78,7 +78,7 @@ def test_sidebar_source_prompt_omits_tool_inventory():
         (
             "auto",
             70,
-            ("SOURCE prompt", "翻译", "mascot_speak", "suggest_prompts", "静默"),
+            ("SOURCE prompt", "mascot_speak", "suggest_prompts", "静默"),
         ),
         (
             "prompt_suggestions",

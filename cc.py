@@ -61,10 +61,9 @@ from constants import (
 from cli_runtime import env_cli_path
 from memory_runtime import (
     default_memory_source,
-    log_memory_reflex_post_answer,
     memory_inject_enabled,
     memory_inject_timeout,
-    render_babata_memory_context_event,
+    render_babata_memory_context,
 )
 from turn_audit import (
     TurnAudit,
@@ -222,10 +221,10 @@ _SETTING_SOURCES: list[str] = (
 )
 
 # Default trust boundary keeps cwd at the repo and permission prompts enabled.
-# BABATA_FULL_TRUST=1 opts into cwd=$HOME and auto mode for trusted personal deployments.
+# BABATA_FULL_TRUST=1 opts into cwd=$HOME and unrestricted tool execution.
 _FULL_TRUST = os.environ.get("BABATA_FULL_TRUST") == "1"
 _DEFAULT_CWD = str(Path.home()) if _FULL_TRUST else str(Path(__file__).parent)
-_PERMISSION_MODE = "auto" if _FULL_TRUST else "default"
+_PERMISSION_MODE = "bypassPermissions" if _FULL_TRUST else "default"
 
 
 def _with_repo_project_instructions(prompt: str) -> str:
@@ -274,10 +273,7 @@ def _channel_label_from_state_file(fp: Path) -> str:
 
 _SUMMARY_CACHE_FILE = _STATE_DIR / "session-summaries.json"
 
-# Summary subprocess 的专用 CWD. claude -p 会按 CWD 把 session jsonl 写到对应
-# bucket (~/.claude/projects/<cwd-hash>/); 如果 summary 进程跟 babata 日常用同
-# 一个 CWD ($HOME), 它产生的 "用一句话总结..." session 会污染主 bucket, 反过来
-# 被 list_recent_sessions 扫到显示给 V. 用专用 sandbox CWD 物理隔离.
+# Legacy summary sessions remain excluded from the user-facing resume list.
 _SUMMARY_SANDBOX = _STATE_DIR / "summary-sandbox"
 
 
@@ -286,100 +282,6 @@ def _load_summary_cache() -> dict:
         return json.loads(_SUMMARY_CACHE_FILE.read_text())
     except Exception:
         return {}
-
-
-def _save_summary_cache(cache: dict) -> None:
-    """原子写 (tmp + rename) 避免跟并发 generator 互踩."""
-    try:
-        _SUMMARY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _SUMMARY_CACHE_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(cache, ensure_ascii=False))
-        tmp.replace(_SUMMARY_CACHE_FILE)
-    except Exception as e:
-        log.warning("Failed to persist summary cache: %s", e)
-
-
-def _extract_session_text_for_summary(jsonl_path: Path, max_chars: int = 6000) -> str:
-    """把 session jsonl 里 user + assistant 真实文本拼成给 claude -p 总结的输入.
-
-    max_chars 控制上限, 避免长会话一次塞爆 (haiku 便宜但仍是成本). 优先拿开头
-    + 结尾 —— 开头锚定主题, 结尾反映当前状态. 中间大量 tool-call / context dump
-    对"一句话总结"没增量.
-    """
-    lines = []
-    try:
-        for raw in jsonl_path.read_text().splitlines():
-            try:
-                d = json.loads(raw)
-            except Exception:
-                continue
-            if d.get("type") not in ("user", "assistant"):
-                continue
-            msg = d.get("message")
-            if not isinstance(msg, dict):
-                continue
-            text = _extract_text(msg.get("content"))
-            if not text or _is_synthetic_user_text(text):
-                continue
-            role = d.get("type")
-            lines.append(f"[{role}] {text[:500]}")
-    except Exception:
-        return ""
-    if not lines:
-        return ""
-    joined = "\n".join(lines)
-    if len(joined) <= max_chars:
-        return joined
-    # 头 60% + 尾 40%
-    head_n = int(max_chars * 0.6)
-    tail_n = max_chars - head_n
-    return joined[:head_n] + "\n...[省略中段]...\n" + joined[-tail_n:]
-
-
-def _spawn_summary_generation(sid: str, source_mtime: float) -> None:
-    """Fire-and-forget: 后台线程跑 claude -p haiku 生成 session 一句话总结, 写缓存.
-
-    调用方不等结果 — 本次 /resume 仍用 first_user fallback, 下次 /resume 命中缓存.
-    Haiku 一句话总结典型 1-3 秒, 10 session 并发大约 3-5 秒写完缓存.
-    """
-    jsonl = _find_jsonl_any_bucket(sid)
-    if jsonl is None:
-        return
-
-    def worker() -> None:
-        import subprocess
-        try:
-            text = _extract_session_text_for_summary(jsonl)
-            if not text:
-                return
-            prompt = "20字内概括会话主题，只输出一句中文。\n\n" + text
-            cli = env_cli_path("CLAUDE_CLI_PATH") or "claude"
-            # Model 不写死, 跟随 ~/.claude/settings.json 全局默认:
-            # CC 模型会升级, 代码里写死 'haiku' 将来可能指向弃用 tier.
-            # 若总结任务用 opus 太慢, 改 settings.json 或加 env override.
-            #
-            # CWD 用 _SUMMARY_SANDBOX 而不是 $HOME, 避免 subprocess session jsonl
-            # 污染主 bucket (2026-04-20 踩过的坑).
-            _SUMMARY_SANDBOX.mkdir(parents=True, exist_ok=True)
-            result = subprocess.run(
-                [cli, "-p", prompt,
-                 "--output-format", "text",
-                 "--permission-mode", "auto"],
-                capture_output=True, text=True, timeout=60,
-                cwd=str(_SUMMARY_SANDBOX),
-            )
-            summary = (result.stdout or "").strip().strip('"').strip("「」")
-            if not summary or len(summary) > 60:
-                # haiku 偶尔抗命给长输出 / 空输出 — 丢弃不写缓存, 下次再试
-                return
-            cache = _load_summary_cache()
-            cache[sid] = {"summary": summary, "source_mtime": source_mtime}
-            _save_summary_cache(cache)
-        except Exception as e:
-            log.debug("summary gen failed for %s: %s", sid[:8], e)
-
-    import threading
-    threading.Thread(target=worker, daemon=True).start()
 
 
 def _scan_peer_sids() -> dict[str, list[str]]:
@@ -405,8 +307,7 @@ def _scan_peer_sids() -> dict[str, list[str]]:
 def _recent_session_files(*, scan_all_buckets: bool) -> list[Path]:
     """Return candidate Claude session JSONL files newest-first.
 
-    The summary subprocess has its own cwd bucket; exclude it so internal
-    "summarize this session" calls do not pollute V-facing `/resume`.
+    Exclude the legacy summary bucket from V-facing `/resume`.
     """
     try:
         if scan_all_buckets:
@@ -480,12 +381,10 @@ def _session_listing_candidate(fp: Path, peer_map: dict[str, list[str]]) -> dict
 
 
 def _session_preview(sid: str, first_user: str, mtime: float, summary_cache: dict) -> str:
-    # Summary cache: 按 jsonl mtime 失效. 命中用缓存, miss/过期后台生成
-    # + 本次 fallback first_user. 下次 /resume 就能看见总结.
+    # Reuse valid legacy titles; listing sessions never starts a model.
     cached = summary_cache.get(sid)
     if cached and cached.get("source_mtime") == mtime:
         return cached.get("summary") or first_user
-    _spawn_summary_generation(sid, mtime)
     return first_user
 
 
@@ -496,12 +395,8 @@ async def _always_allow(
 ) -> PermissionResultAllow | PermissionResultDeny:
     """Auto-approve every SDK permission prompt.
 
-    bypassPermissions mode alone doesn't cover CC's "protected paths"
-    (~/.claude, .git, .ssh, .zshrc, .mcp.json, ...). Those still prompt in
-    every mode except `auto` and `dontAsk`. Bot is non-interactive, so any
-    prompt that reaches SDK = hung tool call.
-
-    Personal Mac full-trust — blanket allow."""
+    Used in the default permission mode. Full-trust mode uses the CLI's
+    bypassPermissions policy and does not register this callback."""
     block, reason = should_block_for_permission(tool_name, tool_input)
     if block:
         message = reason or "Blocked by babata deterministic guard"
@@ -512,6 +407,7 @@ async def _always_allow(
 # CC still decides meaning from the data we expose. Kept explicit so a future
 # reader sees the cost model instead of magic numbers.
 _MAX_RECENT_SIDS = 200          # ring buffer of past session_ids (~1y at 5/day, ~15KB state file)
+_CLAUDE_MEMORY_INJECTED_KEY = "claude_memory_injected_sids"
 _RESUME_INJECT_PAIRS = 2        # last N user+assistant pairs to inject on resume failure
 _RESUME_INJECT_CHARS = 240      # per-turn char cap (2 pairs × 240 × 2 ≈ 1KB, fits any system_prompt)
 _IDLE_RESET_MINUTES_DEFAULT = 1440  # 24h, parity with hermes session_reset.idle_minutes (gateway/config.py:114)
@@ -533,16 +429,11 @@ def _record_session_metadata(
     state["recent_sids"] = hist[:recent_limit]
 
 
-def _render_babata_memory_context_event(
-    source: str,
-    user_prompt: str | None = None,
-) -> tuple[str, str | None]:
-    return render_babata_memory_context_event(
+def _render_babata_memory_context(source: str) -> str:
+    return render_babata_memory_context(
         enabled=memory_inject_enabled("claude"),
         source=source,
-        user_prompt=user_prompt,
         cpu="claude",
-        cwd=_DEFAULT_CWD,
         timeout=memory_inject_timeout("claude"),
     )
 
@@ -866,28 +757,44 @@ class CC:
         self._model = model
         self._effort = effort
         self._session_id: str | None = self._load_state().get("session_id")
-        self._memory_reflex_event_id: str | None = None
+        self._memory_injected_pending = False
 
-    def _source_prompt_with_memory(
-        self,
-        extra_context: str | None = None,
-        *,
-        user_prompt: str | None = None,
-    ) -> str:
+    def _source_prompt_with_memory(self, extra_context: str | None = None) -> str:
         parts = [self._source_prompt]
-        self._memory_reflex_event_id = None
-        if self._memory_enabled:
-            memory_context, event_id = _render_babata_memory_context_event(self._memory_source, user_prompt)
-            self._memory_reflex_event_id = event_id
+        self._memory_injected_pending = False
+        if self._memory_enabled and self._should_inject_claude_memory():
+            memory_context = _render_babata_memory_context(self._memory_source)
             if memory_context:
                 parts.append(memory_context)
+                self._memory_injected_pending = True
         if extra_context:
             parts.append(extra_context)
         return "\n\n".join(parts)
 
-    def _record_memory_reflex_answer(self, content: str) -> None:
-        log_memory_reflex_post_answer(self._memory_reflex_event_id, content)
-        self._memory_reflex_event_id = None
+    def _should_inject_claude_memory(self) -> bool:
+        if not memory_inject_enabled("claude"):
+            return False
+        if not self._session_id:
+            return True
+        injected = self._load_state().get(_CLAUDE_MEMORY_INJECTED_KEY)
+        if not isinstance(injected, list):
+            return True
+        return self._session_id not in {str(sid) for sid in injected}
+
+    def _mark_claude_memory_injected(self, sid: str) -> None:
+        state = self._load_state()
+        injected = state.get(_CLAUDE_MEMORY_INJECTED_KEY)
+        if not isinstance(injected, list):
+            injected = []
+        history = [str(item) for item in injected if str(item) != sid]
+        history.insert(0, sid)
+        state[_CLAUDE_MEMORY_INJECTED_KEY] = history[:_MAX_RECENT_SIDS]
+        self._save_state(state)
+
+    def _commit_pending_memory_injection(self, sid: str | None) -> None:
+        if self._memory_injected_pending and sid:
+            self._mark_claude_memory_injected(sid)
+        self._memory_injected_pending = False
 
     # ── state persistence (per-channel) ──────────────────────────────
 
@@ -942,9 +849,9 @@ class CC:
         """Silently reset session if idle exceeds threshold. Returns True if reset.
 
         Idle reset ≠ /new: fires only the babata-local session-end hook for the
-        old sid. Skips skill-evolve session-start (no explicit reset) and
-        skips the "会话已重置" reply. Next turn starts fresh and picks up the
-        standard startup memory context.
+        old sid. It does not fire session-start for the old sid and skips the
+        "会话已重置" reply. Next turn starts fresh and picks up the standard
+        startup memory context.
 
         Default 24h, parity with hermes idle_minutes. Migration: state files
         without last_activity_at fall back to file mtime so an already-stale
@@ -1096,8 +1003,8 @@ class CC:
     def resume(self, sid: str) -> bool:
         """Switch active session to `sid` (or its forked counterpart). False if JSONL missing.
 
-        Bumps the active sid to the front of recent_sids. Skill-evolve hooks:
-        skipped (pointer switch). Babata-local hooks: fired.
+        Bumps the active sid to the front of recent_sids. Babata-local lifecycle
+        hooks fire when the pointer changes.
 
         Cross-bucket fork: 若 sid 文件在别的 cwd-bucket, _import_jsonl_to_bucket
         会用 *新 uuid* 复制一份到 babata bucket 并返回新 sid; 这里把 self._session_id
@@ -1241,18 +1148,18 @@ class CC:
     def _make_query_options(
         self,
         *,
-        user_prompt: str,
         include_partial_messages: bool,
     ) -> ClaudeAgentOptions:
         opts = ClaudeAgentOptions(
             max_turns=200,
             permission_mode=_PERMISSION_MODE,
-            can_use_tool=_always_allow,  # auto-approve protected-path prompts that bypassPermissions still forwards
+            can_use_tool=None if _FULL_TRUST else _always_allow,
+            sandbox={"enabled": False} if _FULL_TRUST else None,
             cwd=_DEFAULT_CWD,
             cli_path=env_cli_path("CLAUDE_CLI_PATH"),
             include_partial_messages=include_partial_messages,
             system_prompt=_with_repo_project_instructions(
-                self._source_prompt_with_memory(user_prompt=user_prompt)
+                self._source_prompt_with_memory()
             ),
             model=self._model,
             setting_sources=_SETTING_SOURCES,  # 默认 project-only; shared mode 再加 user
@@ -1299,13 +1206,12 @@ class CC:
         )
 
         opts = self._make_query_options(
-            user_prompt=prompt,
             include_partial_messages=on_stream is not None,
         )
 
         try:
             resp = await self._run(opts, prompt, images, on_stream)
-            self._record_memory_reflex_answer(resp.content)
+            self._commit_pending_memory_injection(resp.session_id)
             resp.audit = finish_turn(
                 audit,
                 response=resp,
@@ -1326,10 +1232,10 @@ class CC:
             self._record_sid(None)
             opts.resume = None
             ctx = self._recent_turns_summary()
+            opts.system_prompt = _with_repo_project_instructions(
+                self._source_prompt_with_memory(ctx or None)
+            )
             if ctx:
-                opts.system_prompt = _with_repo_project_instructions(
-                    self._source_prompt_with_memory(ctx, user_prompt=prompt)
-                )
                 note = f"⚠️ 会话重置 ({type(e).__name__}), 已从归档注入最近 {_RESUME_INJECT_PAIRS} 轮"
             else:
                 note = f"⚠️ 会话重置 ({type(e).__name__}), 历史归档也没找到"
@@ -1338,7 +1244,7 @@ class CC:
             except Exception as retry_error:
                 finish_turn(audit, error=retry_error)
                 raise
-            self._record_memory_reflex_answer(resp.content)
+            self._commit_pending_memory_injection(resp.session_id)
             resp.resume_note = note
             resp.audit = finish_turn(
                 audit,
@@ -1392,7 +1298,6 @@ class CC:
             images_count=0,
         )
         opts = self._make_query_options(
-            user_prompt=prompt,
             include_partial_messages=False,
         )
         try:
@@ -1400,6 +1305,7 @@ class CC:
         except Exception as e:
             finish_turn(audit, error=e)
             raise
+        self._commit_pending_memory_injection(resp.session_id)
         resp.audit = finish_turn(
             audit,
             response=resp,
@@ -1535,7 +1441,8 @@ class LiveSession(CC):
         opts = ClaudeAgentOptions(
             max_turns=200,
             permission_mode=_PERMISSION_MODE,
-            can_use_tool=_always_allow,
+            can_use_tool=None if _FULL_TRUST else _always_allow,
+            sandbox={"enabled": False} if _FULL_TRUST else None,
             cwd=_DEFAULT_CWD,
             cli_path=env_cli_path("CLAUDE_CLI_PATH"),
             include_partial_messages=True,
@@ -1947,6 +1854,7 @@ class LiveSession(CC):
                 changed = (old_sid, sid)
             self._session_id = sid
             self._record_sid(sid)
+        self._commit_pending_memory_injection(sid)
         audit = self._pending_audits.pop(0) if self._pending_audits else None
         response.audit = finish_turn(
             audit,

@@ -156,7 +156,6 @@ def test_full_trust_keeps_repo_instructions_when_cwd_moves_home(monkeypatch, tmp
     )
 
     opts = session._make_query_options(
-        user_prompt="hello",
         include_partial_messages=False,
     )
 

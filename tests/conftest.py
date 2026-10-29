@@ -54,6 +54,7 @@ class ClaudeAgentOptions:
     setting_sources: list[str] | None = None
     max_buffer_size: int | None = None
     can_use_tool: Any = None
+    sandbox: dict[str, Any] | None = None
 
 
 class ClaudeSDKClient:

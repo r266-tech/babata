@@ -97,6 +97,7 @@ def make_engine(
     live: bool = False,
     engine: str | None = None,
     model: str | None = None,
+    reasoning: str | None = None,
     effort: str | None = None,
     memory_source: str | None = None,
     memory_enabled: bool = True,
@@ -119,6 +120,8 @@ def make_engine(
             state_file=state_file,
             source_prompt=source_prompt,
             mcp_servers=mcp_servers,
+            model=model,
+            reasoning=reasoning,
             memory_source=memory_source,
             memory_enabled=memory_enabled,
         )

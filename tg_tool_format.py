@@ -362,8 +362,6 @@ def _second_brain_detail(command: str) -> str:
 def _shell_special_summary(command: str) -> tuple[str, str] | None:
     if "babata-memory-context" in command or "memory-inject.sh" in command:
         return "Memory", _memory_context_detail(command)
-    if "babata-memory-reflex" in command:
-        return "Memory", "reflex"
     if "self-ops.sh" in command and "restart" in command:
         return "Restart", _self_ops_restart_detail(command)
     if re.search(r"\blaunchctl\s+", command):

@@ -45,7 +45,7 @@ def _run_claude(monkeypatch, tmp_path, messages):
         if chunk:
             streamed.append(chunk)
 
-    opts = session._make_query_options(user_prompt="hi", include_partial_messages=False)
+    opts = session._make_query_options(include_partial_messages=False)
     resp = asyncio.run(session._run(opts, "hi", None, on_stream))
     return opts, resp, streamed
 

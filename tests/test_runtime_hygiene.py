@@ -345,12 +345,6 @@ def test_removed_dead_public_helpers_do_not_return():
         ("turn_audit.py", "guard_mode"),
         ("turn_audit.py", "review_bus_mode"),
         ("memory_runtime.py", "memory_inject_script"),
-        ("memory_runtime.py", "memory_reflex_script"),
-        ("memory_runtime.py", "memory_reflex_timeout"),
-        ("memory_runtime.py", "format_memory_reflex_hint"),
-        ("memory_runtime.py", "memory_reflex_enabled"),
-        ("memory_runtime.py", "memory_reflex_for_prompt"),
-        ("memory_runtime.py", "log_memory_reflex_preflight"),
         ("weixin_bot.py", "strip_markdown"),
         ("weixin_bot.py", "chunk_text"),
     ]

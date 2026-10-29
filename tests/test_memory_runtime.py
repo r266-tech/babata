@@ -1,18 +1,12 @@
-import json
-import stat
-from pathlib import Path
+import subprocess
+from types import SimpleNamespace
+
+import pytest
 
 import cc
 import codex_engine
+import grok_engine
 import memory_runtime
-
-_TEST_REFLEX_TIMEOUT_S = "5"
-
-
-def _write_executable(path: Path, body: str) -> None:
-    path.write_text(body, encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IXUSR)
-
 
 def test_default_memory_source_uses_env_not_prompt(monkeypatch):
     monkeypatch.delenv("BABATA_MEMORY_SOURCE", raising=False)
@@ -77,377 +71,91 @@ def test_memory_inject_timeout_is_owned_by_runtime(monkeypatch):
     assert memory_runtime.memory_inject_timeout("codex") == 5.0
 
 
-def test_memory_reflex_is_opt_in(monkeypatch):
-    monkeypatch.delenv("BABATA_MEMORY_REFLEX", raising=False)
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_MODE", "enforce")
-
-    assert memory_runtime._memory_reflex_enabled() is False
-    assert memory_runtime.memory_reflex_mode() == "off"
-
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX", "1")
-    assert memory_runtime._memory_reflex_enabled() is True
-    assert memory_runtime.memory_reflex_mode() == "enforce"
-
-
-def test_render_memory_context_event_injects_without_default_reflex(monkeypatch, tmp_path):
-    inject_log = tmp_path / "inject-env.json"
-    inject_script = tmp_path / "inject.sh"
-    reflex_script = tmp_path / "reflex.py"
-    reflex_log = tmp_path / "events.jsonl"
-
-    _write_executable(
-        inject_script,
-        "\n".join([
-            "#!/usr/bin/env python3",
-            "import json, os",
-            f"open({str(inject_log)!r}, 'w').write(json.dumps({{",
-            "    'profile': os.environ.get('BABATA_MEMORY_PROFILE'),",
-            "    'include_top': os.environ.get('BABATA_MEMORY_INCLUDE_TOP'),",
-            "}, sort_keys=True))",
-            "print('<memory-context>standing</memory-context>')",
-        ]),
-    )
-    _write_executable(
-        reflex_script,
-        "\n".join([
-            "#!/bin/sh",
-            "printf '%s\\n' '{\"routes\":[\"deep\"],\"profile\":\"deep\"}'",
-        ]),
-    )
-    monkeypatch.setenv("BABATA_MEMORY_INJECT_SCRIPT", str(inject_script))
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_SCRIPT", str(reflex_script))
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_LOG", str(reflex_log))
-    monkeypatch.delenv("BABATA_MEMORY_REFLEX", raising=False)
-    monkeypatch.delenv("BABATA_MEMORY_PROFILE", raising=False)
-
-    context, event_id = memory_runtime.render_babata_memory_context_event(
-        enabled=True,
-        source="sidebar",
-        user_prompt="hello memory",
-        cpu="codex",
-        cwd=str(tmp_path),
-        timeout=float(_TEST_REFLEX_TIMEOUT_S),
-    )
-
-    assert context == "<memory-context>standing</memory-context>"
-    assert json.loads(inject_log.read_text()) == {"include_top": "skip", "profile": "standing"}
-    assert event_id is None
-    assert not reflex_log.exists()
-
-
-def test_log_memory_reflex_preflight_only_skips_when_default_off(monkeypatch, tmp_path):
-    reflex_script = tmp_path / "reflex.py"
-    reflex_log = tmp_path / "events.jsonl"
-    _write_executable(
-        reflex_script,
-        "\n".join([
-            "#!/bin/sh",
-            "printf '%s\\n' '{\"routes\":[\"recent\"],\"profile\":\"recent\"}'",
-        ]),
-    )
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_SCRIPT", str(reflex_script))
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_LOG", str(reflex_log))
-    monkeypatch.delenv("BABATA_MEMORY_REFLEX", raising=False)
-
-    event_id = memory_runtime.log_memory_reflex_preflight_only(
-        source="sidebar",
-        user_prompt="look up yesterday",
-        cpu="codex",
-        cwd=str(tmp_path),
-    )
-
-    assert event_id is None
-    assert not reflex_log.exists()
-
-
-def test_render_memory_context_event_logs_enforced_reflex(monkeypatch, tmp_path):
-    inject_log = tmp_path / "inject-env.json"
-    inject_script = tmp_path / "inject.sh"
-    reflex_script = tmp_path / "reflex.py"
-    reflex_log = tmp_path / "events.jsonl"
-
-    _write_executable(
-        inject_script,
-        "\n".join([
-            "#!/usr/bin/env python3",
-            "import json, os",
-            f"open({str(inject_log)!r}, 'w').write(json.dumps({{",
-            "    'profile': os.environ.get('BABATA_MEMORY_PROFILE'),",
-            "    'cpu': os.environ.get('BABATA_MEMORY_CPU'),",
-            "    'source': os.environ.get('BABATA_MEMORY_SOURCE'),",
-            "    'include_top': os.environ.get('BABATA_MEMORY_INCLUDE_TOP'),",
-            "}, sort_keys=True))",
-            "print('<memory-context>ok</memory-context>')",
-        ]),
-    )
-    _write_executable(
-        reflex_script,
-        "\n".join([
-            "#!/bin/sh",
-            f"printf '%s\\n' '{{\"routes\":[\"deep\"],\"profile\":\"deep\",\"flags\":[\"reflection_candidate\"],\"reasons\":[\"need detail\"],\"cwd\":\"{str(tmp_path)}\",\"source\":\"sidebar\"}}'",
-        ]),
-    )
-    monkeypatch.setenv("BABATA_MEMORY_INJECT_SCRIPT", str(inject_script))
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_SCRIPT", str(reflex_script))
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_LOG", str(reflex_log))
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX", "1")
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_MODE", "enforce")
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_TIMEOUT", _TEST_REFLEX_TIMEOUT_S)
-    monkeypatch.delenv("BABATA_MEMORY_PROFILE", raising=False)
-    monkeypatch.setenv("BABATA_MEMORY_CPU", "stale-cpu")
-    monkeypatch.setenv("BABATA_MEMORY_SOURCE", "stale-source")
+@pytest.mark.parametrize("profile", [None, "standing", "lite", "recent", "deep", " deep ", "invalid"])
+@pytest.mark.parametrize("legacy_mode", [None, "dry-run", "enforce"])
+def test_renderer_preserves_profiles_and_ignores_retired_router(monkeypatch, tmp_path, profile, legacy_mode):
+    script = tmp_path / "inject.sh"
+    script.touch()
+    reflex = tmp_path / "reflex-trap"
+    reflex.write_text("must never execute")
+    event_log = tmp_path / "events.jsonl"
+    monkeypatch.setenv("BABATA_MEMORY_INJECT_SCRIPT", str(script))
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_SCRIPT", str(reflex))
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_LOG", str(event_log))
     monkeypatch.delenv("BABATA_MEMORY_INCLUDE_TOP", raising=False)
+    if profile is None:
+        monkeypatch.delenv("BABATA_MEMORY_PROFILE", raising=False)
+    else:
+        monkeypatch.setenv("BABATA_MEMORY_PROFILE", profile)
+    if legacy_mode is None:
+        monkeypatch.delenv("BABATA_MEMORY_REFLEX", raising=False)
+        monkeypatch.delenv("BABATA_MEMORY_REFLEX_MODE", raising=False)
+    else:
+        monkeypatch.setenv("BABATA_MEMORY_REFLEX", "1")
+        monkeypatch.setenv("BABATA_MEMORY_REFLEX_MODE", legacy_mode)
+    calls = []
 
-    context, event_id = memory_runtime.render_babata_memory_context_event(
-        enabled=True,
-        source="sidebar",
-        user_prompt="hello memory",
-        cpu="codex",
-        cwd=str(tmp_path),
-        timeout=float(_TEST_REFLEX_TIMEOUT_S),
-    )
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        assert command == [str(script)]
+        assert "input" not in kwargs
+        return SimpleNamespace(returncode=0, stdout="  <memory-context>routes</memory-context>\n", stderr="")
 
-    assert event_id
-    assert "<memory-context>ok</memory-context>" in context
-    assert "<memory-reflex>" not in context
-    assert "routes: deep" not in context
-    assert "profile: deep" not in context
-    assert "need detail" not in context
-    assert "signal:" not in context
-    assert "why:" not in context
-    assert json.loads(inject_log.read_text()) == {
-        "cpu": "codex",
-        "include_top": "skip",
-        "profile": "deep",
-        "source": "sidebar",
-    }
-    events = [json.loads(line) for line in reflex_log.read_text().splitlines()]
-    assert events == [
-        {
-            "actual_profile": "deep",
-            "event": "preflight",
-            "id": event_id,
-            "memory_injected": True,
-            "message_sha256": events[0]["message_sha256"],
-            "mode": "enforce",
-            "post_answer_observation": "pending",
-            "router": {"flags": ["reflection_candidate"], "profile": "deep", "routes": ["deep"]},
-            "source": "sidebar",
-            "cpu": "codex",
-            "ts": events[0]["ts"],
-        }
-    ]
-    assert len(events[0]["message_sha256"]) == 64
-    assert "hello memory" not in reflex_log.read_text(encoding="utf-8")
-    assert "need detail" not in reflex_log.read_text(encoding="utf-8")
-    assert str(tmp_path) not in reflex_log.read_text(encoding="utf-8")
-    assert "message_summary" not in events[0]
-
-    memory_runtime.log_memory_reflex_post_answer(event_id, "没有找到")
-    events = [json.loads(line) for line in reflex_log.read_text().splitlines()]
-    assert events[1]["event"] == "post_answer"
-    assert events[1]["id"] == event_id
-    assert len(events[1]["answer_sha256"]) == 64
-    assert events[1]["observation"]["memory_miss_marker"] is True
-    assert "answer_summary" not in events[1]
-    assert "没有找到" not in reflex_log.read_text(encoding="utf-8")
+    monkeypatch.setattr(memory_runtime.subprocess, "run", fake_run)
+    context = memory_runtime.render_babata_memory_context(enabled=True, source="sidebar", cpu="codex", timeout=2.5)
+    assert context == "<memory-context>routes</memory-context>"
+    assert len(calls) == 1
+    env = calls[0][1]["env"]
+    assert env["BABATA_MEMORY_PROFILE"] == (profile.strip() if profile and profile.strip() != "invalid" else "standing")
+    assert env["BABATA_MEMORY_CPU"] == "codex"
+    assert env["BABATA_MEMORY_SOURCE"] == "sidebar"
+    assert env["BABATA_MEMORY_INCLUDE_TOP"] == "skip"
+    assert calls[0][1]["timeout"] == 2.5
+    assert not event_log.exists()
 
 
-def test_render_memory_context_event_preserves_explicit_profile_and_include_top(monkeypatch, tmp_path):
-    inject_log = tmp_path / "inject-env.json"
-    inject_script = tmp_path / "inject.sh"
-    reflex_script = tmp_path / "reflex.py"
-    reflex_log = tmp_path / "events.jsonl"
+@pytest.mark.parametrize("module,cpu,flag", [(cc, "claude", "BABATA_CC_MEMORY_INJECT"), (codex_engine, "codex", "BABATA_CODEX_MEMORY_INJECT"), (grok_engine, "grok", "BABATA_GROK_MEMORY_INJECT")])
+def test_cpu_adapters_share_context_delivery(monkeypatch, module, cpu, flag):
+    monkeypatch.delenv("BABATA_CRON_AGENT", raising=False)
+    monkeypatch.setenv(flag, "1")
+    monkeypatch.setenv(flag + "_TIMEOUT", "1.5")
+    calls = []
+    monkeypatch.setattr(module, "render_babata_memory_context", lambda **kwargs: calls.append(kwargs) or "context")
+    assert module._render_babata_memory_context("tg") == "context"
+    assert calls == [{"enabled": True, "source": "tg", "cpu": cpu, "timeout": 1.5}]
 
-    _write_executable(
-        inject_script,
-        "\n".join([
-            "#!/usr/bin/env python3",
-            "import json, os",
-            f"open({str(inject_log)!r}, 'w').write(json.dumps({{",
-            "    'profile': os.environ.get('BABATA_MEMORY_PROFILE'),",
-            "    'include_top': os.environ.get('BABATA_MEMORY_INCLUDE_TOP'),",
-            "}, sort_keys=True))",
-            "print('<memory-context>explicit</memory-context>')",
-        ]),
-    )
-    _write_executable(
-        reflex_script,
-        "\n".join([
-            "#!/bin/sh",
-            "printf '%s\\n' '{\"routes\":[\"deep\"],\"profile\":\"deep\"}'",
-        ]),
-    )
-    monkeypatch.setenv("BABATA_MEMORY_INJECT_SCRIPT", str(inject_script))
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_SCRIPT", str(reflex_script))
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_LOG", str(reflex_log))
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX", "1")
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_MODE", "enforce")
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_TIMEOUT", _TEST_REFLEX_TIMEOUT_S)
-    monkeypatch.setenv("BABATA_MEMORY_PROFILE", "recent")
+
+@pytest.mark.parametrize("enabled,present", [(False, False), (False, True), (True, False)])
+def test_disabled_or_missing_renderer_skips_subprocess(monkeypatch, tmp_path, enabled, present):
+    script = tmp_path / "inject.sh"
+    if present:
+        script.touch()
+    monkeypatch.setenv("BABATA_MEMORY_INJECT_SCRIPT", str(script))
+
+    def fail(*args, **kwargs):
+        raise AssertionError("no subprocess should run")
+
+    monkeypatch.setattr(memory_runtime.subprocess, "run", fail)
+    assert memory_runtime.render_babata_memory_context(enabled=enabled, source="tg", cpu="claude", timeout=1) == ""
+
+
+@pytest.mark.parametrize("result", ["nonzero", "empty", "timeout", "oserror"])
+def test_failed_renderer_does_not_claim_context(monkeypatch, tmp_path, result):
+    script = tmp_path / "inject.sh"
+    script.touch()
+    monkeypatch.setenv("BABATA_MEMORY_INJECT_SCRIPT", str(script))
+
+    def fake_run(command, **kwargs):
+        if result == "timeout":
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        if result == "oserror":
+            raise OSError("cannot execute")
+        return SimpleNamespace(returncode=2 if result == "nonzero" else 0, stdout="not context" if result == "nonzero" else " \n", stderr="failed" if result == "nonzero" else "")
+
+    monkeypatch.setattr(memory_runtime.subprocess, "run", fake_run)
+    assert memory_runtime.render_babata_memory_context(enabled=True, source="tg", cpu="grok", timeout=1) == ""
+
+
+def test_explicit_include_top_is_preserved(monkeypatch):
     monkeypatch.setenv("BABATA_MEMORY_INCLUDE_TOP", "force")
-
-    context, event_id = memory_runtime.render_babata_memory_context_event(
-        enabled=True,
-        source="terminal",
-        user_prompt="need deep",
-        cpu="codex",
-        cwd=str(tmp_path),
-        timeout=float(_TEST_REFLEX_TIMEOUT_S),
-    )
-
-    assert event_id
-    assert "<memory-context>explicit</memory-context>" in context
-    assert json.loads(inject_log.read_text()) == {
-        "include_top": "force",
-        "profile": "recent",
-    }
-    event = json.loads(reflex_log.read_text().splitlines()[0])
-    assert event["actual_profile"] == "recent"
-    assert event["router"] == {"profile": "deep", "routes": ["deep"]}
-
-
-def test_log_memory_reflex_preflight_only_records_router_without_inject(monkeypatch, tmp_path):
-    reflex_script = tmp_path / "reflex.py"
-    reflex_log = tmp_path / "events.jsonl"
-    _write_executable(
-        reflex_script,
-        "\n".join([
-            "#!/bin/sh",
-            f"printf '%s\\n' '{{\"routes\":[\"recent\"],\"profile\":\"recent\",\"reasons\":[\"history\"],\"cwd\":\"{str(tmp_path)}\"}}'",
-        ]),
-    )
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_SCRIPT", str(reflex_script))
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_LOG", str(reflex_log))
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX", "1")
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_MODE", "dry-run")
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_TIMEOUT", _TEST_REFLEX_TIMEOUT_S)
-    monkeypatch.delenv("BABATA_MEMORY_PROFILE", raising=False)
-
-    event_id = memory_runtime.log_memory_reflex_preflight_only(
-        source="sidebar",
-        user_prompt="look up yesterday",
-        cpu="codex",
-        cwd=str(tmp_path),
-    )
-
-    assert event_id
-    events = [json.loads(line) for line in reflex_log.read_text().splitlines()]
-    assert events == [
-        {
-            "actual_profile": "standing",
-            "event": "preflight",
-            "id": event_id,
-            "memory_injected": False,
-            "message_sha256": events[0]["message_sha256"],
-            "mode": "dry-run",
-            "post_answer_observation": "pending",
-            "router": {"profile": "recent", "routes": ["recent"]},
-            "source": "sidebar",
-            "cpu": "codex",
-            "ts": events[0]["ts"],
-        }
-    ]
-    assert len(events[0]["message_sha256"]) == 64
-    assert "message_summary" not in events[0]
-    assert "look up yesterday" not in reflex_log.read_text(encoding="utf-8")
-    assert "history" not in reflex_log.read_text(encoding="utf-8")
-    assert str(tmp_path) not in reflex_log.read_text(encoding="utf-8")
-
-
-def test_memory_reflex_routes_stay_telemetry_not_prompt_hints(monkeypatch, tmp_path):
-    inject_script = tmp_path / "inject.sh"
-    reflex_script = tmp_path / "reflex.py"
-    reflex_log = tmp_path / "events.jsonl"
-    _write_executable(
-        inject_script,
-        "\n".join([
-            "#!/bin/sh",
-            "printf '%s\\n' '<memory-context>ok</memory-context>'",
-        ]),
-    )
-    _write_executable(
-        reflex_script,
-        "\n".join([
-            "#!/bin/sh",
-            "printf '%s\\n' '{\"routes\":[\"brain\",\"wx\",\"code-grounded\"],\"profile\":\"lite\",\"reasons\":[\"private detail\"]}'",
-        ]),
-    )
-    monkeypatch.setenv("BABATA_MEMORY_INJECT_SCRIPT", str(inject_script))
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_SCRIPT", str(reflex_script))
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_LOG", str(reflex_log))
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX", "1")
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_MODE", "enforce")
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_TIMEOUT", _TEST_REFLEX_TIMEOUT_S)
-
-    context, event_id = memory_runtime.render_babata_memory_context_event(
-        enabled=True,
-        source="sidebar",
-        user_prompt="查一下这个人的微信和资料",
-        cpu="codex",
-        cwd=str(tmp_path),
-        timeout=float(_TEST_REFLEX_TIMEOUT_S),
-    )
-
-    assert event_id
-    assert context == "<memory-context>ok</memory-context>"
-    assert "<memory-reflex>" not in context
-    assert "routes:" not in context
-    assert "private detail" not in context
-    event = json.loads(reflex_log.read_text().splitlines()[0])
-    assert event["router"] == {"profile": "lite", "routes": ["brain", "wx", "code-grounded"]}
-    assert "hint_injected" not in event
-
-
-def test_memory_reflex_values_are_allowlisted(monkeypatch, tmp_path):
-    reflex_log = tmp_path / "events.jsonl"
-    monkeypatch.setenv("BABATA_MEMORY_REFLEX_LOG", str(reflex_log))
-
-    event_id = memory_runtime._log_memory_reflex_preflight(
-        reflex={
-            "routes": ["recent", str(tmp_path), "unexpected-route"],
-            "profile": str(tmp_path),
-            "route": "deep",
-            "flags": ["reflection_candidate", str(tmp_path), "free text reason"],
-        },
-        user_prompt="hello",
-        source="sidebar",
-        cpu="codex",
-        mode="dry-run",
-        actual_profile="lite",
-        memory_injected=False,
-    )
-
-    assert event_id
-    text = reflex_log.read_text(encoding="utf-8")
-    event = json.loads(text.splitlines()[0])
-    assert event["router"] == {
-        "flags": ["reflection_candidate"],
-        "routes": ["recent"],
-    }
-    assert str(tmp_path) not in text
-
-
-def test_memory_runtime_owns_shared_reflex_helpers():
-    cc_source = Path(cc.__file__).read_text(encoding="utf-8")
-    codex_source = Path(codex_engine.__file__).read_text(encoding="utf-8")
-    forbidden = (
-        "def _cc_memory_inject_enabled",
-        "def _codex_memory_inject_enabled",
-        "def _memory_inject_timeout",
-        "_DEFAULT_MEMORY_REFLEX_LOG",
-        "def _memory_source_from_prompt",
-        "def _memory_reflex_for_prompt",
-        "def _memory_reflex_enabled",
-        "def _memory_reflex_mode",
-        "def _memory_reflex_script",
-        "def _memory_reflex_timeout",
-        "def _render_babata_memory_context(",
-        "def _memory_reflex_log_path",
-        "def _append_memory_reflex_event",
-        "def _log_memory_reflex_preflight_only",
-        "def _answer_memory_observation",
-    )
-    for source in (cc_source, codex_source):
-        for marker in forbidden:
-            assert marker not in source
+    assert memory_runtime._memory_inject_env(profile="deep", cpu="claude", source="terminal")["BABATA_MEMORY_INCLUDE_TOP"] == "force"

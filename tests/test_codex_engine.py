@@ -288,17 +288,10 @@ def test_codex_engine_injects_babata_memory_once_per_session(monkeypatch, tmp_pa
     seen_sources: list[str | None] = []
     monkeypatch.setattr(
         codex_engine,
-        "_render_babata_memory_context_event",
-        lambda source=None, user_prompt=None: (
-            seen_sources.append(source) or "<memory-context>shared</memory-context>",
-            None,
+        "_render_babata_memory_context",
+        lambda source=None: (
+            seen_sources.append(source) or "<memory-context>shared</memory-context>"
         ),
-    )
-    reflex_sources: list[str | None] = []
-    monkeypatch.setattr(
-        codex_engine,
-        "log_memory_reflex_preflight_only",
-        lambda source, user_prompt, cpu, cwd: reflex_sources.append((source, cpu, cwd)) or "event-1",
     )
     session = codex_engine.CodexEngine(
         state_file=tmp_path / "session.json",
@@ -316,12 +309,12 @@ def test_codex_engine_injects_babata_memory_once_per_session(monkeypatch, tmp_pa
 
     session._mark_codex_memory_injected("sid-1")
     session._session_id = "sid-1"
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_MODE", "enforce")
     _cmd, resumed_prompt, resumed_injected = session._build_command("again", [], tmp_path / "last.txt")
 
     assert resumed_injected is False
     assert "<memory-context>shared</memory-context>" not in resumed_prompt
     assert resumed_prompt.endswith("again")
-    assert reflex_sources == [("unknown", "codex", codex_engine._codex_cwd("unknown"))]
 
 
 def test_codex_engine_uses_explicit_memory_source(monkeypatch, tmp_path):
@@ -329,10 +322,9 @@ def test_codex_engine_uses_explicit_memory_source(monkeypatch, tmp_path):
     seen_sources: list[str | None] = []
     monkeypatch.setattr(
         codex_engine,
-        "_render_babata_memory_context_event",
-        lambda source=None, user_prompt=None: (
-            seen_sources.append(source) or "<memory-context>shared</memory-context>",
-            None,
+        "_render_babata_memory_context",
+        lambda source=None: (
+            seen_sources.append(source) or "<memory-context>shared</memory-context>"
         ),
     )
     session = codex_engine.CodexEngine(
@@ -355,11 +347,6 @@ def test_codex_build_command_preserves_new_and_resume_cli_flags(monkeypatch, tmp
     monkeypatch.setenv("BABATA_CODEX_SEARCH", "1")
     monkeypatch.setenv("BABATA_CODEX_SANDBOX", "read-only")
     monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "0")
-    monkeypatch.setattr(
-        codex_engine,
-        "log_memory_reflex_preflight_only",
-        lambda **_kwargs: "event-1",
-    )
     session = codex_engine.CodexEngine(
         state_file=tmp_path / "session.json",
         source_prompt="Source: test.",
@@ -371,6 +358,7 @@ def test_codex_build_command_preserves_new_and_resume_cli_flags(monkeypatch, tmp
         "codex-bin",
         "-c", "notify=[]",
         "-c", 'approval_policy="never"',
+        "-c", 'sandbox_mode="read-only"',
         "-c", "features.memories=false",
         "-c", 'sandbox_permissions=["disk-full-read-access"]',
         "-m", "codex-test",
@@ -392,7 +380,6 @@ def test_codex_build_command_preserves_new_and_resume_cli_flags(monkeypatch, tmp
         "--ignore-user-config",
         "--json",
         "--skip-git-repo-check",
-        "--sandbox", "read-only",
         "-C", str(Path(codex_engine.__file__).parent),
         "-o", str(last_file),
         "-i", str(image),
@@ -411,6 +398,7 @@ def test_codex_build_command_preserves_new_and_resume_cli_flags(monkeypatch, tmp
     assert resume_cmd == [
         *common,
         "exec",
+        "-C", str(Path(codex_engine.__file__).parent),
         "resume",
         "--ignore-user-config",
         "--json",
@@ -422,13 +410,34 @@ def test_codex_build_command_preserves_new_and_resume_cli_flags(monkeypatch, tmp
     ]
 
 
+def test_codex_search_is_enabled_by_default_and_can_be_disabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("BABATA_CODEX_CLI_PATH", "codex-bin")
+    monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "0")
+    monkeypatch.delenv("BABATA_CODEX_SEARCH", raising=False)
+    session = codex_engine.CodexEngine(
+        state_file=tmp_path / "session.json",
+        source_prompt="Source: test.",
+        memory_source="sidebar",
+    )
+
+    default_cmd, _prompt, _memory_injected = session._build_command(
+        "hello",
+        [],
+        tmp_path / "default-last.txt",
+    )
+    assert "--search" in default_cmd
+
+    monkeypatch.setenv("BABATA_CODEX_SEARCH", "0")
+    disabled_cmd, _prompt, _memory_injected = session._build_command(
+        "hello",
+        [],
+        tmp_path / "disabled-last.txt",
+    )
+    assert "--search" not in disabled_cmd
+
+
 def test_codex_image_request_injects_native_first_policy(monkeypatch, tmp_path):
     monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "0")
-    monkeypatch.setattr(
-        codex_engine,
-        "log_memory_reflex_preflight_only",
-        lambda **_kwargs: "event-1",
-    )
     session = codex_engine.CodexEngine(
         state_file=tmp_path / "session.json",
         source_prompt="Source: test.",
@@ -441,17 +450,12 @@ def test_codex_image_request_injects_native_first_policy(monkeypatch, tmp_path):
     )
 
     assert codex_engine._CODEX_NATIVE_IMAGE_POLICY in prompt_stdin
-    assert "Do not silently use shell scripts" in prompt_stdin
+    assert "unless already authorized" in prompt_stdin
     assert prompt_stdin.endswith("生成一张真人版图片给我")
 
 
 def test_codex_reference_image_injects_native_first_policy(monkeypatch, tmp_path):
     monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "0")
-    monkeypatch.setattr(
-        codex_engine,
-        "log_memory_reflex_preflight_only",
-        lambda **_kwargs: "event-1",
-    )
     session = codex_engine.CodexEngine(
         state_file=tmp_path / "session.json",
         source_prompt="Source: test.",
@@ -468,11 +472,6 @@ def test_codex_reference_image_injects_native_first_policy(monkeypatch, tmp_path
 
 def test_codex_non_image_request_does_not_inject_image_policy(monkeypatch, tmp_path):
     monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "0")
-    monkeypatch.setattr(
-        codex_engine,
-        "log_memory_reflex_preflight_only",
-        lambda **_kwargs: "event-1",
-    )
     session = codex_engine.CodexEngine(
         state_file=tmp_path / "session.json",
         source_prompt="Source: test.",
@@ -878,14 +877,30 @@ def test_codex_build_command_defaults_to_56_sol_medium(monkeypatch, tmp_path):
     monkeypatch.delenv("BABATA_CODEX_MODEL", raising=False)
     monkeypatch.delenv("BABATA_CODEX_REASONING", raising=False)
     monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "0")
-    monkeypatch.setattr(
-        codex_engine,
-        "log_memory_reflex_preflight_only",
-        lambda **_kwargs: "event-1",
-    )
     session = codex_engine.CodexEngine(
         state_file=tmp_path / "session.json",
         source_prompt="Source: test.",
+    )
+
+    cmd, _prompt_stdin, _memory_injected = session._build_command(
+        "hello",
+        [],
+        tmp_path / "last.txt",
+    )
+
+    assert cmd[cmd.index("-m") + 1] == "gpt-5.6-sol"
+    assert 'model_reasoning_effort="medium"' in cmd
+
+
+def test_codex_build_command_honors_per_instance_model_and_reasoning(monkeypatch, tmp_path):
+    monkeypatch.setenv("BABATA_CODEX_MODEL", "environment-model")
+    monkeypatch.setenv("BABATA_CODEX_REASONING", "low")
+    monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "0")
+    session = codex_engine.CodexEngine(
+        state_file=tmp_path / "session.json",
+        source_prompt="Source: test.",
+        model="gpt-5.6-sol",
+        reasoning="medium",
     )
 
     cmd, _prompt_stdin, _memory_injected = session._build_command(
@@ -946,17 +961,14 @@ def test_make_engine_accepts_explicit_memory_opt_out(tmp_path):
     assert made._memory_enabled is False
 
 
-def test_codex_memory_opt_out_skips_inject_and_reflex(monkeypatch, tmp_path):
+def test_codex_memory_opt_out_skips_inject(monkeypatch, tmp_path):
     monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "1")
 
     def fail_inject(*_args, **_kwargs):
         raise AssertionError("memory inject should not run")
 
-    def fail_reflex(*_args, **_kwargs):
-        raise AssertionError("memory reflex should not run")
 
-    monkeypatch.setattr(codex_engine, "_render_babata_memory_context_event", fail_inject)
-    monkeypatch.setattr(codex_engine, "log_memory_reflex_preflight_only", fail_reflex)
+    monkeypatch.setattr(codex_engine, "_render_babata_memory_context", fail_inject)
     session = codex_engine.CodexEngine(
         state_file=tmp_path / "session.json",
         source_prompt="Source: evidence-bound.",

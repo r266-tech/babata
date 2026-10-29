@@ -32,12 +32,9 @@ from cc import (
 )
 from memory_runtime import (
     default_memory_source,
-    log_memory_reflex_post_answer,
-    log_memory_reflex_preflight_only,
     memory_inject_enabled,
     memory_inject_timeout,
-    memory_reflex_mode,
-    render_babata_memory_context_event,
+    render_babata_memory_context,
 )
 from turn_audit import begin_turn, finish_turn, summarize_tool_use
 
@@ -193,17 +190,11 @@ def _cap_grok_state_turns(turns: object) -> list[list[str]]:
     return out
 
 
-def _render_babata_memory_context_event(
-    source: str | None = None,
-    user_prompt: str | None = None,
-) -> tuple[str, str | None]:
-    source_name = source or "unknown"
-    return render_babata_memory_context_event(
+def _render_babata_memory_context(source: str | None = None) -> str:
+    return render_babata_memory_context(
         enabled=memory_inject_enabled("grok"),
-        source=source_name,
-        user_prompt=user_prompt,
+        source=source or "unknown",
         cpu="grok",
-        cwd=_grok_cwd(source_name),
         timeout=memory_inject_timeout("grok"),
     )
 
@@ -341,7 +332,6 @@ class GrokEngine(CC):
             memory_source=memory_source or default_memory_source(),
             memory_enabled=memory_enabled,
         )
-        self._memory_reflex_event_id: str | None = None
 
     async def query(
         self,
@@ -449,8 +439,6 @@ class GrokEngine(CC):
             self._record_grok_turn(sid, prompt, content)
             if memory_injected:
                 self._mark_grok_memory_injected(sid)
-        log_memory_reflex_post_answer(self._memory_reflex_event_id, content)
-        self._memory_reflex_event_id = None
         return Response(
             content=content,
             session_id=sid,
@@ -497,20 +485,8 @@ class GrokEngine(CC):
 
     def _build_prompt(self, prompt: str) -> tuple[str, bool]:
         memory_context = ""
-        source = self._memory_source
-        if not self._memory_enabled:
-            self._memory_reflex_event_id = None
-        elif self._should_inject_grok_memory():
-            memory_context, event_id = _render_babata_memory_context_event(source, prompt)
-            self._memory_reflex_event_id = event_id
-        else:
-            source_name = source or "unknown"
-            self._memory_reflex_event_id = log_memory_reflex_preflight_only(
-                source=source_name,
-                user_prompt=prompt,
-                cpu="grok",
-                cwd=_grok_cwd(source_name),
-            )
+        if self._memory_enabled and self._should_inject_grok_memory():
+            memory_context = _render_babata_memory_context(self._memory_source)
         parts = []
         if self._source_prompt:
             parts.append(self._source_prompt)
@@ -522,8 +498,6 @@ class GrokEngine(CC):
     def _should_inject_grok_memory(self) -> bool:
         if not memory_inject_enabled("grok"):
             return False
-        if memory_reflex_mode() == "enforce":
-            return True
         if not self._session_id:
             return True
         injected = self._load_state().get(_GROK_MEMORY_INJECTED_KEY)

@@ -16,6 +16,7 @@ import re
 import shutil
 import tempfile
 import time
+import tomllib
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -30,12 +31,9 @@ from cli_runtime import resolve_cli_command
 from constants import HOOKS_DIR as _HOOKS_DIR
 from cc import CC, Event, Response, StreamCB, _record_session_metadata
 from memory_runtime import (
-    log_memory_reflex_preflight_only,
-    log_memory_reflex_post_answer,
     memory_inject_enabled,
     memory_inject_timeout,
-    memory_reflex_mode,
-    render_babata_memory_context_event,
+    render_babata_memory_context,
 )
 from turn_audit import begin_turn, finish_turn, summarize_tool_use
 
@@ -67,11 +65,7 @@ _CODEX_IMAGE_INTENT_RE = re.compile(
     r"(generate|create|edit|transform).{0,48}(image|photo|picture))",
     re.IGNORECASE,
 )
-_CODEX_NATIVE_IMAGE_POLICY = """Codex CPU image routing:
-- For image generation/editing/transformation requests, first use Codex's native image tool if an actual callable `image_gen` tool is exposed in this session.
-- Do not silently use shell scripts, `gen-image`, `scripts/image_gen.py`, OpenRouter/Gemini, `image2` endpoint chains, URL/API-key routes, or any other third-party image API as a substitute for native Codex image tools.
-- If no callable native image tool is exposed, or the native tool fails for technical/capability reasons, say that explicitly and ask the user before using any fallback, unless the user already explicitly asked for `gen-image`, `image2`, Gemini/OpenRouter, a custom endpoint, or a URL/API-key route.
-- If the native tool blocks for safety/policy, do not bypass the block through a fallback API."""
+_CODEX_NATIVE_IMAGE_POLICY = """For image generation or editing, use a callable native image tool first unless the user explicitly chose another provider. If unavailable or technically failed, explain and ask before using a fallback unless already authorized. Never bypass a native safety refusal. Image attachments alone do not request generation or editing."""
 _CODEX_GENERATED_IMAGE_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
 
 
@@ -178,6 +172,28 @@ def _codex_sandbox_permission_overrides() -> list[str]:
     return ["-c", 'sandbox_permissions=["disk-full-read-access"]']
 
 
+def _codex_search_enabled() -> bool:
+    raw = os.environ.get("BABATA_CODEX_SEARCH", "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _codex_transport_overrides(source: str | None) -> list[str]:
+    raw = os.environ.get("BABATA_WEIXIN_CODEX_WEBSOCKETS", "").strip().lower()
+    if source != "wechat" or raw not in {"0", "false", "off", "no"}:
+        return []
+    provider = "openai"
+    if os.environ.get("BABATA_CODEX_IGNORE_USER_CONFIG") != "1":
+        home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        config = home / "config.toml"
+        if config.is_file():
+            with config.open("rb") as stream:
+                provider = tomllib.load(stream).get("model_provider", provider)
+    # CLI dotted overrides require one unquoted provider key.
+    if not isinstance(provider, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", provider):
+        raise ValueError("WeChat HTTP transport requires a simple Codex provider ID")
+    return ["-c", f"model_providers.{provider}.supports_websockets=false"]
+
+
 def _codex_code_mode_host_path() -> str | None:
     configured = os.environ.get("CODEX_CODE_MODE_HOST_PATH")
     if configured:
@@ -241,24 +257,15 @@ def _codex_generated_images_for_session(sid: str | None) -> set[Path]:
 
 
 def _codex_cwd(source: str | None = None) -> str:
-    if source == "sidebar":
-        return str(Path(__file__).parent)
-    if os.environ.get("BABATA_FULL_TRUST") == "1":
-        return str(Path.home())
+    # Trust changes sandbox access, not the project instruction root.
     return str(Path(__file__).parent)
 
 
-def _render_babata_memory_context_event(
-    source: str | None = None,
-    user_prompt: str | None = None,
-) -> tuple[str, str | None]:
-    source_name = source or "unknown"
-    return render_babata_memory_context_event(
+def _render_babata_memory_context(source: str | None = None) -> str:
+    return render_babata_memory_context(
         enabled=memory_inject_enabled("codex"),
-        source=source_name,
-        user_prompt=user_prompt,
+        source=source or "unknown",
         cpu="codex",
-        cwd=_codex_cwd(source_name),
         timeout=memory_inject_timeout("codex"),
     )
 
@@ -501,6 +508,8 @@ class CodexEngine(CC):
         state_file: Path,
         source_prompt: str,
         mcp_servers: dict[str, Any] | None = None,
+        model: str | None = None,
+        reasoning: str | None = None,
         memory_source: str | None = None,
         memory_enabled: bool = True,
     ) -> None:
@@ -511,7 +520,14 @@ class CodexEngine(CC):
             memory_source=memory_source,
             memory_enabled=memory_enabled,
         )
-        self._memory_reflex_event_id: str | None = None
+        self._codex_model_override = model
+        self._codex_reasoning_override = reasoning
+
+    def _codex_model(self) -> str:
+        return self._codex_model_override or os.environ.get("BABATA_CODEX_MODEL") or "gpt-5.6-sol"
+
+    def _codex_reasoning(self) -> str:
+        return self._codex_reasoning_override or os.environ.get("BABATA_CODEX_REASONING") or "medium"
 
     async def query(
         self,
@@ -651,8 +667,6 @@ class CodexEngine(CC):
                 self._record_codex_turn(sid, prompt, content)
                 if memory_injected:
                     self._mark_codex_memory_injected(sid)
-            log_memory_reflex_post_answer(self._memory_reflex_event_id, content)
-            self._memory_reflex_event_id = None
 
             return Response(
                 content=content,
@@ -660,7 +674,7 @@ class CodexEngine(CC):
                 cost=0.0,
                 tools=tools,
                 audit={"tool_uses": tool_uses},
-                model=os.environ.get("BABATA_CODEX_MODEL") or "gpt-5.6-sol",
+                model=self._codex_model(),
                 input_tokens=result["usage"].get("input_tokens", 0),
                 output_tokens=result["usage"].get("output_tokens", 0),
                 cache_read_tokens=result["usage"].get("cached_input_tokens", 0),
@@ -689,14 +703,18 @@ class CodexEngine(CC):
             _codex_cli_path(),
             "-c", "notify=[]",
             "-c", 'approval_policy="never"',
+            # Resume must apply the current deployment policy, not the sandbox
+            # captured when this session was first created.
+            "-c", f'sandbox_mode="{_codex_sandbox()}"',
             "-c", "features.memories=false",
             *_codex_sandbox_permission_overrides(),
+            *_codex_transport_overrides(self._memory_source),
             *_codex_mcp_overrides(self._mcp_servers),
         ]
-        model = os.environ.get("BABATA_CODEX_MODEL") or "gpt-5.6-sol"
-        reasoning = os.environ.get("BABATA_CODEX_REASONING") or "medium"
+        model = self._codex_model()
+        reasoning = self._codex_reasoning()
         base.extend(["-m", model, "-c", f'model_reasoning_effort="{reasoning}"'])
-        if os.environ.get("BABATA_CODEX_SEARCH") == "1":
+        if _codex_search_enabled():
             base.append("--search")
         if os.environ.get("BABATA_CODEX_IGNORE_USER_CONFIG") == "1":
             exec_flags = ["--ignore-user-config"]
@@ -710,6 +728,7 @@ class CodexEngine(CC):
             return [
                 *base,
                 "exec",
+                "-C", _codex_cwd(self._memory_source),
                 "resume",
                 *exec_flags,
                 "--json",
@@ -726,7 +745,6 @@ class CodexEngine(CC):
                 *exec_flags,
                 "--json",
                 "--skip-git-repo-check",
-                "--sandbox", _codex_sandbox(),
                 "-C", _codex_cwd(self._memory_source),
                 "-o", str(last_file),
                 *image_args,
@@ -743,23 +761,8 @@ class CodexEngine(CC):
         has_images: bool = False,
     ) -> tuple[str, bool]:
         memory_context = ""
-        source = self._memory_source
-        if not self._memory_enabled:
-            self._memory_reflex_event_id = None
-        elif self._should_inject_codex_memory():
-            memory_context, event_id = _render_babata_memory_context_event(
-                source,
-                prompt,
-            )
-            self._memory_reflex_event_id = event_id
-        else:
-            source_name = source or "unknown"
-            self._memory_reflex_event_id = log_memory_reflex_preflight_only(
-                source=source_name,
-                user_prompt=prompt,
-                cpu="codex",
-                cwd=_codex_cwd(source_name),
-            )
+        if self._memory_enabled and self._should_inject_codex_memory():
+            memory_context = _render_babata_memory_context(self._memory_source)
         full_prompt = self._build_full_prompt(
             prompt,
             memory_context,
@@ -787,8 +790,6 @@ class CodexEngine(CC):
     def _should_inject_codex_memory(self) -> bool:
         if not memory_inject_enabled("codex"):
             return False
-        if memory_reflex_mode() == "enforce":
-            return True
         if not self._session_id:
             return True
         state = self._load_state()
@@ -1005,6 +1006,8 @@ class CodexLiveSession(CodexEngine):
         state_file: Path,
         source_prompt: str,
         mcp_servers: dict[str, Any] | None = None,
+        model: str | None = None,
+        reasoning: str | None = None,
         memory_source: str | None = None,
         memory_enabled: bool = True,
     ) -> None:
@@ -1012,6 +1015,8 @@ class CodexLiveSession(CodexEngine):
             state_file=state_file,
             source_prompt=source_prompt,
             mcp_servers=mcp_servers,
+            model=model,
+            reasoning=reasoning,
             memory_source=memory_source,
             memory_enabled=memory_enabled,
         )

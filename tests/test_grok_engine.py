@@ -182,17 +182,10 @@ def test_grok_engine_injects_memory_once_per_session(monkeypatch, tmp_path):
     seen_sources: list[str | None] = []
     monkeypatch.setattr(
         grok_engine,
-        "_render_babata_memory_context_event",
-        lambda source=None, user_prompt=None: (
-            seen_sources.append(source) or "<memory-context>shared</memory-context>",
-            None,
+        "_render_babata_memory_context",
+        lambda source=None: (
+            seen_sources.append(source) or "<memory-context>shared</memory-context>"
         ),
-    )
-    reflex_calls = []
-    monkeypatch.setattr(
-        grok_engine,
-        "log_memory_reflex_preflight_only",
-        lambda **kwargs: reflex_calls.append(kwargs) or "event-1",
     )
     session = grok_engine.GrokEngine(
         state_file=tmp_path / "session.json",
@@ -210,6 +203,7 @@ def test_grok_engine_injects_memory_once_per_session(monkeypatch, tmp_path):
 
     session._mark_grok_memory_injected("sid-1")
     session._session_id = "sid-1"
+    monkeypatch.setenv("BABATA_MEMORY_REFLEX_MODE", "enforce")
     resume_cmd, _resume_model, resume_injected, resume_prompt_file = session._build_command("again")
 
     assert resume_injected is False
@@ -217,14 +211,6 @@ def test_grok_engine_injects_memory_once_per_session(monkeypatch, tmp_path):
     assert "--resume" in resume_cmd
     assert resume_cmd[resume_cmd.index("--resume") + 1] == "sid-1"
     assert resume_cmd[-1] == "Source: test.\n\nagain"
-    assert reflex_calls == [
-        {
-            "source": "tg",
-            "user_prompt": "again",
-            "cpu": "grok",
-            "cwd": grok_engine._grok_cwd("tg"),
-        }
-    ]
 
 
 def test_make_engine_selects_grok(monkeypatch, tmp_path):

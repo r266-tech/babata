@@ -120,10 +120,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             prompts = arguments.get("prompts") or []
             if not isinstance(prompts, list):
                 return [TextContent(type="text", text="Error: 'prompts' must be a list")]
+            args = {"prompts": prompts}
+            if isinstance(arguments.get("tab_id"), int):
+                args["tab_id"] = arguments["tab_id"]
+            if isinstance(arguments.get("window_id"), int):
+                args["window_id"] = arguments["window_id"]
             payload = await _bridge_call(
                 "notify_sw",
                 name="suggest_prompts",
-                args={"prompts": prompts},
+                args=args,
             )
             return [TextContent(type="text", text=_format_result(payload))]
 

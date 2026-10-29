@@ -164,12 +164,12 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {
+            "properties": _target_props({
                 "prompts": {
                     "type": "array",
                     "items": {"type": "string"},
                 },
-            },
+            }),
             "required": ["prompts"],
         },
     },
@@ -210,7 +210,7 @@ SIDEBAR_TOOLS: list[dict[str, Any]] = [
         "name": "bookmarks_create",
         "dispatch": "bridge",
         "description": (
-            "Create bookmark; parent_id optional; use bookmarks_tree."
+            "Create bookmark; parent_id optionally selects its folder."
         ),
         "inputSchema": {
             "type": "object",
