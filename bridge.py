@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 # subprocess inherits the same via mcp_servers["tg"]["env"]. Fall back to
 # the derived namespace-based default when not pre-set (terminal CC case).
 SOCKET_PATH = BRIDGE_SOCKET
+_TG_PUBLIC_PAGE_ENV = "BABATA_TG_ENABLE_PUBLIC_PAGE"
 
 # Telegram caption limit, measured in UTF-16 code units (TG wire unit).
 # Borrows openclaw `caption.ts:1-15` `splitTelegramCaption` design: when
@@ -118,6 +119,7 @@ class TGBridge:
         self._server = await asyncio.start_unix_server(
             self._handle_connection, path=SOCKET_PATH
         )
+        os.chmod(SOCKET_PATH, 0o600)
         log.info("Bridge socket listening at %s", SOCKET_PATH)
 
     async def stop(self) -> None:
@@ -353,6 +355,9 @@ class TGBridge:
         URLs, giving full rich-layout rendering (h3/h4 / real lists /
         blockquote / highlighted code) that TG inline HTML can't.
         """
+        if os.environ.get(_TG_PUBLIC_PAGE_ENV) != "1":
+            await self._respond(writer, f"Error: public page publishing disabled; set {_TG_PUBLIC_PAGE_ENV}=1")
+            return
         from telegraph import create_page
 
         title = request.get("title", PROJECT) or PROJECT

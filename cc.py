@@ -7,7 +7,6 @@ keeping session state and exposed tools isolated per channel.
 
 import asyncio
 import copy
-import hashlib
 import json
 import logging
 import os
@@ -23,7 +22,6 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     ResultMessage,
-    TextBlock,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
@@ -36,13 +34,10 @@ from blocking_review import (
 )
 from claude_agent_sdk.types import (
     PermissionResultAllow,
+    PermissionResultDeny,
     StreamEvent,
     ToolPermissionContext,
 )
-try:
-    from claude_agent_sdk.types import PermissionResultDeny
-except ImportError:  # pragma: no cover - old SDK compatibility
-    PermissionResultDeny = None
 
 log = logging.getLogger(__name__)
 
@@ -61,10 +56,15 @@ from constants import (
     INSTANCE,
     INSTANCE_LABELS,
     PROJECT,
-    SKILL_HOOKS_DIR as _SKILL_HOOKS_DIR,
     STATE_DIR as _STATE_DIR,
 )
-from skill_evolve_nudge import notify_skill_evolve_turn
+from cli_runtime import env_cli_path
+from memory_runtime import (
+    default_memory_source,
+    memory_inject_enabled,
+    memory_inject_timeout,
+    render_babata_memory_context,
+)
 from turn_audit import (
     TurnAudit,
     begin_turn,
@@ -74,15 +74,30 @@ from turn_audit import (
 )
 
 VENV_PYTHON = str(Path(__file__).parent / ".venv" / "bin" / "python")
+_REPO_DIR = Path(__file__).resolve().parent
+_REPO_CLAUDE = _REPO_DIR / "CLAUDE.md"
 
 _CC_PROJECTS = Path.home() / ".claude" / "projects" / str(Path.home()).replace("/", "-")
+_NO_BYTECODE_ENV = "PYTHONDONTWRITEBYTECODE"
+
+
+def _mcp_servers_without_repo_bytecode(mcp_servers: dict[str, Any] | None) -> dict[str, Any]:
+    """Ensure local MCP subprocesses do not write __pycache__ into the repo."""
+    cleaned = copy.deepcopy(mcp_servers or {})
+    for cfg in cleaned.values():
+        if not isinstance(cfg, dict):
+            continue
+        env = cfg.setdefault("env", {})
+        if isinstance(env, dict):
+            env[_NO_BYTECODE_ENV] = "1"
+    return cleaned
 
 
 def _find_jsonl_any_bucket(sid: str) -> Path | None:
     """Locate <sid>.jsonl across all ~/.claude/projects/<cwd-hash>/ buckets.
 
-    babata 默认 cwd=$HOME, 单 bucket 看到的只是 V 在 $HOME 跑 claude 那批 session.
-    V 在 ~/code/foo 跑 claude 的 session 落在 -Users-admin-code-foo/ 别的 bucket,
+    babata 默认 cwd=$HOME, 单 bucket 只看到从 $HOME 启动的 claude sessions.
+    从 ~/code/foo 启动的 claude session 落在 -Users-admin-code-foo/ 别的 bucket,
     list_recent_sessions(scan_all_buckets=True) 会列出来; 但实际 resume / 读 turn
     时还得跨 bucket 找文件 — 这里就做这个查找.
 
@@ -105,13 +120,35 @@ def _find_jsonl_any_bucket(sid: str) -> Path | None:
     return None
 
 
+def _complete_jsonl_prefix(content: bytes) -> bytes:
+    """Return only complete JSONL records from a possibly racing session copy."""
+    if not content:
+        return content
+    if not content.endswith(b"\n"):
+        # Last line not newline-terminated; treat as in-progress write.
+        last_nl = content.rfind(b"\n")
+        if last_nl >= 0:
+            return content[: last_nl + 1]
+        # Single incomplete line — drop to empty rather than corrupt.
+        return b""
+
+    lines = content.splitlines()
+    if not lines:
+        return content
+    try:
+        json.loads(lines[-1])
+        return content
+    except Exception:
+        return b"\n".join(lines[:-1]) + (b"\n" if lines[:-1] else b"")
+
+
 def _import_jsonl_to_bucket(source_sid: str) -> str | None:
     """Resolve <source_sid>.jsonl to a sid that lives in babata's bucket.
 
     源文件已在 babata bucket → 直接返回 source_sid (no copy, no fork).
-    源文件在别的 cwd-bucket (V 在终端别处开的原生 CC) → fork: 用 *新 uuid*
+    源文件在别的 cwd-bucket (终端别处开的原生 CC) → fork: 用 *新 uuid*
     复制到 babata bucket, 返回新 sid. 关键设计:
-      - 新 uuid 避免 sid 冲突: 原 sid 在源 bucket 不动, V 在原 cwd 终端继续
+      - 新 uuid 避免 sid 冲突: 原 sid 在源 bucket 不动, 原 cwd 终端继续
         resume 同一个 sid 仍能续上, 跟 babata 这边的 fork 物理隔离 不会
         silent diverge (Codex A-FORK).
       - SDK --resume <new_sid> 能找到 (CLI cwd-bound, 文件在 babata bucket).
@@ -151,22 +188,9 @@ def _import_jsonl_to_bucket(source_sid: str) -> str | None:
         # session 正 append, 末行可能截断. 不能 parse 就 trim.
         try:
             content = tmp_path.read_bytes()
-            if content and not content.endswith(b"\n"):
-                # Last line not newline-terminated; treat as in-progress write.
-                last_nl = content.rfind(b"\n")
-                if last_nl >= 0:
-                    tmp_path.write_bytes(content[: last_nl + 1])
-                else:
-                    # Single incomplete line — drop to empty rather than corrupt.
-                    tmp_path.write_bytes(b"")
-            else:
-                # Validate last line parses as JSON; if not, trim it.
-                lines = content.splitlines()
-                if lines:
-                    try:
-                        json.loads(lines[-1])
-                    except Exception:
-                        tmp_path.write_bytes(b"\n".join(lines[:-1]) + (b"\n" if lines[:-1] else b""))
+            complete = _complete_jsonl_prefix(content)
+            if complete != content:
+                tmp_path.write_bytes(complete)
         except Exception:
             pass
         with open(tmp_path, "rb") as t:
@@ -187,27 +211,41 @@ def _import_jsonl_to_bucket(source_sid: str) -> str | None:
         with suppress(Exception):
             lock_path.unlink()
 
-# 默认隔离 — 不读用户 ~/.claude/{settings.json, CLAUDE.md, skills/}, 不动 OAuth keychain.
-# 用户日常 CC 完全无感. 开源用户走这条 (.env 必须有 ANTHROPIC_API_KEY).
-# V 私人 .env 设 BABATA_SHARED_CC=1 → 共享用户 CC 全套 (skill / settings / OAuth), 跟之前体验一致.
-_SETTING_SOURCES: list[str] = ["user"] if os.environ.get("BABATA_SHARED_CC") == "1" else []
+# Default isolated mode loads repo project instructions but not
+# ~/.claude/{settings.json, CLAUDE.md, skills/} or OAuth keychain state.
+# BABATA_SHARED_CC=1 additionally opts into the user profile.
+_SETTING_SOURCES: list[str] = (
+    ["project", "user"]
+    if os.environ.get("BABATA_SHARED_CC") == "1"
+    else ["project"]
+)
 
-# 默认信任边界 — babata 容器化 default: cwd 限定 repo 自身 (不让 babata access 用户整个家),
-# permission_mode 走 "default" (重要 tool call 提示授权, 不静默 bypass).
-# V 私人 .env 设 BABATA_FULL_TRUST=1 → cwd=~/ + auto mode (官方支持, status "auto mode on").
+# Default trust boundary keeps cwd at the repo and permission prompts enabled.
+# BABATA_FULL_TRUST=1 opts into cwd=$HOME and unrestricted tool execution.
 _FULL_TRUST = os.environ.get("BABATA_FULL_TRUST") == "1"
 _DEFAULT_CWD = str(Path.home()) if _FULL_TRUST else str(Path(__file__).parent)
-_PERMISSION_MODE = "auto" if _FULL_TRUST else "default"
+_PERMISSION_MODE = "bypassPermissions" if _FULL_TRUST else "default"
+
+
+def _with_repo_project_instructions(prompt: str) -> str:
+    """Keep the transport safety adapter when full-trust cwd moves to $HOME."""
+    if not _FULL_TRUST:
+        return prompt
+    try:
+        instructions = _REPO_CLAUDE.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(
+            f"BABATA_FULL_TRUST requires readable repo instructions: {_REPO_CLAUDE}"
+        ) from exc
+    marker = "<babata-repo-instructions>"
+    if marker in prompt:
+        return prompt
+    return f"{prompt}\n\n{marker}\n{instructions}\n</babata-repo-instructions>"
 
 # _STATE_DIR: all channel state files land here. Cross-channel session picker
 # scans this dir, so it's a soft coupling — cc.py isn't fully channel-agnostic
 # anymore, but /resume can list sessions from every channel (TG / WX / terminal
 # bb) in one picker, sorted by bucket mtime with non-local channels tagged.
-# _SKILL_HOOKS_DIR: SDK doesn't fire settings.json SessionEnd/SessionStart
-# hooks (those are CC CLI-native), so babata fires them explicitly on
-# reset()/init so TG/WeChat channels can plug into skill evolution (v3).
-
-
 def _channel_label_from_state_file(fp: Path) -> str:
     """state file name → human-readable channel label for the /resume picker.
 
@@ -235,10 +273,7 @@ def _channel_label_from_state_file(fp: Path) -> str:
 
 _SUMMARY_CACHE_FILE = _STATE_DIR / "session-summaries.json"
 
-# Summary subprocess 的专用 CWD. claude -p 会按 CWD 把 session jsonl 写到对应
-# bucket (~/.claude/projects/<cwd-hash>/); 如果 summary 进程跟 babata 日常用同
-# 一个 CWD ($HOME), 它产生的 "用一句话总结..." session 会污染主 bucket, 反过来
-# 被 list_recent_sessions 扫到显示给 V. 用专用 sandbox CWD 物理隔离.
+# Legacy summary sessions remain excluded from the user-facing resume list.
 _SUMMARY_SANDBOX = _STATE_DIR / "summary-sandbox"
 
 
@@ -249,108 +284,10 @@ def _load_summary_cache() -> dict:
         return {}
 
 
-def _save_summary_cache(cache: dict) -> None:
-    """原子写 (tmp + rename) 避免跟并发 generator 互踩."""
-    try:
-        _SUMMARY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _SUMMARY_CACHE_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(cache, ensure_ascii=False))
-        tmp.replace(_SUMMARY_CACHE_FILE)
-    except Exception as e:
-        log.warning("Failed to persist summary cache: %s", e)
-
-
-def _extract_session_text_for_summary(jsonl_path: Path, max_chars: int = 6000) -> str:
-    """把 session jsonl 里 user + assistant 真实文本拼成给 claude -p 总结的输入.
-
-    max_chars 控制上限, 避免长会话一次塞爆 (haiku 便宜但仍是成本). 优先拿开头
-    + 结尾 —— 开头锚定主题, 结尾反映当前状态. 中间大量 tool-call / context dump
-    对"一句话总结"没增量.
-    """
-    lines = []
-    try:
-        for raw in jsonl_path.read_text().splitlines():
-            try:
-                d = json.loads(raw)
-            except Exception:
-                continue
-            if d.get("type") not in ("user", "assistant"):
-                continue
-            msg = d.get("message")
-            if not isinstance(msg, dict):
-                continue
-            text = _extract_text(msg.get("content"))
-            if not text or _is_synthetic_user_text(text):
-                continue
-            role = d.get("type")
-            lines.append(f"[{role}] {text[:500]}")
-    except Exception:
-        return ""
-    if not lines:
-        return ""
-    joined = "\n".join(lines)
-    if len(joined) <= max_chars:
-        return joined
-    # 头 60% + 尾 40%
-    head_n = int(max_chars * 0.6)
-    tail_n = max_chars - head_n
-    return joined[:head_n] + "\n...[省略中段]...\n" + joined[-tail_n:]
-
-
-def _spawn_summary_generation(sid: str, source_mtime: float) -> None:
-    """Fire-and-forget: 后台线程跑 claude -p haiku 生成 session 一句话总结, 写缓存.
-
-    调用方不等结果 — 本次 /resume 仍用 first_user fallback, 下次 /resume 命中缓存.
-    Haiku 一句话总结典型 1-3 秒, 10 session 并发大约 3-5 秒写完缓存.
-    """
-    jsonl = _find_jsonl_any_bucket(sid)
-    if jsonl is None:
-        return
-
-    def worker() -> None:
-        import subprocess
-        try:
-            text = _extract_session_text_for_summary(jsonl)
-            if not text:
-                return
-            prompt = (
-                "用一句话 (不超过 20 个中文字) 总结下面这段 CC session 的核心主题, "
-                "让用户一眼认出是哪个对话. 只输出一句话, 不加任何前缀 / 引号 / 解释.\n\n"
-                + text
-            )
-            cli = os.environ.get("CLAUDE_CLI_PATH") or "claude"
-            # Model 不写死, 跟随 ~/.claude/settings.json 全局默认 (babata 哲学:
-            # 模型会随 CC 升级, 代码里写死 'haiku' 将来可能指向弃用 tier).
-            # 若 V 觉得总结任务用 opus 太慢, 改 settings.json 或加 env override.
-            #
-            # CWD 用 _SUMMARY_SANDBOX 而不是 $HOME, 避免 subprocess session jsonl
-            # 污染主 bucket (2026-04-20 踩过的坑).
-            _SUMMARY_SANDBOX.mkdir(parents=True, exist_ok=True)
-            result = subprocess.run(
-                [cli, "-p", prompt,
-                 "--output-format", "text",
-                 "--permission-mode", "auto"],
-                capture_output=True, text=True, timeout=60,
-                cwd=str(_SUMMARY_SANDBOX),
-            )
-            summary = (result.stdout or "").strip().strip('"').strip("「」")
-            if not summary or len(summary) > 60:
-                # haiku 偶尔抗命给长输出 / 空输出 — 丢弃不写缓存, 下次再试
-                return
-            cache = _load_summary_cache()
-            cache[sid] = {"summary": summary, "source_mtime": source_mtime}
-            _save_summary_cache(cache)
-        except Exception as e:
-            log.debug("summary gen failed for %s: %s", sid[:8], e)
-
-    import threading
-    threading.Thread(target=worker, daemon=True).start()
-
-
 def _scan_peer_sids() -> dict[str, list[str]]:
     """扫 _STATE_DIR 所有 *-session.json, 返回 {sid: [channel_label, ...]}.
 
-    一个 sid 如果被多个 channel 的 recent_sids 收录 (例 V 从 TG /resume 了 bb 开的
+    一个 sid 如果被多个 channel 的 recent_sids 收录 (例从 TG /resume 了 bb 开的
     session → 两个 state 都会有它), 列表里会有多个来源.
     """
     out: dict[str, list[str]] = {}
@@ -367,287 +304,138 @@ def _scan_peer_sids() -> dict[str, list[str]]:
     return out
 
 
+def _recent_session_files(*, scan_all_buckets: bool) -> list[Path]:
+    """Return candidate Claude session JSONL files newest-first.
+
+    Exclude the legacy summary bucket from V-facing `/resume`.
+    """
+    try:
+        if scan_all_buckets:
+            projects_root = _CC_PROJECTS.parent
+            try:
+                sandbox_real = str(_SUMMARY_SANDBOX.resolve())
+            except Exception:
+                sandbox_real = str(_SUMMARY_SANDBOX)
+            sandbox_bucket_name = sandbox_real.replace("/", "-")
+            buckets = [
+                b for b in projects_root.iterdir()
+                if b.is_dir() and b.name != sandbox_bucket_name
+            ]
+            files = (fp for b in buckets for fp in b.glob("*.jsonl"))
+        else:
+            files = _CC_PROJECTS.glob("*.jsonl")
+        return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+    except Exception:
+        return []
+
+
+def _first_real_user_and_entrypoint(fp: Path) -> tuple[str | None, str | None]:
+    """Return the first V-authored user text and its Claude entrypoint."""
+    try:
+        for line in fp.read_text().splitlines():
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("type") != "user":
+                continue
+            msg = d.get("message")
+            if not isinstance(msg, dict):
+                continue
+            text = _extract_text(msg.get("content"))
+            if not text or _is_synthetic_user_text(text):
+                continue
+            entrypoint = d.get("entrypoint")
+            return text, entrypoint if isinstance(entrypoint, str) else None
+    except Exception:
+        return None, None
+    return None, None
+
+
+def _session_listing_candidate(fp: Path, peer_map: dict[str, list[str]]) -> dict[str, Any] | None:
+    sid = fp.stem
+    first_user, entrypoint = _first_real_user_and_entrypoint(fp)
+    if not first_user:
+        return None
+    try:
+        mtime = fp.stat().st_mtime
+    except Exception:
+        mtime = 0.0
+
+    owners = peer_map.get(sid, [])
+    if owners:
+        channel = owners[0]
+    elif entrypoint == "sdk-cli":
+        # claude -p 一次性 (cron wrapper / 手敲 -p). 和 bb 交互拆开.
+        channel = "oneshot"
+    else:
+        # cli (bb / 原生 claude 交互) / claude-desktop / sdk-py orphan / 未知.
+        channel = "term"
+    return {
+        "sid": sid,
+        "first_user": first_user,
+        "mtime": mtime,
+        "owners": owners,
+        "channel": channel,
+    }
+
+
+def _session_preview(sid: str, first_user: str, mtime: float, summary_cache: dict) -> str:
+    # Reuse valid legacy titles; listing sessions never starts a model.
+    cached = summary_cache.get(sid)
+    if cached and cached.get("source_mtime") == mtime:
+        return cached.get("summary") or first_user
+    return first_user
+
+
 async def _always_allow(
     tool_name: str,
     tool_input: dict[str, Any],
     ctx: ToolPermissionContext,
-) -> PermissionResultAllow | Any:
+) -> PermissionResultAllow | PermissionResultDeny:
     """Auto-approve every SDK permission prompt.
 
-    bypassPermissions mode alone doesn't cover CC's "protected paths"
-    (~/.claude, .git, .ssh, .zshrc, .mcp.json, ...). Those still prompt in
-    every mode except `auto` and `dontAsk`. Bot is non-interactive, so any
-    prompt that reaches SDK = hung tool call.
-
-    Personal Mac full-trust — blanket allow."""
+    Used in the default permission mode. Full-trust mode uses the CLI's
+    bypassPermissions policy and does not register this callback."""
     block, reason = should_block_for_permission(tool_name, tool_input)
     if block:
         message = reason or "Blocked by babata deterministic guard"
-        if PermissionResultDeny is not None:
-            return PermissionResultDeny(message=message)
-        raise PermissionError(message)
+        return PermissionResultDeny(message=message)
     return PermissionResultAllow()
 
 # Tunables. These are storage / token-budget params, not "importance judgments" —
 # CC still decides meaning from the data we expose. Kept explicit so a future
 # reader sees the cost model instead of magic numbers.
 _MAX_RECENT_SIDS = 200          # ring buffer of past session_ids (~1y at 5/day, ~15KB state file)
-_RESUME_INJECT_PAIRS = 3        # last N user+assistant pairs to inject on resume failure
-_RESUME_INJECT_CHARS = 300      # per-turn char cap (3 pairs × 300 × 2 ≈ 1.8KB, fits any system_prompt)
+_CLAUDE_MEMORY_INJECTED_KEY = "claude_memory_injected_sids"
+_RESUME_INJECT_PAIRS = 2        # last N user+assistant pairs to inject on resume failure
+_RESUME_INJECT_CHARS = 240      # per-turn char cap (2 pairs × 240 × 2 ≈ 1KB, fits any system_prompt)
 _IDLE_RESET_MINUTES_DEFAULT = 1440  # 24h, parity with hermes session_reset.idle_minutes (gateway/config.py:114)
-_DEFAULT_MEMORY_INJECT_SCRIPT = Path.home() / "cc-workspace/scripts/memory-inject.sh"
-_DEFAULT_MEMORY_REFLEX_SCRIPT = Path.home() / "cc-workspace/bin/babata-memory-reflex"
-_DEFAULT_MEMORY_REFLEX_LOG = Path.home() / "cc-workspace/state/memory-reflex/events.jsonl"
 
 
-def _cc_memory_inject_enabled() -> bool:
-    if os.environ.get("BABATA_CRON_AGENT") == "1":
-        return False
-    return os.environ.get("BABATA_CC_MEMORY_INJECT", "1") != "0"
-
-
-def _memory_inject_script() -> Path:
-    configured = os.environ.get("BABATA_MEMORY_INJECT_SCRIPT")
-    return Path(configured).expanduser() if configured else _DEFAULT_MEMORY_INJECT_SCRIPT
-
-
-def _memory_inject_timeout() -> float:
-    raw = os.environ.get("BABATA_CC_MEMORY_INJECT_TIMEOUT", "5")
-    try:
-        return max(0.1, float(raw))
-    except ValueError:
-        return 5.0
-
-
-def _memory_reflex_enabled() -> bool:
-    return os.environ.get("BABATA_MEMORY_REFLEX", "1") != "0"
-
-
-def _memory_reflex_mode() -> str:
-    if not _memory_reflex_enabled():
-        return "off"
-    mode = os.environ.get("BABATA_MEMORY_REFLEX_MODE", "dry-run").strip().lower()
-    return mode if mode in {"dry-run", "enforce"} else "dry-run"
-
-
-def _memory_reflex_script() -> Path:
-    configured = os.environ.get("BABATA_MEMORY_REFLEX_SCRIPT")
-    return Path(configured).expanduser() if configured else _DEFAULT_MEMORY_REFLEX_SCRIPT
-
-
-def _memory_reflex_timeout() -> float:
-    raw = os.environ.get("BABATA_MEMORY_REFLEX_TIMEOUT", "0.8")
-    try:
-        return max(0.1, float(raw))
-    except ValueError:
-        return 0.8
-
-
-def _memory_source_from_prompt(source_prompt: str) -> str:
-    lower = source_prompt.lower()
-    if "source: telegram" in lower:
-        return "tg"
-    if "source: wechat" in lower:
-        return "wechat"
-    if "source: sidebar" in lower:
-        return "sidebar"
-    return os.environ.get("BABATA_MEMORY_SOURCE") or "unknown"
-
-
-def _memory_reflex_for_prompt(source_prompt: str, user_prompt: str | None) -> dict[str, Any]:
-    if not _memory_reflex_enabled() or not user_prompt:
-        return {}
-    script = _memory_reflex_script()
-    if not script.is_file():
-        log.warning("babata memory reflex script missing: %s", script)
-        return {}
-    source = _memory_source_from_prompt(source_prompt)
-    try:
-        result = subprocess.run(
-            [
-                str(script),
-                "--message", "-",
-                "--source", source,
-                "--cpu", "claude",
-                "--cwd", _DEFAULT_CWD,
-            ],
-            input=user_prompt,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=_memory_reflex_timeout(),
-            check=False,
-        )
-    except Exception as exc:
-        log.warning("babata memory reflex failed: %s", exc)
-        return {}
-    if result.returncode != 0:
-        log.warning("babata memory reflex exited %s: %s", result.returncode, result.stderr.strip()[:500])
-        return {}
-    try:
-        parsed = json.loads(result.stdout)
-    except Exception as exc:
-        log.warning("babata memory reflex returned invalid json: %s", exc)
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _format_memory_reflex_hint(reflex: dict[str, Any]) -> str:
-    routes = [str(r) for r in reflex.get("routes", []) if str(r)]
-    profile = str(reflex.get("profile") or "lite")
-    if not routes or (profile == "lite" and all(r in {"none", "lite"} for r in routes)):
-        return ""
-    reasons = reflex.get("reasons")
-    reason_text = "; ".join(str(r) for r in reasons[:3]) if isinstance(reasons, list) else ""
-    return "\n".join([
-        "<memory-reflex>",
-        f"routes: {', '.join(routes)}",
-        f"profile: {profile}",
-        "note: router signal only; retrieve deeper evidence only when useful.",
-        f"why: {reason_text}" if reason_text else "why: unspecified",
-        "</memory-reflex>",
-    ])
-
-
-def _memory_reflex_log_path() -> Path:
-    configured = os.environ.get("BABATA_MEMORY_REFLEX_LOG")
-    return Path(configured).expanduser() if configured else _DEFAULT_MEMORY_REFLEX_LOG
-
-
-def _message_summary(text: str | None, limit: int = 180) -> str:
-    compact = " ".join((text or "").split())
-    return compact[:limit].rstrip()
-
-
-def _append_memory_reflex_event(payload: dict[str, Any]) -> None:
-    try:
-        path = _memory_reflex_log_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
-    except Exception as exc:
-        log.warning("babata memory reflex log failed: %s", exc)
-
-
-def _log_memory_reflex_preflight(
+def _record_session_metadata(
+    state: dict,
+    sid: str | None,
     *,
-    reflex: dict[str, Any],
-    user_prompt: str | None,
-    source: str,
-    cpu: str,
-    mode: str,
-    actual_profile: str,
-    memory_injected: bool,
-    hint_injected: bool,
-) -> str | None:
-    if not reflex:
-        return None
-    now = time.time()
-    digest = hashlib.sha256((user_prompt or "").encode("utf-8")).hexdigest()
-    event_id = hashlib.sha256(f"{now}:{cpu}:{source}:{digest}".encode("utf-8")).hexdigest()[:16]
-    _append_memory_reflex_event({
-        "event": "preflight",
-        "id": event_id,
-        "ts": now,
-        "source": source,
-        "cpu": cpu,
-        "mode": mode,
-        "message_sha256": digest,
-        "message_summary": _message_summary(user_prompt),
-        "router": reflex,
-        "actual_profile": actual_profile,
-        "memory_injected": memory_injected,
-        "hint_injected": hint_injected,
-        "post_answer_observation": "pending",
-    })
-    return event_id
-
-
-def _answer_memory_observation(content: str) -> dict[str, Any]:
-    markers = ("不记得", "没记住", "没有记忆", "没有记录", "查不到", "没查到", "无法确认", "没有找到")
-    return {
-        "heuristic_only": True,
-        "memory_miss_marker": any(marker in content for marker in markers),
-        "wrong_recall": None,
-        "missed_required_lookup": None,
-    }
-
-
-def _log_memory_reflex_post_answer(event_id: str | None, content: str) -> None:
-    if not event_id:
+    now: float,
+    recent_limit: int = _MAX_RECENT_SIDS,
+) -> None:
+    state["session_id"] = sid
+    state["last_activity_at"] = now
+    if not sid:
         return
-    _append_memory_reflex_event({
-        "event": "post_answer",
-        "id": event_id,
-        "ts": time.time(),
-        "answer_sha256": hashlib.sha256((content or "").encode("utf-8")).hexdigest(),
-        "answer_summary": _message_summary(content),
-        "observation": _answer_memory_observation(content or ""),
-    })
+    hist = [s for s in state.get("recent_sids", []) if isinstance(s, str) and s and s != sid]
+    hist.insert(0, sid)
+    state["recent_sids"] = hist[:recent_limit]
 
 
-def _render_babata_memory_context_event(
-    source_prompt: str,
-    user_prompt: str | None = None,
-) -> tuple[str, str | None]:
-    if not _cc_memory_inject_enabled():
-        return "", None
-    script = _memory_inject_script()
-    if not script.is_file():
-        log.warning("babata memory inject script missing: %s", script)
-        return "", None
-    reflex = _memory_reflex_for_prompt(source_prompt, user_prompt)
-    mode = _memory_reflex_mode()
-    enforce = mode == "enforce"
-    source = _memory_source_from_prompt(source_prompt)
-    actual_profile = os.environ.get("BABATA_MEMORY_PROFILE") or (
-        str(reflex.get("profile") or "lite") if enforce else "lite"
-    )
-    env = os.environ.copy()
-    env["BABATA_MEMORY_PROFILE"] = actual_profile
-    env.setdefault("BABATA_MEMORY_CPU", "claude")
-    env.setdefault("BABATA_MEMORY_SOURCE", source)
-    env.setdefault("BABATA_MEMORY_INCLUDE_TOP", "force")
-    try:
-        result = subprocess.run(
-            [str(script)],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=_memory_inject_timeout(),
-            check=False,
-        )
-    except Exception as exc:
-        log.warning("babata memory inject failed: %s", exc)
-        return "", None
-    if result.returncode != 0:
-        log.warning(
-            "babata memory inject exited %s: %s",
-            result.returncode,
-            result.stderr.strip()[:500],
-        )
-        return "", None
-    parts = [result.stdout.strip()]
-    hint = _format_memory_reflex_hint(reflex) if enforce else ""
-    if hint:
-        parts.append(hint)
-    context = "\n\n".join(part for part in parts if part)
-    event_id = _log_memory_reflex_preflight(
-        reflex=reflex,
-        user_prompt=user_prompt,
+def _render_babata_memory_context(source: str) -> str:
+    return render_babata_memory_context(
+        enabled=memory_inject_enabled("claude"),
         source=source,
         cpu="claude",
-        mode=mode,
-        actual_profile=actual_profile,
-        memory_injected=bool(context),
-        hint_injected=bool(hint),
+        timeout=memory_inject_timeout("claude"),
     )
-    return context, event_id
-
-
-def _render_babata_memory_context(source_prompt: str, user_prompt: str | None = None) -> str:
-    return _render_babata_memory_context_event(source_prompt, user_prompt)[0]
 
 
 def _idle_reset_seconds() -> int:
@@ -675,7 +463,7 @@ def _idle_reset_seconds() -> int:
 #   <bash-input>…</bash-input>                       — CC's Bash tool calls
 #   <local-command-stdout>…                          — command captures
 # Any of these as the first "user" message of a session makes the /resume
-# preview useless. Match tag-prefixed content so V sees her real first prompt.
+# preview useless. Match tag-prefixed content so the real first prompt is shown.
 _SYNTHETIC_USER_PREFIXES = (
     "<local-command-",
     "<command-name>",
@@ -690,7 +478,7 @@ _SYNTHETIC_USER_PREFIXES = (
 
 
 def _is_synthetic_user_text(text: str) -> bool:
-    """True if `text` is CC-injected scaffolding rather than a V-authored turn."""
+    """True if `text` is CC-injected scaffolding rather than user-authored text."""
     stripped = text.lstrip()
     return stripped.startswith(_SYNTHETIC_USER_PREFIXES)
 
@@ -767,14 +555,23 @@ class Response:
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
     audit: dict[str, Any] | None = None
+    # Local files produced by a CPU-native image tool. Channel transports own
+    # delivery because native image tools may intentionally emit no final text.
+    generated_images: list[str] = field(default_factory=list)
     # True when the SDK ResultMessage reported an error result (rate-limit /
     # max_turns / API 5xx). Surfaced so the bot can show the real failure
     # instead of an empty bubble.
     is_error: bool = False
+    # True when the CLI reported a usage/billing/auth failure (AssistantMessage.error),
+    # so a channel can hand the turn to a fallback CPU.
+    cpu_unavailable: bool = False
+
+
+_UNAVAILABLE_ERRORS = frozenset({"rate_limit", "billing_error", "authentication_failed"})
 
 
 def _result_error_text(subtype: str | None, result: Any) -> str:
-    """Human-facing message for an error ResultMessage so V sees the real
+    """Human-facing message for an error ResultMessage so the UI shows the real
     failure (limit / max_turns / API error) rather than an empty answer."""
     labels = {
         "error_max_turns": "本轮触及最大工具调用轮次上限 (max_turns)",
@@ -808,6 +605,130 @@ class Event:
     exception: Exception | None = None
 
 
+def _user_message_payload(
+    prompt: str,
+    images: list[dict[str, str]] | None,
+) -> dict[str, Any]:
+    content: str | list[dict[str, Any]]
+    if images:
+        content = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img["media_type"],
+                    "data": img["data"],
+                },
+            }
+            for img in images
+        ]
+        if prompt:
+            content.append({"type": "text", "text": prompt})
+    else:
+        content = prompt
+    return {
+        "type": "user",
+        "message": {"role": "user", "content": content},
+        "parent_tool_use_id": None,
+    }
+
+
+def _events_from_sdk_message(msg: Any, tools_seen: list[str]) -> list[Event]:
+    events: list[Event] = []
+    if isinstance(msg, AssistantMessage):
+        for block in getattr(msg, "content", []) or []:
+            if isinstance(block, ToolUseBlock):
+                name = getattr(block, "name", "")
+                inp = getattr(block, "input", {}) or {}
+                if name and name not in tools_seen:
+                    tools_seen.append(name)
+                events.append(Event(
+                    kind="tool_use",
+                    name=name,
+                    input_dict=inp,
+                ))
+    elif isinstance(msg, StreamEvent):
+        ev = msg.event or {}
+        if ev.get("type") == "content_block_delta":
+            delta = ev.get("delta") or {}
+            if delta.get("type") == "text_delta":
+                chunk = delta.get("text") or ""
+                if chunk:
+                    events.append(Event(kind="text_delta", chunk=chunk))
+    elif isinstance(msg, UserMessage):
+        for block in getattr(msg, "content", []) or []:
+            if isinstance(block, ToolResultBlock):
+                events.append(Event(
+                    kind="tool_result",
+                    is_error=bool(block.is_error),
+                    text=_tool_result_text(block.content),
+                ))
+    return events
+
+
+def _response_from_messages(messages: list[Any], tools_seen: list[str]) -> Response:
+    content = ""
+    cost = 0.0
+    sid = ""
+    model: str | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    in_tok = out_tok = cache_r = cache_c = 0
+    is_error = False
+    err_subtype: str | None = None
+
+    for msg in messages:
+        if isinstance(msg, ResultMessage):
+            cost = getattr(msg, "total_cost_usd", 0.0) or 0.0
+            sid = getattr(msg, "session_id", None) or ""
+            result = getattr(msg, "result", None)
+            if result:
+                content = str(result).strip()
+            is_error = bool(getattr(msg, "is_error", False))
+            err_subtype = getattr(msg, "subtype", None)
+            mu = getattr(msg, "model_usage", None) or {}
+            if mu:
+                model = next(iter(mu.keys()))
+                stats = mu[model] or {}
+                context_window = stats.get("contextWindow")
+                max_output_tokens = stats.get("maxOutputTokens")
+                in_tok = int(stats.get("inputTokens") or 0)
+                out_tok = int(stats.get("outputTokens") or 0)
+                cache_r = int(stats.get("cacheReadInputTokens") or 0)
+                cache_c = int(stats.get("cacheCreationInputTokens") or 0)
+            break
+
+    if not content:
+        parts = []
+        for msg in messages:
+            if isinstance(msg, AssistantMessage):
+                for block in getattr(msg, "content", []) or []:
+                    if hasattr(block, "text"):
+                        parts.append(block.text)
+        content = "\n".join(parts).strip()
+
+    if not content and tools_seen:
+        content = "(done)"
+
+    if is_error and not content:
+        content = _result_error_text(err_subtype, None)
+
+    return Response(
+        content=content,
+        session_id=sid,
+        cost=cost,
+        tools=list(tools_seen),
+        model=model,
+        context_window=context_window,
+        max_output_tokens=max_output_tokens,
+        input_tokens=in_tok,
+        output_tokens=out_tok,
+        cache_read_tokens=cache_r,
+        cache_creation_tokens=cache_c,
+        is_error=is_error,
+    )
+
+
 class CC:
     """Single-session Claude Code interface for one channel.
 
@@ -824,32 +745,56 @@ class CC:
         source_prompt: str,
         mcp_servers: dict[str, Any] | None = None,
         model: str | None = None,
+        effort: str | None = None,
+        memory_source: str | None = None,
+        memory_enabled: bool = True,
     ) -> None:
         self._state_file = state_file
         self._source_prompt = source_prompt
-        self._mcp_servers = mcp_servers or {}
+        self._memory_source = memory_source or default_memory_source()
+        self._memory_enabled = memory_enabled
+        self._mcp_servers = _mcp_servers_without_repo_bytecode(mcp_servers)
         self._model = model
+        self._effort = effort
         self._session_id: str | None = self._load_state().get("session_id")
-        self._memory_reflex_event_id: str | None = None
+        self._memory_injected_pending = False
 
-    def _source_prompt_with_memory(
-        self,
-        extra_context: str | None = None,
-        *,
-        user_prompt: str | None = None,
-    ) -> str:
+    def _source_prompt_with_memory(self, extra_context: str | None = None) -> str:
         parts = [self._source_prompt]
-        memory_context, event_id = _render_babata_memory_context_event(self._source_prompt, user_prompt)
-        self._memory_reflex_event_id = event_id
-        if memory_context:
-            parts.append(memory_context)
+        self._memory_injected_pending = False
+        if self._memory_enabled and self._should_inject_claude_memory():
+            memory_context = _render_babata_memory_context(self._memory_source)
+            if memory_context:
+                parts.append(memory_context)
+                self._memory_injected_pending = True
         if extra_context:
             parts.append(extra_context)
         return "\n\n".join(parts)
 
-    def _record_memory_reflex_answer(self, content: str) -> None:
-        _log_memory_reflex_post_answer(self._memory_reflex_event_id, content)
-        self._memory_reflex_event_id = None
+    def _should_inject_claude_memory(self) -> bool:
+        if not memory_inject_enabled("claude"):
+            return False
+        if not self._session_id:
+            return True
+        injected = self._load_state().get(_CLAUDE_MEMORY_INJECTED_KEY)
+        if not isinstance(injected, list):
+            return True
+        return self._session_id not in {str(sid) for sid in injected}
+
+    def _mark_claude_memory_injected(self, sid: str) -> None:
+        state = self._load_state()
+        injected = state.get(_CLAUDE_MEMORY_INJECTED_KEY)
+        if not isinstance(injected, list):
+            injected = []
+        history = [str(item) for item in injected if str(item) != sid]
+        history.insert(0, sid)
+        state[_CLAUDE_MEMORY_INJECTED_KEY] = history[:_MAX_RECENT_SIDS]
+        self._save_state(state)
+
+    def _commit_pending_memory_injection(self, sid: str | None) -> None:
+        if self._memory_injected_pending and sid:
+            self._mark_claude_memory_injected(sid)
+        self._memory_injected_pending = False
 
     # ── state persistence (per-channel) ──────────────────────────────
 
@@ -880,24 +825,33 @@ class CC:
 
     def _record_sid(self, sid: str | None) -> None:
         state = self._load_state()
-        state["session_id"] = sid
         self._remember_engine_sid(state, sid)
-        # Touch activity timestamp on every sid write — _run() calls this after
-        # each successful turn, so it doubles as the idle-reset clock.
-        state["last_activity_at"] = time.time()
-        if sid:
-            hist = [s for s in state.get("recent_sids", []) if s != sid]
-            hist.insert(0, sid)
-            state["recent_sids"] = hist[:_MAX_RECENT_SIDS]
+        _record_session_metadata(state, sid, now=time.time())
         self._save_state(state)
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    @property
+    def assistant_engine_name(self) -> str | None:
+        name = getattr(self, "_babata_engine_name", None)
+        return name if isinstance(name, str) and name else None
+
+    def recent_session_ids(self) -> list[str]:
+        sids = self._load_state().get("recent_sids") or []
+        return [sid for sid in sids if isinstance(sid, str) and sid]
+
+    def persist_current_session(self) -> None:
+        self._record_sid(self._session_id)
 
     def _check_idle_reset(self) -> bool:
         """Silently reset session if idle exceeds threshold. Returns True if reset.
 
         Idle reset ≠ /new: fires only the babata-local session-end hook for the
-        old sid. Skips skill-evolve session-start (V didn't actively reset) and
-        skips the "会话已重置" reply. Next turn starts fresh and picks up the
-        standard SessionStart memory inject.
+        old sid. It does not fire session-start for the old sid and skips the
+        "会话已重置" reply. Next turn starts fresh and picks up the standard
+        startup memory context.
 
         Default 24h, parity with hermes idle_minutes. Migration: state files
         without last_activity_at fall back to file mtime so an already-stale
@@ -943,6 +897,7 @@ class CC:
             if not target.is_file():
                 continue
             turns: list[tuple[str, str]] = []
+            skip_synthetic_reply = False
             try:
                 for line in target.read_text().splitlines():
                     try:
@@ -956,29 +911,32 @@ class CC:
                     if role not in ("user", "assistant"):
                         continue
                     text = _extract_text(msg.get("content"))
-                    if text:
-                        turns.append((role, text))
+                    if not text:
+                        continue
+                    if role == "user":
+                        if _is_synthetic_user_text(text):
+                            skip_synthetic_reply = True
+                            continue
+                        skip_synthetic_reply = False
+                    elif skip_synthetic_reply:
+                        skip_synthetic_reply = False
+                        continue
+                    turns.append((role, text))
             except Exception:
                 continue
             if not turns:
                 continue
             recent = turns[-(2 * _RESUME_INJECT_PAIRS):]
-            lines = [f"{'V' if r == 'user' else 'CC'}: {t[:_RESUME_INJECT_CHARS]}"
-                     for r, t in recent]
+            lines = [f"{r}: {t[:_RESUME_INJECT_CHARS]}" for r, t in recent]
             return "会话从历史归档恢复, 最近几轮:\n" + "\n".join(lines)
         return ""
 
     def reset(self) -> None:
         old_sid = self._session_id
         if old_sid:
-            self._fire_hook(_SKILL_HOOKS_DIR, "session-end.sh", old_sid)
             self._fire_hook(_HOOKS_DIR, "session-end.sh", old_sid)
         self._session_id = None
         self._record_sid(None)
-        # skill-evolve SessionStart: 处理 pending + surface 上次 evolve 给 V (空
-        # sid, 它不关心新 sid 是啥). babata-local session-start 不在这里 fire —
-        # 新 sid 要等下一次 query 的 ResultMessage 才拿得到, 见 _run().
-        self._fire_hook(_SKILL_HOOKS_DIR, "session-start.sh", "")
 
     def list_recent_sessions(
         self, limit: int = 10, channel_filter: list[str] | None = None,
@@ -992,11 +950,11 @@ class CC:
         session, 按 JSONL 的 entrypoint 字段细分:
           - entrypoint=sdk-cli → 'oneshot' (claude -p 一次性, cron / 手敲 -p)
           - 其他 (cli / claude-desktop / sdk-py orphan / 未知) → 'term' (交互或异常)
-        这样 /resume 里 "终端" 和 "一次性" 能分开, V 找 bb 交互 session 不再被
+        这样 /resume 里 "终端" 和 "一次性" 能分开, 交互 session 不再被
         cron 一次性塞满列表.
 
         行为变更 (2026-04-20): 从"扫本 channel state.recent_sids"改成"扫整个
-        _CC_PROJECTS bucket 的 *.jsonl 按 mtime 排序". 原因: V 的设计是多渠道
+        _CC_PROJECTS bucket 的 *.jsonl 按 mtime 排序". 原因: 多渠道
         共享一个 CC 内核, TG / WX / 终端 bb 开的 session 应互相可见. 旧实现
         依赖 per-channel state, bb/WX 开的 session TG 永远看不到.
 
@@ -1010,105 +968,29 @@ class CC:
         peer_map = _scan_peer_sids()
         summary_cache = _load_summary_cache()
         own_channel = _channel_label_from_state_file(self._state_file)
-        try:
-            if scan_all_buckets:
-                # 跨 cwd bucket 扫 — V 在终端不同目录开的 claude session 落在
-                # 不同 bucket (~/.claude/projects/<cwd-hash>/), 单 bucket 扫只
-                # 看得见 babata 自己 cwd 那个. "终端"/"一次性" 渠道用全局视图,
-                # V 不用记自己当时在哪个目录敲的 claude.
-                # 排除 summary subprocess 的 sandbox bucket — 那里全是 babata
-                # 内部 "用一句话总结..." 的 sdk-cli 调用, 不是 V 真正的 oneshot.
-                # 用 realpath 防 _SUMMARY_SANDBOX 路径里有 symlink 时跟 CC CLI
-                # 用 realpath 算 bucket name 不一致 (Codex F-SANDBOX-EXCLUSION).
-                projects_root = _CC_PROJECTS.parent
-                try:
-                    sandbox_real = str(_SUMMARY_SANDBOX.resolve())
-                except Exception:
-                    sandbox_real = str(_SUMMARY_SANDBOX)
-                sandbox_bucket_name = sandbox_real.replace("/", "-")
-                buckets = [
-                    b for b in projects_root.iterdir()
-                    if b.is_dir() and b.name != sandbox_bucket_name
-                ]
-                files = sorted(
-                    (fp for b in buckets for fp in b.glob("*.jsonl")),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-            else:
-                files = sorted(
-                    _CC_PROJECTS.glob("*.jsonl"),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-        except Exception:
-            return []
+        files = _recent_session_files(scan_all_buckets=scan_all_buckets)
 
         out: list[dict] = []
         for fp in files:
-            sid = fp.stem
-            first_user: str | None = None
-            entrypoint: str | None = None
-            try:
-                for line in fp.read_text().splitlines():
-                    try:
-                        d = json.loads(line)
-                    except Exception:
-                        continue
-                    if d.get("type") != "user":
-                        continue
-                    msg = d.get("message")
-                    if not isinstance(msg, dict):
-                        continue
-                    text = _extract_text(msg.get("content"))
-                    if not text or _is_synthetic_user_text(text):
-                        continue
-                    first_user = text
-                    # entrypoint 在同一条 user record 上 (cli / sdk-py / sdk-cli /
-                    # claude-desktop). 用来区分 "终端交互" vs "一次性 -p".
-                    ep = d.get("entrypoint")
-                    if isinstance(ep, str):
-                        entrypoint = ep
-                    break
-            except Exception:
+            candidate = _session_listing_candidate(fp, peer_map)
+            if candidate is None:
                 continue
-            if not first_user:
-                continue
-            try:
-                mtime = fp.stat().st_mtime
-            except Exception:
-                mtime = 0.0
-
-            owners = peer_map.get(sid, [])
-            if owners:
-                channel_label = owners[0]
-            elif entrypoint == "sdk-cli":
-                # claude -p 一次性 (cron wrapper / 手敲 -p). 和 bb 交互拆开.
-                channel_label = "oneshot"
-            else:
-                # cli (bb / 原生 claude 交互) / claude-desktop / sdk-py orphan / 未知.
-                channel_label = "term"
-
             # channel_filter 白名单过滤. 'term'/'oneshot' 匹配 "无 owner" 的 orphan.
             # 在 summary spawn 之前过滤, 避免 scan_all_buckets 模式下给被丢弃的
             # session 起 haiku 总结 (Codex E-PERF).
+            channel_label = candidate["channel"]
             if channel_filter is not None and channel_label not in channel_filter:
                 continue
 
-            # Summary cache: 按 jsonl mtime 失效. 命中用缓存, miss/过期后台生成
-            # + 本次 fallback first_user. 下次 /resume 就能看见总结.
-            cached = summary_cache.get(sid)
-            if cached and cached.get("source_mtime") == mtime:
-                preview = cached.get("summary") or first_user
-            else:
-                preview = first_user
-                _spawn_summary_generation(sid, mtime)
-
+            sid = candidate["sid"]
+            first_user = candidate["first_user"]
+            mtime = candidate["mtime"]
+            owners = candidate["owners"]
             is_own = own_channel in owners
             out.append({
                 "sid": sid,
                 "first_user": first_user,
-                "preview": preview,      # summary (命中缓存) or first_user (fallback)
+                "preview": _session_preview(sid, first_user, mtime, summary_cache),
                 "mtime": mtime,
                 "is_current": sid == self._session_id,
                 "channel": channel_label,
@@ -1121,8 +1003,8 @@ class CC:
     def resume(self, sid: str) -> bool:
         """Switch active session to `sid` (or its forked counterpart). False if JSONL missing.
 
-        Bumps the active sid to the front of recent_sids. Skill-evolve hooks:
-        skipped (pointer switch). Babata-local hooks: fired.
+        Bumps the active sid to the front of recent_sids. Babata-local lifecycle
+        hooks fire when the pointer changes.
 
         Cross-bucket fork: 若 sid 文件在别的 cwd-bucket, _import_jsonl_to_bucket
         会用 *新 uuid* 复制一份到 babata bucket 并返回新 sid; 这里把 self._session_id
@@ -1157,7 +1039,7 @@ class CC:
 
         Returns up to 2 * pairs (role, text) entries in chronological order,
         or empty list if sid has no JSONL or no meaningful turns. Used by
-        the bot's `/resume` button click to show V what she just resumed
+        the bot's `/resume` button click to show what was just resumed
         into — selecting by 48-char first-user preview isn't enough to tell
         two nearby threads apart.
         """
@@ -1204,7 +1086,7 @@ class CC:
         picker 的判定逻辑一致. assistant 只要写过任何一条 (含纯 tool_use) 就不
         算孤儿, 说明 CC 至少开始响应了.
 
-        用于 bot _post_init 上线通知: 孤儿 = 附加 ⚠️ 告警让 V 决定 /resume 或
+        用于 bot _post_init 上线通知: 孤儿 = 附加 ⚠️ 告警让用户决定 /resume 或
         /new. 不自动重试 (工具可能有副作用).
         """
         sid = sid or self._session_id
@@ -1239,20 +1121,12 @@ class CC:
 
     @staticmethod
     def _fire_hook(hook_dir: Path, script: str, session_id: str) -> None:
-        """Fire a lifecycle hook asynchronously (non-blocking).
-
-        Two hook dirs in play (see constants): SKILL_HOOKS_DIR (V-private
-        skill-evolve) and HOOKS_DIR (repo-local babata hooks, e.g. push sid
-        to TG). Fire site picks which dir(s) to hit — skill-evolve has a
-        different "session-start" semantic (fired with empty sid, for pending
-        scan), so we don't auto-fire both on every event.
-        """
+        """Fire a repo-local lifecycle hook asynchronously (non-blocking)."""
         hook_path = hook_dir / script
         if not hook_path.is_file():
             return
         # BABATA_INSTANCE_LABEL: 把当前 bot 的人话昵称 (巴巴塔 / 巴巴塔2 / ...) 暴
-        # 露给 hook 脚本, 省得 shell 层再 import constants 反查映射. skill-evolve
-        # hooks 不用这个 env 但多塞一个无害.
+        # 露给 hook 脚本, 省得 shell 层再 import constants 反查映射.
         env = {
             **os.environ,
             "CLAUDE_SESSION_ID": session_id,
@@ -1274,30 +1148,34 @@ class CC:
     def _make_query_options(
         self,
         *,
-        user_prompt: str,
         include_partial_messages: bool,
     ) -> ClaudeAgentOptions:
         opts = ClaudeAgentOptions(
             max_turns=200,
             permission_mode=_PERMISSION_MODE,
-            can_use_tool=_always_allow,  # auto-approve protected-path prompts that bypassPermissions still forwards
+            can_use_tool=None if _FULL_TRUST else _always_allow,
+            sandbox={"enabled": False} if _FULL_TRUST else None,
             cwd=_DEFAULT_CWD,
-            cli_path=os.environ.get("CLAUDE_CLI_PATH"),
+            cli_path=env_cli_path("CLAUDE_CLI_PATH"),
             include_partial_messages=include_partial_messages,
-            system_prompt=self._source_prompt_with_memory(user_prompt=user_prompt),
+            system_prompt=_with_repo_project_instructions(
+                self._source_prompt_with_memory()
+            ),
             model=self._model,
-            setting_sources=_SETTING_SOURCES,  # 默认 [] 隔离; BABATA_SHARED_CC=1 → ["user"] 共享
+            setting_sources=_SETTING_SOURCES,  # 默认 project-only; shared mode 再加 user
             mcp_servers=self._mcp_servers,
-            # SDK 默认 max_buffer_size = 1MB; V 发 PDF/大图 或 resume 含 base64
+            # SDK 默认 max_buffer_size = 1MB; PDF/大图 或 resume 含 base64
             # 附件的老 session 时, CLI stdout 单条 JSON message 就超了 → 报
             # "JSON message exceeded maximum buffer size" → SDK 抛 Exception
-            # → cc.query 走 resume-fail 分支 → fire 🔴 + 🟢 让 V 以为在瞎切 session.
+            # → cc.query 走 resume-fail 分支 → fire 🔴 + 🟢, 看起来像误切 session.
             # 64MB 一次性 settle (单条 JSON message 理论上限 ~ context window
             # 文本量级, 远不到 64MB). 2026-04-22 根因: babata-vvv.err 11:20 事件.
             max_buffer_size=64 * 1024 * 1024,
         )
         if self._session_id:
             opts.resume = self._session_id
+        if self._effort:
+            opts.effort = self._effort
         return opts
 
     async def query(
@@ -1308,13 +1186,13 @@ class CC:
     ) -> Response:
         # Channel-agnostic reset command. Any channel (TG/WX/future) whose
         # transport layer doesn't have its own command dispatch still gets
-        # /new for free — and reset() fires the skill-evolve hooks.
+        # /new for free — and reset() fires the repo lifecycle hooks.
         if prompt.strip() == "/new" and not images:
             self.reset()
             return Response(content="会话已重置。", session_id="", cost=0.0)
 
-        # Silent idle reset (default 24h, hermes parity). V didn't ask for it,
-        # don't reply "会话已重置" — fresh session + memory inject takes over.
+        # Silent idle reset (default 24h, hermes parity). No explicit reset,
+        # don't reply "会话已重置" — fresh session + memory context takes over.
         # Override via BABATA_IDLE_RESET_MINUTES env (0 disables).
         self._check_idle_reset()
 
@@ -1328,13 +1206,12 @@ class CC:
         )
 
         opts = self._make_query_options(
-            user_prompt=prompt,
             include_partial_messages=on_stream is not None,
         )
 
         try:
             resp = await self._run(opts, prompt, images, on_stream)
-            self._record_memory_reflex_answer(resp.content)
+            self._commit_pending_memory_injection(resp.session_id)
             resp.audit = finish_turn(
                 audit,
                 response=resp,
@@ -1355,8 +1232,10 @@ class CC:
             self._record_sid(None)
             opts.resume = None
             ctx = self._recent_turns_summary()
+            opts.system_prompt = _with_repo_project_instructions(
+                self._source_prompt_with_memory(ctx or None)
+            )
             if ctx:
-                opts.system_prompt = self._source_prompt_with_memory(ctx, user_prompt=prompt)
                 note = f"⚠️ 会话重置 ({type(e).__name__}), 已从归档注入最近 {_RESUME_INJECT_PAIRS} 轮"
             else:
                 note = f"⚠️ 会话重置 ({type(e).__name__}), 历史归档也没找到"
@@ -1365,7 +1244,7 @@ class CC:
             except Exception as retry_error:
                 finish_turn(audit, error=retry_error)
                 raise
-            self._record_memory_reflex_answer(resp.content)
+            self._commit_pending_memory_injection(resp.session_id)
             resp.resume_note = note
             resp.audit = finish_turn(
                 audit,
@@ -1419,7 +1298,6 @@ class CC:
             images_count=0,
         )
         opts = self._make_query_options(
-            user_prompt=prompt,
             include_partial_messages=False,
         )
         try:
@@ -1427,6 +1305,7 @@ class CC:
         except Exception as e:
             finish_turn(audit, error=e)
             raise
+        self._commit_pending_memory_injection(resp.session_id)
         resp.audit = finish_turn(
             audit,
             response=resp,
@@ -1445,27 +1324,13 @@ class CC:
         client = ClaudeSDKClient(opts)
         messages = []
         tools_seen: list[str] = []
+        cpu_unavailable = False
 
         try:
             await client.connect()
-
             if images:
-                blocks: list[dict[str, Any]] = [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": img["media_type"],
-                            "data": img["data"],
-                        },
-                    }
-                    for img in images
-                ]
-                if prompt:
-                    blocks.append({"type": "text", "text": prompt})
-
                 async def _multi():
-                    yield {"type": "user", "message": {"role": "user", "content": blocks}}
+                    yield _user_message_payload(prompt, images)
 
                 await client.query(_multi())
             else:
@@ -1477,123 +1342,45 @@ class CC:
                 if isinstance(msg, ResultMessage):
                     break
 
+                # Limit/auth notices are not answers: keep them off the channel.
+                if getattr(msg, "error", None) in _UNAVAILABLE_ERRORS:
+                    cpu_unavailable = True
+                    continue
+
                 if not on_stream:
                     continue
 
-                if isinstance(msg, AssistantMessage):
-                    for block in getattr(msg, "content", []) or []:
-                        if isinstance(block, ToolUseBlock):
-                            name = getattr(block, "name", "")
-                            inp = getattr(block, "input", {}) or {}
-                            if name and name not in tools_seen:
-                                tools_seen.append(name)
-                            await on_stream(name, inp, None, None)
-                        # TextBlock not streamed here — it's the *final* full
-                        # text, would duplicate what we already sent via
-                        # StreamEvent text deltas below.
-                elif isinstance(msg, StreamEvent):
-                    ev = msg.event or {}
-                    if ev.get("type") == "content_block_delta":
-                        delta = ev.get("delta") or {}
-                        if delta.get("type") == "text_delta":
-                            chunk = delta.get("text") or ""
-                            if chunk:
-                                await on_stream(None, None, chunk, None)
-                elif isinstance(msg, UserMessage):
-                    for block in getattr(msg, "content", []) or []:
-                        if isinstance(block, ToolResultBlock):
-                            await on_stream(None, None, None, {
-                                "is_error": bool(block.is_error),
-                                "text": _tool_result_text(block.content),
-                            })
+                for event in _events_from_sdk_message(msg, tools_seen):
+                    if event.kind == "tool_use":
+                        await on_stream(event.name, event.input_dict or {}, None, None)
+                    elif event.kind == "text_delta":
+                        await on_stream(None, None, event.chunk or "", None)
+                    elif event.kind == "tool_result":
+                        await on_stream(None, None, None, {
+                            "is_error": event.is_error,
+                            "text": event.text or "",
+                        })
         finally:
             await client.disconnect()
 
         tool_uses = _extract_tool_uses(messages)
         tools_seen = _ordered_tool_names(tools_seen, tool_uses)
+        response = _response_from_messages(messages, tools_seen)
+        # A notice the CLI recovered from is not a failed turn.
+        response.cpu_unavailable = cpu_unavailable and response.is_error
 
-        content = ""
-        cost = 0.0
-        sid = None
-        model: str | None = None
-        context_window: int | None = None
-        max_output_tokens: int | None = None
-        in_tok = out_tok = cache_r = cache_c = 0
-        is_error = False
-        err_subtype: str | None = None
-
-        for msg in messages:
-            if isinstance(msg, ResultMessage):
-                cost = getattr(msg, "total_cost_usd", 0.0) or 0.0
-                sid = getattr(msg, "session_id", None)
-                result = getattr(msg, "result", None)
-                if result:
-                    content = str(result).strip()
-                is_error = bool(getattr(msg, "is_error", False))
-                err_subtype = getattr(msg, "subtype", None)
-                # model_usage shape: {"claude-opus-4-N[1m]": {inputTokens, outputTokens,
-                # cacheReadInputTokens, cacheCreationInputTokens, contextWindow,
-                # maxOutputTokens, ...}}. First key = the model CC actually ran.
-                mu = getattr(msg, "model_usage", None) or {}
-                if mu:
-                    model = next(iter(mu.keys()))
-                    stats = mu[model] or {}
-                    context_window = stats.get("contextWindow")
-                    max_output_tokens = stats.get("maxOutputTokens")
-                    in_tok = int(stats.get("inputTokens") or 0)
-                    out_tok = int(stats.get("outputTokens") or 0)
-                    cache_r = int(stats.get("cacheReadInputTokens") or 0)
-                    cache_c = int(stats.get("cacheCreationInputTokens") or 0)
-                break
-
-        if not content:
-            parts = []
-            for msg in messages:
-                if isinstance(msg, AssistantMessage):
-                    for block in getattr(msg, "content", []) or []:
-                        if hasattr(block, "text"):
-                            parts.append(block.text)
-            content = "\n".join(parts).strip()
-
-        if not content and tools_seen:
-            content = "(done)"
-
-        if is_error and not content:
-            content = _result_error_text(err_subtype, None)
-
-        if sid:
+        if response.session_id:
             # Detect session boundary: SDK starts a fresh sid on first turn,
             # after /reset, or when resume failed and a new session was created
             # implicitly. Fire babata session-start so TG sees the new sid.
             # Skipped when sid is unchanged (same session continuing).
-            if sid != self._session_id:
-                self._fire_hook(_HOOKS_DIR, "session-start.sh", sid)
-            self._session_id = sid
-            self._record_sid(sid)
-            notify_skill_evolve_turn(
-                session_id=sid,
-                cpu="claude",
-                source=_memory_source_from_prompt(self._source_prompt),
-                channel=_channel_label_from_state_file(self._state_file),
-                state_file=self._state_file,
-                metadata={"tools": tools_seen, "engine": "claude"},
-            )
+            if response.session_id != self._session_id:
+                self._fire_hook(_HOOKS_DIR, "session-start.sh", response.session_id)
+            self._session_id = response.session_id
+            self._record_sid(response.session_id)
 
-        return Response(
-            content=content,
-            session_id=sid or "",
-            cost=cost,
-            tools=tools_seen,
-            model=model,
-            context_window=context_window,
-            max_output_tokens=max_output_tokens,
-            input_tokens=in_tok,
-            output_tokens=out_tok,
-            cache_read_tokens=cache_r,
-            cache_creation_tokens=cache_c,
-            audit={"tool_uses": tool_uses},
-            is_error=is_error,
-        )
+        response.audit = {"tool_uses": tool_uses}
+        return response
 
 
 class LiveSession(CC):
@@ -1615,12 +1402,18 @@ class LiveSession(CC):
         source_prompt: str,
         mcp_servers: dict[str, Any] | None = None,
         model: str | None = None,
+        effort: str | None = None,
+        memory_source: str | None = None,
+        memory_enabled: bool = True,
     ) -> None:
         super().__init__(
             state_file=state_file,
             source_prompt=source_prompt,
             mcp_servers=mcp_servers,
             model=model,
+            effort=effort,
+            memory_source=memory_source,
+            memory_enabled=memory_enabled,
         )
         self._client: ClaudeSDKClient | None = None
         self._inbox: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
@@ -1636,10 +1429,6 @@ class LiveSession(CC):
         self._blocking_review_round = 0
 
     @property
-    def session_id(self) -> str | None:
-        return self._session_id
-
-    @property
     def is_connected(self) -> bool:
         return self._client is not None and not self._closed
 
@@ -1652,11 +1441,14 @@ class LiveSession(CC):
         opts = ClaudeAgentOptions(
             max_turns=200,
             permission_mode=_PERMISSION_MODE,
-            can_use_tool=_always_allow,
+            can_use_tool=None if _FULL_TRUST else _always_allow,
+            sandbox={"enabled": False} if _FULL_TRUST else None,
             cwd=_DEFAULT_CWD,
-            cli_path=os.environ.get("CLAUDE_CLI_PATH"),
+            cli_path=env_cli_path("CLAUDE_CLI_PATH"),
             include_partial_messages=True,
-            system_prompt=system_prompt if system_prompt is not None else self._source_prompt_with_memory(),
+            system_prompt=_with_repo_project_instructions(
+                system_prompt if system_prompt is not None else self._source_prompt_with_memory()
+            ),
             model=self._model,
             setting_sources=_SETTING_SOURCES,
             mcp_servers=self._mcp_servers,
@@ -1666,6 +1458,8 @@ class LiveSession(CC):
         )
         if resume and self._session_id:
             opts.resume = self._session_id
+        if self._effort:
+            opts.effort = self._effort
         return opts
 
     async def connect(self) -> None:
@@ -1809,34 +1603,8 @@ class LiveSession(CC):
                             yield Event(kind="turn_end", response=response)
                             continue
 
-                        if isinstance(msg, AssistantMessage):
-                            for block in getattr(msg, "content", []) or []:
-                                if isinstance(block, ToolUseBlock):
-                                    name = getattr(block, "name", "")
-                                    inp = getattr(block, "input", {}) or {}
-                                    if name and name not in tools_seen:
-                                        tools_seen.append(name)
-                                    yield Event(
-                                        kind="tool_use",
-                                        name=name,
-                                        input_dict=inp,
-                                    )
-                        elif isinstance(msg, StreamEvent):
-                            ev = msg.event or {}
-                            if ev.get("type") == "content_block_delta":
-                                delta = ev.get("delta") or {}
-                                if delta.get("type") == "text_delta":
-                                    chunk = delta.get("text") or ""
-                                    if chunk:
-                                        yield Event(kind="text_delta", chunk=chunk)
-                        elif isinstance(msg, UserMessage):
-                            for block in getattr(msg, "content", []) or []:
-                                if isinstance(block, ToolResultBlock):
-                                    yield Event(
-                                        kind="tool_result",
-                                        is_error=bool(block.is_error),
-                                        text=_tool_result_text(block.content),
-                                    )
+                        for event in _events_from_sdk_message(msg, tools_seen):
+                            yield event
                 except Exception as e:
                     if self._closed:
                         break
@@ -2063,35 +1831,14 @@ class LiveSession(CC):
         prompt: str,
         images: list[dict[str, str]] | None,
     ) -> dict[str, Any]:
-        if images:
-            blocks: list[dict[str, Any]] = [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": img["media_type"],
-                        "data": img["data"],
-                    },
-                }
-                for img in images
-            ]
-            if prompt:
-                blocks.append({"type": "text", "text": prompt})
-            content: str | list[dict[str, Any]] = blocks
-        else:
-            content = prompt
-        return {
-            "type": "user",
-            "message": {"role": "user", "content": content},
-            "parent_tool_use_id": None,
-        }
+        return _user_message_payload(prompt, images)
 
     def _handle_result_message(
         self,
         messages: list[Any],
         tools_seen: list[str],
     ) -> tuple[Response, tuple[str | None, str] | None]:
-        response = self._response_from_messages(messages, tools_seen)
+        response = _response_from_messages(messages, tools_seen)
         tool_uses = _extract_tool_uses(messages)
         response.tools = _ordered_tool_names(response.tools, tool_uses)
         if self._resume_note_next:
@@ -2107,14 +1854,7 @@ class LiveSession(CC):
                 changed = (old_sid, sid)
             self._session_id = sid
             self._record_sid(sid)
-            notify_skill_evolve_turn(
-                session_id=sid,
-                cpu="claude",
-                source=_memory_source_from_prompt(self._source_prompt),
-                channel=_channel_label_from_state_file(self._state_file),
-                state_file=self._state_file,
-                metadata={"tools": response.tools, "engine": "claude-live"},
-            )
+        self._commit_pending_memory_injection(sid)
         audit = self._pending_audits.pop(0) if self._pending_audits else None
         response.audit = finish_turn(
             audit,
@@ -2147,69 +1887,3 @@ class LiveSession(CC):
         self._blocking_review_round += 1
         self._enqueue_internal_repair(build_repair_prompt(review))
         return True
-
-    @staticmethod
-    def _response_from_messages(
-        messages: list[Any],
-        tools_seen: list[str],
-    ) -> Response:
-        content = ""
-        cost = 0.0
-        sid = ""
-        model: str | None = None
-        context_window: int | None = None
-        max_output_tokens: int | None = None
-        in_tok = out_tok = cache_r = cache_c = 0
-
-        is_error = False
-        err_subtype: str | None = None
-        for msg in messages:
-            if isinstance(msg, ResultMessage):
-                cost = getattr(msg, "total_cost_usd", 0.0) or 0.0
-                sid = getattr(msg, "session_id", None) or ""
-                result = getattr(msg, "result", None)
-                if result:
-                    content = str(result).strip()
-                is_error = bool(getattr(msg, "is_error", False))
-                err_subtype = getattr(msg, "subtype", None)
-                mu = getattr(msg, "model_usage", None) or {}
-                if mu:
-                    model = next(iter(mu.keys()))
-                    stats = mu[model] or {}
-                    context_window = stats.get("contextWindow")
-                    max_output_tokens = stats.get("maxOutputTokens")
-                    in_tok = int(stats.get("inputTokens") or 0)
-                    out_tok = int(stats.get("outputTokens") or 0)
-                    cache_r = int(stats.get("cacheReadInputTokens") or 0)
-                    cache_c = int(stats.get("cacheCreationInputTokens") or 0)
-                break
-
-        if not content:
-            parts = []
-            for msg in messages:
-                if isinstance(msg, AssistantMessage):
-                    for block in getattr(msg, "content", []) or []:
-                        if isinstance(block, TextBlock):
-                            parts.append(block.text)
-            content = "\n".join(parts).strip()
-
-        if not content and tools_seen:
-            content = "(done)"
-
-        if is_error and not content:
-            content = _result_error_text(err_subtype, None)
-
-        return Response(
-            content=content,
-            session_id=sid,
-            cost=cost,
-            tools=list(tools_seen),
-            model=model,
-            context_window=context_window,
-            max_output_tokens=max_output_tokens,
-            input_tokens=in_tok,
-            output_tokens=out_tok,
-            cache_read_tokens=cache_r,
-            cache_creation_tokens=cache_c,
-            is_error=is_error,
-        )

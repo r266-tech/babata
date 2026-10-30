@@ -6,8 +6,8 @@
 # silently die. PTB 22.7 把 TimedOut 内吞, in-process error_callback 行不通
 # (codex review 2026-04-28 验证), 走外部独立通路监控.
 #
-# 哲学: 监控不能依赖被监控组件 (feedback_monitoring_separation). launchd
-# 是独立 supervisor, 跟 bot.py 解耦.
+# Boundary: monitoring cannot depend on the monitored component
+# (feedback_monitoring_separation). launchd is the independent supervisor.
 #
 # 触发: launchd com.babata.poll-watchdog.plist, StartInterval=60.
 
@@ -19,7 +19,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$REPO_DIR/.env"
 if [ -f "$ENV_FILE" ] && [ -z "${PROJECT_STATE_DIR:-}" ]; then
     PROJECT_STATE_DIR=$(grep -m1 '^PROJECT_STATE_DIR=' "$ENV_FILE" 2>/dev/null \
-        | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '\r')
+        | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '\r' || true)
     [ -n "$PROJECT_STATE_DIR" ] && export PROJECT_STATE_DIR
 fi
 

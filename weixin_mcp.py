@@ -12,6 +12,10 @@ can actually deliver.
 import asyncio
 import json
 import logging
+import sys
+from copy import deepcopy
+
+sys.dont_write_bytecode = True
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -24,100 +28,87 @@ SOCKET_PATH = "/tmp/babata-weixin-bridge.sock"
 server = Server("weixin")
 
 
+def _tool(
+    name: str,
+    description: str,
+    properties: dict,
+    required: list[str],
+) -> Tool:
+    return Tool(
+        name=name,
+        description=description,
+        inputSchema={
+            "type": "object",
+            "properties": deepcopy(properties),
+            "required": list(required),
+        },
+    )
+
+
+_WX_TOOL_SPECS = (
+    (
+        "wx_send_text",
+        (
+            "Send text to WeChat. Final replies auto-delivered; only for "
+            "mid-turn pushes, long-running progress, proactive sends."
+        ),
+        {"text": {"type": "string"}},
+        ["text"],
+    ),
+    (
+        "wx_send_image",
+        (
+            "Send image (local path or https URL) to WeChat; caption sent first."
+        ),
+        {
+            "path": {
+                "type": "string",
+            },
+            "caption": {"type": "string"},
+        },
+        ["path"],
+    ),
+    (
+        "wx_send_video",
+        "Send local mp4/mov/webm to WeChat.",
+        {
+            "path": {"type": "string"},
+            "caption": {"type": "string"},
+        },
+        ["path"],
+    ),
+    (
+        "wx_send_file",
+        (
+            "Send local file to WeChat; file_name overrides basename."
+        ),
+        {
+            "path": {"type": "string"},
+            "file_name": {"type": "string"},
+            "caption": {"type": "string"},
+        },
+        ["path"],
+    ),
+    # wx_send_voice stays absent: iLink filters bot->user voice.
+    (
+        "wx_send_typing",
+        "Show/cancel WeChat typing indicator; status 1 on, 2 off.",
+        {
+            "status": {
+                "type": "integer",
+                "enum": [1, 2],
+            },
+        },
+        ["status"],
+    ),
+)
+
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
-        Tool(
-            name="wx_send_text",
-            description=(
-                "Send a text message to the user's WeChat. "
-                "When invoked from an inbound WeChat conversation, the assistant's "
-                "final turn text is already auto-delivered — this tool is additive, "
-                "for mid-turn pushes, long-running task progress, or proactive sends. "
-                "WeChat client renders Markdown natively (bold/italic/code/headings/"
-                "lists/tables/links/quotes/hr; nested supported). "
-                "HTML tags and [x]/[ ] task lists display literally. "
-                "Bare URLs auto-linked; [text](url) hides URL."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {"text": {"type": "string"}},
-                "required": ["text"],
-            },
-        ),
-        Tool(
-            name="wx_send_image",
-            description=(
-                "Send a local image (jpg/png/gif/webp/bmp) to the user's WeChat. "
-                "Optional caption is sent as a separate TEXT message first."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute or ~-relative file path"},
-                    "caption": {"type": "string"},
-                },
-                "required": ["path"],
-            },
-        ),
-        Tool(
-            name="wx_send_video",
-            description="Send a local video file (mp4/mov/webm) to the user's WeChat.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "caption": {"type": "string"},
-                },
-                "required": ["path"],
-            },
-        ),
-        Tool(
-            name="wx_send_file",
-            description=(
-                "Send a local file as a WeChat file attachment (any type). "
-                "If file_name is omitted, the local file's basename is used."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "file_name": {"type": "string"},
-                    "caption": {"type": "string"},
-                },
-                "required": ["path"],
-            },
-        ),
-        # wx_send_voice 永久下线 (2026-04-26 round 2 verdict, Java SDK live test 坐实):
-        # ilink 协议 server 在 bot→user 方向 silent filter voice item.
-        # 穷举证据:
-        #   - 13 字段变体 (A-M) + silk +0x02 prefix + 3 个 encode_type 值 (4/6/7)
-        #     + 5 个 channel_version (1.0.0/2.1.8/2.1.9/2.1.10/2.2.0/3.0.0)
-        #     + echo V 自己录的 silk 字节 verbatim
-        #   - 全部 server 200 OK 但 client 永不渲染气泡
-        #   - lith0924 Java SDK (CSDN 文章 reference, GitHub wechat-ilink-sdk-java) live test:
-        #     mvn install + WeixinVoiceSend.java + 拦截 wire dump → server 同样 200 OK,
-        #     V 同样收不到. Java SDK 是 vaporware.
-        # ClawBot 截图里的 voice 气泡是 V 发给 bot 的输入 (左对齐), 不是 bot 发的.
-        Tool(
-            name="wx_send_typing",
-            description=(
-                "Show or hide the 'typing…' indicator in WeChat. "
-                "Use status=1 before a long task, status=2 to cancel early. "
-                "WeChat auto-cancels typing after a short delay so repeated calls are OK."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "status": {
-                        "type": "integer",
-                        "enum": [1, 2],
-                        "description": "1 = typing on, 2 = typing off",
-                    },
-                },
-                "required": ["status"],
-            },
-        ),
+        _tool(name, description, properties, required)
+        for name, description, properties, required in _WX_TOOL_SPECS
     ]
 
 

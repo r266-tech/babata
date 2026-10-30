@@ -7,6 +7,7 @@ conversation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from cli_runtime import env_cli_path
 from constants import NAMESPACE, STATE_DIR
 
 
@@ -50,6 +52,7 @@ _MAX_REPAIR_PROMPT = 6000
 _MAX_REVIEW_CONTEXT = 24000
 _MAX_REVIEW_PROMPT = 32000
 _MAX_RAW_OUTPUT = 4000
+_MIN_RESPONSE_SCRUB_CHARS = 32
 _REVIEW_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -75,10 +78,6 @@ _REVIEW_SCHEMA = {
 }
 
 
-def blocking_review_enabled() -> bool:
-    return os.environ.get("BABATA_BLOCKING_REVIEW", "1") != "0"
-
-
 def blocking_review_max_rounds() -> int:
     raw = os.environ.get("BABATA_BLOCKING_REVIEW_MAX_ROUNDS", "2")
     try:
@@ -96,24 +95,32 @@ def run_blocking_review(
     response_content: str,
     round_index: int,
 ) -> dict[str, Any]:
-    if not blocking_review_enabled():
+    if os.environ.get("BABATA_BLOCKING_REVIEW", "1") == "0":
         return _result("skipped", reason="BABATA_BLOCKING_REVIEW=0", round_index=round_index)
     if not _needs_review(audit_summary):
         return _result("skipped", reason="no code-changing turn", round_index=round_index)
 
+    response_preview = _trim(response_content, 2000)
     payload = {
         "schema": "babata.blocking_review_payload.v1",
         "cpu": cpu,
         "channel": channel,
         "round_index": round_index,
         "audit": audit_summary or {},
-        "response_preview": _trim(response_content, 2000),
+        "response_preview": response_preview,
     }
     command = os.environ.get("BABATA_BLOCKING_REVIEW_CMD")
     if command:
-        result = _run_review_command(command, payload, round_index)
+        result = _deterministic_review(payload, round_index)
+        if result.get("status") != "needs_fix":
+            result = _run_review_command(command, payload, round_index)
     else:
         result = _review_without_command(payload, round_index)
+    result = _scrub_response_from_review_result(
+        result,
+        response_content=response_content,
+        response_preview=response_preview,
+    )
     _record_review_result(result)
     return result
 
@@ -123,11 +130,11 @@ def build_repair_prompt(review: dict[str, Any]) -> str:
     if not findings:
         findings = f"- {review.get('message') or review.get('reason') or 'Blocking review requested another pass.'}"
     prompt = f"""<blocking-review>
-Your previous code-changing turn did not pass babata's blocking review gate.
+Previous code-changing turn failed blocking review.
 
-Fix the findings below in the same repository/session. Do not ask the user to
-confirm implementation details. After fixing, rerun the relevant checks and then
-answer the user only with the final result.
+Fix supported findings in the same repository/session within the current task and authorization.
+Resolve routine choices; ask only for material missing information or authority.
+Rerun relevant checks; report the final result and any unresolved findings.
 
 Findings:
 {findings}
@@ -211,7 +218,7 @@ def _review_without_command(payload: dict[str, Any], round_index: int) -> dict[s
     result = _deterministic_review(payload, round_index)
     if result.get("status") == "needs_fix":
         return result
-    if not _counterpart_review_enabled():
+    if not counterpart_review_enabled():
         return result
     if _current_review_depth() >= _max_review_depth():
         result["reason"] = "counterpart review skipped inside delegated reviewer"
@@ -219,11 +226,12 @@ def _review_without_command(payload: dict[str, Any], round_index: int) -> dict[s
     return _run_counterpart_review(payload, round_index)
 
 
-def _counterpart_review_enabled() -> bool:
-    mode = os.environ.get("BABATA_BLOCKING_REVIEW_AGENT", "counterpart").strip().lower()
+def counterpart_review_enabled() -> bool:
+    """Model review is opt-in; local guards and declared checks always remain."""
+    mode = os.environ.get("BABATA_BLOCKING_REVIEW_AGENT", "").strip().lower()
     if mode in {"0", "off", "false", "disabled", "none", "deterministic"}:
         return False
-    return os.environ.get("BABATA_BLOCKING_REVIEW_COUNTERPART", "1") != "0"
+    return os.environ.get("BABATA_BLOCKING_REVIEW_COUNTERPART", "1" if mode else "0") != "0"
 
 
 def _current_review_depth() -> int:
@@ -244,16 +252,21 @@ def _max_review_depth() -> int:
 
 def _run_counterpart_review(payload: dict[str, Any], round_index: int) -> dict[str, Any]:
     source_cpu = str(payload.get("cpu") or "").lower()
-    if source_cpu == "codex":
+    review_cpu = os.environ.get("BABATA_BLOCKING_REVIEW_CPU", "codex").strip().lower()
+    if review_cpu in {"claude", "cc", "claude-code"}:
         return _run_claude_counterpart_review(payload, round_index)
-    if source_cpu == "claude":
+    if review_cpu in {"codex", ""}:
         return _run_codex_counterpart_review(payload, round_index)
-    return _result(
-        "passed",
-        reviewer="deterministic",
-        reason=f"no counterpart reviewer for cpu={source_cpu or '<unknown>'}",
-        round_index=round_index,
-    )
+    # Explicit compatibility mode for the historical opposite-CPU policy.
+    # It is never the default while Claude is unavailable.
+    if review_cpu in {"counterpart", "opposite"}:
+        if source_cpu == "codex":
+            return _run_claude_counterpart_review(payload, round_index)
+        if source_cpu == "claude":
+            return _run_codex_counterpart_review(payload, round_index)
+    # A typo or stale value must not silently disable the model review gate.
+    # Codex is the safe current default while Claude is unavailable.
+    return _run_codex_counterpart_review(payload, round_index)
 
 
 def _run_claude_counterpart_review(payload: dict[str, Any], round_index: int) -> dict[str, Any]:
@@ -315,8 +328,20 @@ def _run_claude_counterpart_review(payload: dict[str, Any], round_index: int) ->
     result["round_index"] = round_index
     result["duration_ms"] = round((time.time() - started) * 1000)
     result["exit_code"] = proc.returncode
-    result["raw_output"] = _trim(text or raw, _MAX_RAW_OUTPUT)
     if proc.returncode != 0 or nested_exit_code not in (None, 0) or nested_timed_out:
+        if _looks_like_counterpart_infra_failure(raw or text):
+            message = _counterpart_infra_failure_message(
+                raw or text,
+                f"cc-worker exited {proc.returncode}",
+            )
+            result = _review_infra_failure(
+                "claude-counterpart",
+                message,
+                round_index,
+            )
+            result["duration_ms"] = round((time.time() - started) * 1000)
+            result["exit_code"] = proc.returncode
+            return result
         _force_review_failure(
             result,
             "counterpart-review-failed",
@@ -348,8 +373,8 @@ def _run_codex_counterpart_review(payload: dict[str, Any], round_index: int) -> 
             str(repo_root),
             "--sandbox",
             os.environ.get("BABATA_CODEX_REVIEW_SANDBOX", "read-only"),
-            "--ask-for-approval",
-            "never",
+            "-c",
+            'approval_policy="never"',
             "--skip-git-repo-check",
             "--ephemeral",
             "--output-schema",
@@ -357,9 +382,14 @@ def _run_codex_counterpart_review(payload: dict[str, Any], round_index: int) -> 
             "--output-last-message",
             str(output_path),
         ]
-        model = os.environ.get("BABATA_CODEX_REVIEW_MODEL")
-        if model:
-            args.extend(["--model", model])
+        model = os.environ.get("BABATA_CODEX_REVIEW_MODEL") or "gpt-5.6-sol"
+        reasoning = os.environ.get("BABATA_CODEX_REVIEW_REASONING") or "max"
+        args.extend([
+            "--model",
+            model,
+            "-c",
+            f'model_reasoning_effort="{reasoning}"',
+        ])
         args.append("-")
         try:
             proc = subprocess.run(
@@ -381,8 +411,20 @@ def _run_codex_counterpart_review(payload: dict[str, Any], round_index: int) -> 
     result["round_index"] = round_index
     result["duration_ms"] = round((time.time() - started) * 1000)
     result["exit_code"] = proc.returncode
-    result["raw_output"] = _trim(output_text or raw, _MAX_RAW_OUTPUT)
     if proc.returncode != 0:
+        if _looks_like_counterpart_infra_failure(raw):
+            message = _counterpart_infra_failure_message(
+                raw,
+                f"codex exited {proc.returncode}",
+            )
+            result = _review_infra_failure(
+                "codex-counterpart",
+                message,
+                round_index,
+            )
+            result["duration_ms"] = round((time.time() - started) * 1000)
+            result["exit_code"] = proc.returncode
+            return result
         _force_review_failure(
             result,
             "counterpart-review-failed",
@@ -438,13 +480,19 @@ def _run_review_command(command: str, payload: dict[str, Any], round_index: int)
 def _parse_command_result(raw: str) -> dict[str, Any]:
     data = _extract_json_object(raw)
     if isinstance(data, dict):
-        return _normalize_review_result(data, raw)
-    upper = raw.upper()
-    status = "needs_fix" if any(marker in upper for marker in ("NEEDS_FIX", "NEEDS-FIX", "BLOCKER", "FAIL")) else "passed"
-    findings = []
-    if status == "needs_fix":
-        findings = [{"severity": "high", "rule": "review", "message": _trim(raw, _MAX_FINDING_TEXT)}]
-    return {"status": status, "findings": findings, "raw_output": _trim(raw, _MAX_FINDING_TEXT)}
+        return _normalize_review_result(data)
+    return _invalid_review_result()
+
+
+def _invalid_review_result() -> dict[str, Any]:
+    return _result(
+        "needs_fix",
+        findings=[{
+            "severity": "high",
+            "rule": "review-output-invalid",
+            "message": "Reviewer returned no valid JSON verdict; review did not complete.",
+        }],
+    )
 
 
 def _extract_json_object(raw: str) -> dict[str, Any] | None:
@@ -471,22 +519,30 @@ def _extract_json_object(raw: str) -> dict[str, Any] | None:
     return None
 
 
-def _normalize_review_result(data: dict[str, Any], raw: str) -> dict[str, Any]:
+def _normalize_review_result(data: dict[str, Any]) -> dict[str, Any]:
     status = str(data.get("status") or data.get("verdict") or "").lower()
     if status in {"pass", "passed", "ok", "approve", "approved"}:
         status = "passed"
     elif status in {"needs_fix", "needs-fix", "fail", "failed", "block", "blocked"}:
         status = "needs_fix"
     else:
-        status = "needs_fix" if data.get("findings") else "passed"
-    findings = data.get("findings") or []
-    if isinstance(findings, str):
-        findings = [{"severity": "medium", "rule": "review", "message": findings}]
+        return _invalid_review_result()
+    findings = data.get("findings", [])
+    if not isinstance(findings, list) or any(not isinstance(item, dict) for item in findings):
+        return _invalid_review_result()
+    if any(
+        not isinstance(item.get("severity"), str)
+        or not isinstance(item.get("message"), str)
+        or ("blocking" in item and not isinstance(item["blocking"], bool))
+        for item in findings
+    ):
+        return _invalid_review_result()
+    if any(item.get("blocking") or item.get("severity") in {"high", "critical"} for item in findings):
+        status = "needs_fix"
     return {
         "status": status,
         "findings": findings if isinstance(findings, list) else [],
         "message": data.get("message"),
-        "raw_output": _trim(raw, _MAX_RAW_OUTPUT),
     }
 
 
@@ -511,32 +567,79 @@ def _result(
     }
 
 
+def _scrub_response_from_review_result(
+    result: dict[str, Any],
+    *,
+    response_content: str,
+    response_preview: str,
+) -> dict[str, Any]:
+    marker = _response_marker(response_content)
+    needles = _response_scrub_needles(response_content, response_preview)
+    scrubbed = _scrub_value(result, needles, marker)
+    if not isinstance(scrubbed, dict):
+        scrubbed = dict(result)
+    scrubbed["response_sha256"] = _sha256_text(response_content)
+    scrubbed["response_bytes"] = _text_bytes(response_content)
+    return scrubbed
+
+
+def _response_scrub_needles(response_content: str, response_preview: str) -> list[str]:
+    needles: list[str] = []
+    for value in (response_content, response_preview):
+        if len(value) < _MIN_RESPONSE_SCRUB_CHARS:
+            continue
+        if value not in needles:
+            needles.append(value)
+    return needles
+
+
+def _scrub_value(value: Any, needles: list[str], marker: str) -> Any:
+    if isinstance(value, str):
+        for needle in needles:
+            value = value.replace(needle, marker)
+        return value
+    if isinstance(value, list):
+        return [_scrub_value(item, needles, marker) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _scrub_value(item, needles, marker)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _response_marker(response_content: str) -> str:
+    return f"[response draft omitted sha256={_sha256_text(response_content)}]"
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _text_bytes(text: str) -> int:
+    return len(text.encode("utf-8", errors="replace"))
+
+
 def _build_counterpart_review_prompt(payload: dict[str, Any], *, reviewer: str) -> str:
     source_cpu = str(payload.get("cpu") or "unknown")
     audit = payload.get("audit") if isinstance(payload.get("audit"), dict) else {}
-    changed_files = [str(path) for path in (audit.get("changed_files") or [])]
     review_context = _review_context(audit)
-    instructions = f"""You are babata's synchronous blocking review gate.
+    instructions = f"""You are the synchronous blocking review gate.
 
-Review the code-changing turn from source_cpu={source_cpu}. You are reviewer={reviewer}.
-This is a bounded sidecar review only: do not edit files, do not call another CPU,
-and do not run nested delegation. The source CPU will apply any fixes in its own
-session after your verdict.
+Review source_cpu={source_cpu}; reviewer={reviewer}. Read-only sidecar: do not
+edit files, call another CPU, or delegate. Source CPU applies fixes.
 
-Return only a JSON object:
+Return JSON only:
 {{"status":"passed","findings":[]}}
 or
 {{"status":"needs_fix","findings":[{{"severity":"high","rule":"bug","path":"path","message":"specific issue"}}]}}
 
-Only block for concrete bugs, regressions, security/privacy issues, broken checks,
-or behavior that clearly violates the user's request. Do not block for style,
-speculation, missing nice-to-have tests, or preferences.
+Block only concrete bugs, regressions, security/privacy issues, broken checks,
+or clear request violations. Do not block style, speculation, nice-to-have tests,
+or preferences.
 
 Audit summary:
-{json.dumps(_compact_audit_for_prompt(audit), ensure_ascii=False, indent=2)}
-
-Changed files:
-{json.dumps(changed_files, ensure_ascii=False)}
+{json.dumps(_compact_audit_for_prompt(audit), ensure_ascii=False, separators=(",", ":"))}
 
 Response draft:
 {payload.get("response_preview") or ""}
@@ -658,7 +761,6 @@ def _cc_worker_cli() -> Path | None:
         return path if path.exists() and os.access(path, os.X_OK) else None
     candidates = [
         Path.home() / "cc-workspace/bin/cc-worker",
-        Path("~/cc-workspace/bin/cc-worker").expanduser(),
     ]
     for candidate in candidates:
         if candidate and candidate.exists() and os.access(candidate, os.X_OK):
@@ -668,7 +770,11 @@ def _cc_worker_cli() -> Path | None:
 
 
 def _codex_cli() -> Path | None:
-    configured = os.environ.get("BABATA_CODEX_REVIEW_CLI") or os.environ.get("BABATA_CODEX_CLI_PATH") or os.environ.get("CODEX_CLI_PATH")
+    configured = env_cli_path(
+        "BABATA_CODEX_REVIEW_CLI",
+        "BABATA_CODEX_CLI_PATH",
+        "CODEX_CLI_PATH",
+    )
     if configured:
         path = Path(configured).expanduser()
         return path if path.exists() and os.access(path, os.X_OK) else None
@@ -737,7 +843,41 @@ def _review_infra_failure(reviewer: str, message: str, round_index: int) -> dict
             findings=[{"severity": "high", "rule": "review-infra", "message": message}],
             round_index=round_index,
         )
-    return _result("passed", reviewer=reviewer, reason=message, round_index=round_index)
+    return _result("skipped", reviewer=reviewer, reason=message, round_index=round_index)
+
+
+def _looks_like_counterpart_infra_failure(output: str) -> bool:
+    text = output.lower()
+    markers = (
+        "invalid api key",
+        "incorrect api key",
+        "api_error_status\": 401",
+        "api_error_status': 401",
+        "authentication failed",
+        "unauthorized",
+        "fix external api key",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _counterpart_infra_failure_message(output: str, fallback: str) -> str:
+    data = _extract_json_object(output)
+    candidates: list[Any] = []
+    if isinstance(data, dict):
+        worker = data.get("worker")
+        if isinstance(worker, dict):
+            candidates.append(worker.get("last_error"))
+        turn = data.get("initial_turn") or data.get("turn")
+        if isinstance(turn, dict):
+            candidates.append(turn.get("text"))
+            parsed = turn.get("parsed")
+            if isinstance(parsed, dict):
+                candidates.append(parsed.get("result"))
+    candidates.append(output)
+    for candidate in candidates:
+        if isinstance(candidate, str) and _looks_like_counterpart_infra_failure(candidate):
+            return _trim(f"counterpart reviewer infrastructure unavailable: {candidate}", _MAX_FINDING_TEXT)
+    return _trim(f"counterpart reviewer infrastructure unavailable: {fallback}", _MAX_FINDING_TEXT)
 
 
 def _force_review_failure(result: dict[str, Any], rule: str, message: str) -> None:

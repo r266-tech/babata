@@ -9,60 +9,74 @@ import time
 from pathlib import Path
 from typing import Any
 
+from cli_runtime import env_cli_path
+from blocking_review import counterpart_review_enabled
+
 
 _CACHE: tuple[float, dict[str, Any]] | None = None
 
 
-def review_health_snapshot(*, force: bool = False) -> dict[str, Any]:
+def review_health_snapshot(*, force: bool = False, probe: bool = True) -> dict[str, Any]:
     ttl = _cache_ttl_seconds()
     now = time.time()
     global _CACHE
     if not force and _CACHE is not None and now - _CACHE[0] < ttl:
         return _CACHE[1]
-    snapshot = _compute_snapshot()
-    _CACHE = (now, snapshot)
+    snapshot = _compute_snapshot(probe=probe)
+    if probe:
+        _CACHE = (now, snapshot)
     return snapshot
 
 
-def review_health_status() -> str:
-    snapshot = review_health_snapshot()
-    return str(snapshot.get("status") or "unknown")
-
-
-def _compute_snapshot() -> dict[str, Any]:
+def _compute_snapshot(*, probe: bool = True) -> dict[str, Any]:
     enabled = os.environ.get("BABATA_BLOCKING_REVIEW", "1") != "0"
-    counterpart_enabled = _counterpart_enabled()
-    strict = os.environ.get("BABATA_BLOCKING_REVIEW_INFRA_STRICT", "0") == "1"
-    probes = {
-        "cc_worker": _probe_cc_worker(),
-        "codex": _probe_codex(),
+    counterpart_enabled = counterpart_review_enabled()
+    configured_review_cpu = os.environ.get("BABATA_BLOCKING_REVIEW_CPU", "codex").strip().lower() or "codex"
+    supported_review_cpus = {
+        "codex", "claude", "cc", "claude-code", "counterpart", "opposite",
     }
-    ok = all(item.get("ok") for item in probes.values())
+    review_cpu = configured_review_cpu if configured_review_cpu in supported_review_cpus else "codex"
+    strict = os.environ.get("BABATA_BLOCKING_REVIEW_INFRA_STRICT", "0") == "1"
     if not enabled:
         status = "disabled"
+        probes = {}
+    elif os.environ.get("BABATA_BLOCKING_REVIEW_CMD"):
+        # Never execute a user-supplied reviewer as a health probe.
+        status = "custom-command-not-checked"
+        probes = {}
     elif not counterpart_enabled:
         status = "deterministic-only"
-    elif ok:
-        status = "ok"
-    elif strict:
-        status = "block"
+        probes = {}
+    elif not probe:
+        status = "not-checked"
+        probes = {}
     else:
-        status = "degraded"
+        if review_cpu in {"codex"}:
+            probes = {"codex": _probe_codex()}
+        elif review_cpu in {"claude", "cc", "claude-code"}:
+            probes = {"cc_worker": _probe_cc_worker()}
+        elif review_cpu in {"counterpart", "opposite"}:
+            probes = {"cc_worker": _probe_cc_worker(), "codex": _probe_codex()}
+        else:  # normalized values above make this unreachable; keep fail-safe.
+            probes = {"codex": _probe_codex()}
+        ok = all(item.get("ok") for item in probes.values())
+        if ok:
+            status = "ok"
+        elif strict:
+            status = "block"
+        else:
+            status = "degraded"
     return {
         "status": status,
         "enabled": enabled,
         "counterpart_enabled": counterpart_enabled,
+        "custom_command_configured": bool(os.environ.get("BABATA_BLOCKING_REVIEW_CMD")),
+        "review_cpu": review_cpu,
+        "configured_review_cpu": configured_review_cpu,
         "strict": strict,
         "probes": probes,
         "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-
-
-def _counterpart_enabled() -> bool:
-    mode = os.environ.get("BABATA_BLOCKING_REVIEW_AGENT", "counterpart").strip().lower()
-    if mode in {"0", "off", "false", "disabled", "none", "deterministic"}:
-        return False
-    return os.environ.get("BABATA_BLOCKING_REVIEW_COUNTERPART", "1") != "0"
 
 
 def _probe_cc_worker() -> dict[str, Any]:
@@ -124,7 +138,6 @@ def _cc_worker_cli() -> Path | None:
         return path if path.exists() and os.access(path, os.X_OK) else None
     candidates = [
         Path.home() / "cc-workspace/bin/cc-worker",
-        Path("~/cc-workspace/bin/cc-worker").expanduser(),
     ]
     for candidate in candidates:
         if candidate and candidate.exists() and os.access(candidate, os.X_OK):
@@ -134,10 +147,10 @@ def _cc_worker_cli() -> Path | None:
 
 
 def _codex_cli() -> Path | None:
-    configured = (
-        os.environ.get("BABATA_CODEX_REVIEW_CLI")
-        or os.environ.get("BABATA_CODEX_CLI_PATH")
-        or os.environ.get("CODEX_CLI_PATH")
+    configured = env_cli_path(
+        "BABATA_CODEX_REVIEW_CLI",
+        "BABATA_CODEX_CLI_PATH",
+        "CODEX_CLI_PATH",
     )
     if configured:
         path = Path(configured).expanduser()

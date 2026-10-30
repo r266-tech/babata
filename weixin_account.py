@@ -7,6 +7,7 @@ Layout (override with BABATA_WEIXIN_DIR env var):
         ├── {accountId}.json                          # {token, baseUrl, userId, savedAt}
         ├── {accountId}.sync.json                     # {get_updates_buf}
         ├── {accountId}.context-tokens.json           # {userId: contextToken, ...}
+        ├── {accountId}.quotes.json                   # {messageId: body} recent, for svr_id quotes
         └── {accountId}.allow.json                    # {version, allowFrom: [userId, ...]}
 
 Mirrors the openclaw-weixin plugin layout 1:1. New installs root it under
@@ -67,10 +68,10 @@ def register_account(account_id: str) -> None:
         _write_json(_root() / "accounts.json", ids)
 
 
-def unregister_account(account_id: str) -> None:
+def _unregister_account(account_id: str) -> None:
     ids = [i for i in list_account_ids() if i != account_id]
     _write_json(_root() / "accounts.json", ids)
-    for suffix in (".json", ".sync.json", ".context-tokens.json", ".allow.json"):
+    for suffix in (".json", ".sync.json", ".context-tokens.json", ".allow.json", ".quotes.json"):
         _account_path(account_id, suffix).unlink(missing_ok=True)
 
 
@@ -115,7 +116,7 @@ def load_sync_buf(account_id: str) -> str:
 # ── context tokens (per-peer, required for outbound reply) ───────────
 
 
-def load_context_tokens(account_id: str) -> dict[str, str]:
+def _load_context_tokens(account_id: str) -> dict[str, str]:
     data = _read_json(_account_path(account_id, ".context-tokens.json"), {})
     return data if isinstance(data, dict) else {}
 
@@ -123,7 +124,7 @@ def load_context_tokens(account_id: str) -> dict[str, str]:
 def set_context_token(account_id: str, user_id: str, ctx_token: str | None) -> None:
     if not user_id:
         return
-    tokens = load_context_tokens(account_id)
+    tokens = _load_context_tokens(account_id)
     if ctx_token:
         tokens[user_id] = ctx_token
     else:
@@ -132,11 +133,42 @@ def set_context_token(account_id: str, user_id: str, ctx_token: str | None) -> N
 
 
 def get_context_token(account_id: str, user_id: str) -> str | None:
-    return load_context_tokens(account_id).get(user_id)
+    return _load_context_tokens(account_id).get(user_id)
 
 
-def clear_context_tokens(account_id: str) -> None:
-    _account_path(account_id, ".context-tokens.json").unlink(missing_ok=True)
+def reply_quota_path(account_id: str) -> Path:
+    """Where WeixinClient keeps per-message send counts and the queued sends."""
+    path = _account_path(account_id, ".reply-quota.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+# ── quote cache (newer clients quote by svr_id only) ─────────────────
+
+_QUOTE_KEEP = 1000
+_QUOTE_BODY_MAX = 2000
+
+
+def remember_message(account_id: str, message_id: Any, body: str) -> None:
+    """Keep recent message bodies so an ID-only quote can be resolved."""
+    if not account_id or message_id in (None, "") or not body:
+        return
+    path = _account_path(account_id, ".quotes.json")
+    quotes = _read_json(path, {})
+    if not isinstance(quotes, dict):
+        quotes = {}
+    quotes.pop(str(message_id), None)
+    quotes[str(message_id)] = body[:_QUOTE_BODY_MAX]
+    while len(quotes) > _QUOTE_KEEP:
+        quotes.pop(next(iter(quotes)))
+    _write_json(path, quotes)
+
+
+def recall_message(account_id: str, message_id: Any) -> str | None:
+    if not account_id or message_id in (None, ""):
+        return None
+    quotes = _read_json(_account_path(account_id, ".quotes.json"), {})
+    return quotes.get(str(message_id)) if isinstance(quotes, dict) else None
 
 
 # ── allowFrom (per-account authz) ────────────────────────────────────
@@ -199,7 +231,7 @@ def clear_stale_for_user(keeping_account_id: str, user_id: str) -> list[str]:
             continue
         meta = load_account(aid)
         if meta and meta.get("userId") == user_id:
-            unregister_account(aid)
+            _unregister_account(aid)
             removed.append(aid)
             log.info("cleared stale account %s (userId=%s)", aid, user_id)
     return removed

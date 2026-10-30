@@ -240,16 +240,20 @@ EOF
     <key>StandardOutPath</key><string>$HOME/babata.log</string>
     <key>StandardErrorPath</key><string>$HOME/babata.log</string>
     <key>EnvironmentVariables</key>
-    <dict><key>PATH</key><string>$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+    <dict><key>PATH</key><string>$HOME/.grok/bin:$HOME/cc-workspace/bin:$HOME/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.npm-global/bin:/Applications/Codex.app/Contents/Resources</string></dict>
 </dict>
 </plist>
 PLISTEOF
-        # 已 load 的先 bootout (idempotent), 再 bootstrap. 旧 launchctl 用 load fallback.
-        launchctl bootout "gui/$UID/com.babata" 2>/dev/null || true
-        if launchctl bootstrap "gui/$UID" "$PLIST" 2>/dev/null; then
-            SVC_OK=1
-        elif launchctl load -w "$PLIST" 2>/dev/null; then
-            SVC_OK=1
+        # Service mutation must go through scripts/self-ops.sh (detached, idle-safe).
+        SELF_OPS="$REPO_DIR/scripts/self-ops.sh"
+        if [[ -x "$SELF_OPS" ]]; then
+            # DELAY=0 for install path: no active turn to protect yet.
+            if DELAY=0 RESTART_IDLE_WAIT_SECONDS=0 \
+                "$SELF_OPS" reload-plist com.babata "$PLIST"; then
+                SVC_OK=1
+            fi
+        else
+            echo "⚠️  self-ops helper missing or not executable: $SELF_OPS"
         fi
 
         # auto-update plist — StartInterval=3600 → 每小时跑 auto-update.sh
@@ -272,17 +276,18 @@ PLISTEOF
 </dict>
 </plist>
 UPLISTEOF
-        launchctl bootout "gui/$UID/com.babata.update" 2>/dev/null || true
-        launchctl bootstrap "gui/$UID" "$UPDATE_PLIST" 2>/dev/null || \
-          launchctl load -w "$UPDATE_PLIST" 2>/dev/null || true
+        if [[ -x "$SELF_OPS" ]]; then
+            DELAY=0 RESTART_IDLE_WAIT_SECONDS=0 \
+                "$SELF_OPS" reload-plist com.babata.update "$UPDATE_PLIST" || true
+        fi
 
         if [[ $SVC_OK -eq 1 ]]; then
             cat <<EOF
 ── Install done. Bot 后台常驻已启动 (launchd). ──────
   - 看 log:      tail -f ~/babata.log
   - 状态:        launchctl print gui/\$UID/com.babata | head -20
-  - 停:          launchctl bootout gui/\$UID/com.babata
-  - 重启:        launchctl kickstart -k gui/\$UID/com.babata
+  - 重装 plist:  bash $REPO_DIR/scripts/self-ops.sh reload-plist com.babata
+  - 重启:        bash $REPO_DIR/scripts/self-ops.sh restart com.babata
   - 自动更新:    每小时 git pull + uv sync (logs/auto-update.log)
 
 EOF

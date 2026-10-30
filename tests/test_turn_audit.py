@@ -1,8 +1,13 @@
+import asyncio
 import json
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+from claude_agent_sdk.types import ToolPermissionContext
+
+import cc
 import turn_audit
 from cc import Response
 
@@ -54,7 +59,7 @@ def test_turn_audit_records_ledger_guards_checks_and_review_bus(monkeypatch, tmp
     )
     assert turn is not None
 
-    (repo / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-testsecret0000000000000000\n")
+    (repo / ".env").write_text("ANTHROPIC_API_KEY=fixture_test_value\n")
 
     summary = turn_audit.finish_turn(
         turn,
@@ -78,6 +83,106 @@ def test_turn_audit_records_ledger_guards_checks_and_review_bus(monkeypatch, tmp
     assert review_rows[0]["source_cpu"] == "codex"
 
 
+def test_turn_audit_hashes_prompt_and_final_without_raw_previews(monkeypatch, tmp_path):
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("BABATA_TURN_LEDGER", "1")
+    monkeypatch.setenv("BABATA_AUDIT_DIR", str(audit_dir))
+    monkeypatch.setenv("BABATA_REVIEW_BUS", "off")
+    long_prompt = "prompt-" + ("p" * 400) + "-PROMPT-TAIL"
+    long_final = "answer-" + ("a" * 500) + "-FINAL-TAIL"
+
+    turn = turn_audit.begin_turn(
+        cpu="codex",
+        channel="test",
+        prompt=long_prompt,
+        session_id_before=None,
+        cwd=tmp_path,
+    )
+    assert turn is not None
+    summary = turn_audit.finish_turn(
+        turn,
+        response=Response(content=long_final, session_id="sid-1", cost=0.0),
+    )
+
+    assert summary is not None
+    raw = (audit_dir / "babata-turn-ledger.jsonl").read_text(encoding="utf-8")
+    assert long_prompt not in raw
+    assert long_final not in raw
+    assert "prompt-" not in raw
+    assert "answer-" not in raw
+    assert "PROMPT-TAIL" not in raw
+    assert "FINAL-TAIL" not in raw
+    begin, finish = _jsonl(audit_dir / "babata-turn-ledger.jsonl")
+    assert "prompt_preview" not in begin
+    assert "final_preview" not in finish
+    assert begin["prompt_sha256"] == turn_audit._sha256_text(long_prompt)
+    assert begin["prompt_bytes"] == len(long_prompt.encode("utf-8"))
+    assert finish["final_sha256"] == turn_audit._sha256_text(long_final)
+    assert finish["final_bytes"] == len(long_final.encode("utf-8"))
+
+
+def test_turn_audit_caps_error_message(monkeypatch, tmp_path):
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("BABATA_TURN_LEDGER", "1")
+    monkeypatch.setenv("BABATA_AUDIT_DIR", str(audit_dir))
+    monkeypatch.setenv("BABATA_REVIEW_BUS", "off")
+    error_message = "error-" + ("e" * 500) + "-ERROR-TAIL"
+
+    turn = turn_audit.begin_turn(
+        cpu="codex",
+        channel="test",
+        prompt="short",
+        session_id_before=None,
+        cwd=tmp_path,
+    )
+    summary = turn_audit.finish_turn(turn, error=RuntimeError(error_message))
+
+    assert summary is not None
+    raw = (audit_dir / "babata-turn-ledger.jsonl").read_text(encoding="utf-8")
+    assert "ERROR-TAIL" not in raw
+    finish = _jsonl(audit_dir / "babata-turn-ledger.jsonl")[-1]
+    assert finish["error"]["type"] == "RuntimeError"
+    assert finish["error"]["message_preview"].endswith("...")
+    assert len(finish["error"]["message_preview"]) <= turn_audit._MAX_ERROR_PREVIEW + 3
+    assert finish["error"]["message_sha256"] == turn_audit._sha256_text(error_message)
+    assert finish["error"]["message_bytes"] == len(error_message.encode("utf-8"))
+
+
+def test_turn_audit_caps_tool_command(monkeypatch, tmp_path):
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv("BABATA_TURN_LEDGER", "1")
+    monkeypatch.setenv("BABATA_AUDIT_DIR", str(audit_dir))
+    monkeypatch.setenv("BABATA_REVIEW_BUS", "off")
+    command = "python3 -c " + ("'print(1); " * 80) + "COMMAND-TAIL"
+
+    summary = turn_audit.summarize_tool_use("Bash", {"command": command})
+    assert "COMMAND-TAIL" not in summary["command"]
+    assert summary["command_sha256"] == turn_audit._sha256_text(command)
+    assert summary["command_bytes"] == len(command.encode("utf-8"))
+
+    turn = turn_audit.begin_turn(
+        cpu="codex",
+        channel="test",
+        prompt="short",
+        session_id_before=None,
+        cwd=tmp_path,
+    )
+    result = turn_audit.finish_turn(
+        turn,
+        response=Response(content="done", session_id="sid-1", cost=0.0),
+        tool_uses=[{"name": "Bash", "command": command}],
+    )
+
+    assert result is not None
+    raw = (audit_dir / "babata-turn-ledger.jsonl").read_text(encoding="utf-8")
+    assert "COMMAND-TAIL" not in raw
+    tool = _jsonl(audit_dir / "babata-turn-ledger.jsonl")[-1]["tool_uses"][0]
+    assert tool["command"].endswith("...")
+    assert len(tool["command"]) <= turn_audit._MAX_COMMAND_PREVIEW + 3
+    assert tool["command_sha256"] == turn_audit._sha256_text(command)
+    assert tool["command_bytes"] == len(command.encode("utf-8"))
+
+
 def test_permission_guard_can_enforce_dangerous_commands(monkeypatch):
     monkeypatch.setenv("BABATA_DETERMINISTIC_GUARDS", "enforce")
     block, reason = turn_audit.should_block_for_permission(
@@ -87,6 +192,17 @@ def test_permission_guard_can_enforce_dangerous_commands(monkeypatch):
     assert block is True
     assert reason and "dangerous-git-command" in reason
 
+    result = asyncio.run(
+        cc._always_allow(
+            "Bash",
+            {"command": "git reset --hard HEAD"},
+            ToolPermissionContext(),
+        )
+    )
+
+    assert result.behavior == "deny"
+    assert "dangerous-git-command" in result.message
+
 
 def test_permission_guard_can_enforce_secret_file_writes(monkeypatch):
     monkeypatch.setenv("BABATA_DETERMINISTIC_GUARDS", "enforce")
@@ -94,11 +210,104 @@ def test_permission_guard_can_enforce_secret_file_writes(monkeypatch):
         "Write",
         {
             "file_path": ".env",
-            "content": "ANTHROPIC_API_KEY=sk-ant-testsecret0000000000000000",
+            "content": "ANTHROPIC_API_KEY=fixture_test_value",
         },
     )
     assert block is True
     assert reason and "env-file-tool-request" in reason
+
+
+def test_deterministic_guards_combine_file_and_tool_findings(monkeypatch, tmp_path):
+    monkeypatch.setenv("BABATA_DETERMINISTIC_GUARDS", "observe")
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=fixture_test_value\n")
+
+    findings = turn_audit.run_deterministic_guards(
+        repo_root=tmp_path,
+        changed_files=[".env"],
+        tool_uses=[
+            {
+                "name": "Bash",
+                "command": "rm -rf /tmp/babata-state/memory",
+            }
+        ],
+    )
+
+    rules = {finding["rule"] for finding in findings}
+    assert {
+        "env-file-changed",
+        "secret-pattern:secret_assignment",
+        "destructive-memory-command",
+    } <= rules
+
+
+def test_tool_guards_keep_path_content_command_and_self_ops_rules(monkeypatch):
+    monkeypatch.setenv("BABATA_DETERMINISTIC_GUARDS", "observe")
+
+    findings = turn_audit.run_deterministic_guards(
+        repo_root=None,
+        changed_files=[],
+        tool_uses=[
+            {
+                "name": "Write",
+                "file_path": ".env.local",
+                "content_has_secret": True,
+                "content_has_launchctl": True,
+            },
+            {
+                "name": "Write",
+                "file_path": "scripts/self-ops.sh",
+                "content_has_launchctl": True,
+            },
+            {
+                "name": "Bash",
+                "command": "git clean -fd",
+            },
+        ],
+    )
+
+    rules = {finding["rule"] for finding in findings}
+    assert {
+        "env-file-tool-request",
+        "secret-pattern:tool-input",
+        "inline-launchctl-tool-input",
+        "ops-boundary-tool-request",
+        "dangerous-git-command",
+    } <= rules
+    self_ops_inline = [
+        finding
+        for finding in findings
+        if finding["rule"] == "inline-launchctl-tool-input"
+        and finding.get("path") == "scripts/self-ops.sh"
+    ]
+    assert self_ops_inline == []
+
+
+def test_command_guard_allows_read_only_search_for_launchd_examples():
+    needle = "launch" + "ctl " + "kick" + "start"
+
+    assert turn_audit._tool_command_guard_findings(f"rg -n '{needle}' tests") == []
+    assert turn_audit._tool_command_guard_findings(f"grep -R '{needle}' .") == []
+
+
+def test_command_guard_still_blocks_launchd_mutation_after_search():
+    mutation = " ".join(("launch" + "ctl", "kick" + "start", "-k", "gui/501/example"))
+    findings = turn_audit._tool_command_guard_findings(f"rg needle .; {mutation}")
+
+    assert {finding["rule"] for finding in findings} == {"inline-launchctl-command"}
+
+    substituted = turn_audit._tool_command_guard_findings(f"rg needle $({mutation})")
+    assert {finding["rule"] for finding in substituted} == {"inline-launchctl-command"}
+
+    chained = turn_audit._tool_command_guard_findings(f"rg needle .\n{mutation}")
+    assert {finding["rule"] for finding in chained} == {"inline-launchctl-command"}
+
+
+@pytest.mark.parametrize("flag", ["--pre", "--pre=sh", "--pre-glob", "--hostname-bin", "-z"])
+def test_command_guard_does_not_trust_search_that_runs_programs(flag):
+    needle = "launch" + "ctl " + "kick" + "start"
+    findings = turn_audit._tool_command_guard_findings(f"rg {flag} '{needle}' .")
+
+    assert {finding["rule"] for finding in findings} == {"inline-launchctl-command"}
 
 
 def test_declared_checks_skip_without_config(monkeypatch, tmp_path):
@@ -147,6 +356,38 @@ def test_declared_checks_skip_config_created_during_turn(monkeypatch, tmp_path):
     assert summary["declared_checks"] == [
         {"status": "skipped", "reason": "declared checks config changed during turn"}
     ]
+
+
+def test_declared_checks_report_item_errors_skips_and_failures(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    checks_dir = repo / ".babata"
+    checks_dir.mkdir()
+    fail_command = f"{sys.executable} -c 'import sys; print(\"bad\"); sys.exit(2)'"
+    (checks_dir / "checks.json").write_text(json.dumps({
+        "checks": [
+            "bad",
+            {"name": "missing-command"},
+            {"name": "docs-only", "command": "false", "when": ["docs"]},
+            {"name": "fail", "command": fail_command, "when": ["always"]},
+        ]
+    }))
+    monkeypatch.setenv("BABATA_DECLARED_CHECKS", "1")
+
+    results = turn_audit.run_declared_checks(
+        repo_root=repo,
+        changed_files=["script.py"],
+        guard_findings=[],
+    )
+
+    assert results[0] == {"status": "config_error", "index": 0, "error": "check must be an object"}
+    assert results[1] == {"name": "missing-command", "status": "config_error", "error": "command is required"}
+    assert results[2] == {"name": "docs-only", "status": "skipped", "reason": "when did not match"}
+    assert results[3]["name"] == "fail"
+    assert results[3]["status"] == "failed"
+    assert results[3]["exit_code"] == 2
+    assert "bad" in results[3]["output_tail"]
 
 
 def test_turn_audit_does_not_attribute_preexisting_dirty_files(monkeypatch, tmp_path):

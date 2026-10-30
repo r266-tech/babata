@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import re
-import shlex
 import shutil
 import signal
 import subprocess
@@ -18,14 +17,17 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
+
+sys.dont_write_bytecode = True
 
 from dotenv import load_dotenv
 
@@ -57,12 +59,12 @@ from telegram.ext import (
 
 from bridge import bridge
 from cc import Event, LiveSession, Response
+from cli_runtime import env_cli_path
 from engine import (
     VENV_PYTHON,
     engine_choices,
     engine_label,
     engine_name,
-    is_codex_engine,
     make_engine,
     normalize_engine,
     persist_engine,
@@ -70,6 +72,7 @@ from engine import (
 from media import image_to_base64, transcribe_voice, understand_video
 from review_health import review_health_snapshot
 from tg_transcript import install_bot_transcript, record_update, transcript_source
+from tg_tool_format import _TOOL_EMOJI, format_tool_status as _fmt_tool
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_USER = int(os.environ.get("ALLOWED_USER_ID", "0"))
@@ -126,7 +129,7 @@ _PROCESSED_MAX = 1000  # 滚动窗口
 
 def _write_runtime_status(event: str = "") -> None:
     try:
-        review_health = review_health_snapshot()
+        review_health = review_health_snapshot(probe=False)
         tmp = RUNTIME_STATUS_FILE.with_suffix(".json.partial")
         tmp.write_text(
             json.dumps(
@@ -180,6 +183,19 @@ class DeliveryReplaySummary:
     skipped_processed: int = 0
     malformed: int = 0
     failed: int = 0
+
+
+@dataclass(frozen=True)
+class PendingDeliveryRecord:
+    delivery_id: str
+    update_ids: tuple[int, ...]
+    chat_id: int
+    message_id: int
+    anchor_update_id: int
+    content: str
+    session_id: str
+    resume_note: str | None
+    generated_images: tuple[str, ...] = ()
 
 
 def _pending_replay_notice_lines(summary: PendingReplaySummary) -> list[str]:
@@ -242,6 +258,10 @@ def _load_pending_deliveries() -> dict[str, dict[str, Any]]:
 
 _pending_deliveries_lock = asyncio.Lock()
 _pending_delivery_records: dict[str, dict[str, Any]] = _load_pending_deliveries()
+_delivery_in_progress: set[str] = set()
+_delivery_retry_task: asyncio.Task[None] | None = None
+_DELIVERY_RETRY_INITIAL_S = 5.0
+_DELIVERY_RETRY_MAX_S = 300.0
 
 
 def _write_pending_deliveries_locked() -> None:
@@ -285,6 +305,7 @@ async def _record_pending_delivery(
         "content": resp.content,
         "resume_note": resp.resume_note,
         "session_id": resp.session_id,
+        "generated_images": list(resp.generated_images),
         "created_at": time.time(),
     }
     async with _pending_deliveries_lock:
@@ -416,11 +437,9 @@ async def _mark_processed(update_id: int | None) -> None:
 
 _TG_SOURCE_PROMPT = (
     "Source: Telegram. "
-    "Output Markdown (bot auto-converts to HTML subset: b/i/u/s/code/pre/a/blockquote). "
-    "Markdown headings/tables/hr unsupported. "
-    "iOS system font: prefer █/░ for progress bars; ▓ renders as noisy stipple. "
-    "New bubble: separate paragraphs with three newlines (\\n\\n\\n). "
-    "Max 4096 chars/message."
+    "Markdown -> TG HTML subset: b/i/u/s/code/pre/a/blockquote. "
+    "No headings/tables/hr. New bubble: \\n\\n\\n. "
+    "Max 4096."
 )
 
 def _tg_mcp_servers() -> dict[str, Any]:
@@ -439,6 +458,7 @@ def _make_tg_engine(target: str | None = None) -> LiveSession:
     return make_engine(
         state_file=SESSION_FILE,
         source_prompt=_TG_SOURCE_PROMPT,
+        memory_source="tg",
         mcp_servers=_tg_mcp_servers(),
         live=True,
         engine=target,
@@ -446,7 +466,7 @@ def _make_tg_engine(target: str | None = None) -> LiveSession:
 
 
 def _current_cpu_name() -> str:
-    name = getattr(cc, "_babata_engine_name", None)
+    name = cc.assistant_engine_name
     if isinstance(name, str) and name:
         return normalize_engine(name)
     return engine_name(SESSION_FILE)
@@ -466,7 +486,7 @@ def _bot_commands_for_cpu(cpu: str | None = None) -> list[tuple[str, str]]:
     if name == "claude":
         commands.insert(3, ("context", "Context usage breakdown"))
         commands.append(("provider", "切换 Anthropic 渠道"))
-    else:  # codex — cmd_provider line 3075 分支切 codex_accounts
+    elif name == "codex":
         commands.append(("provider", "切换 Codex 账号"))
     return commands
 
@@ -591,7 +611,7 @@ def _startup_restart_reason() -> str:
 
 
 async def _graceful_shutdown(app: "Application", reason: str) -> None:
-    """Wait for the live turn, notify V via TG, then exit."""
+    """Wait for the live turn, notify the TG user, then exit."""
     global _shutdown_requested
     if _shutdown_requested:
         log.warning("Second shutdown signal (%s), force exit", reason)
@@ -617,6 +637,11 @@ async def _graceful_shutdown(app: "Application", reason: str) -> None:
             log.warning("Pre-shutdown notice failed: %s", e)
 
     await _wait_inflight_drain()
+
+    if _delivery_retry_task is not None:
+        _delivery_retry_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _delivery_retry_task
 
     if _channel_worker is not None:
         try:
@@ -668,13 +693,15 @@ _HEARTBEAT_INTERVAL_S = 30
 async def _heartbeat_loop(app: "Application") -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     alerted = False
+    peer_alive = False  # a peer that was never alive this run is retired, not down
     is_primary = not INSTANCE
     while True:
         try:
             _HEARTBEAT_ME.touch()
             if is_primary and _HEARTBEAT_PEER.exists():
                 age = time.time() - _HEARTBEAT_PEER.stat().st_mtime
-                if age > _HEARTBEAT_STALE_S and not alerted and ALLOWED_USER:
+                peer_alive = peer_alive or age <= _HEARTBEAT_STALE_S
+                if age > _HEARTBEAT_STALE_S and peer_alive and not alerted and ALLOWED_USER:
                     try:
                         await app.bot.send_message(
                             ALLOWED_USER,
@@ -719,6 +746,8 @@ def _save_state() -> None:
         for key in _BOT_STATE_KEYS:
             if key in _state:
                 merged[key] = _state[key]
+            else:
+                merged.pop(key, None)
         _STATE_PATH.write_text(json.dumps(merged))
     except Exception:
         pass
@@ -749,6 +778,10 @@ _last_session_id: str | None = _state.get("last_session_id")
 # 4000 not 4096: leaves headroom for HTML entity expansion (`&` → `&amp;`)
 # and the (1/N) chunk indicator suffix added by `_split`.
 _MAX_TG = 4000
+_TG_INPUT_MAX_CHARS = int(os.environ.get("BABATA_TG_INPUT_MAX_CHARS", "12000"))
+_TG_INPUT_TRUNCATED_NOTE = "\n\n[Telegram input truncated]"
+_TG_INDICATOR_RESERVE = 10  # " (XX/XX)"
+_TG_FENCE_CLOSE = "\n```"
 
 # Stream edit throttle bases (seconds). adaptive backoff in `_handle_text_delta`
 # / `_handle_tool_event` doubles the interval on every flood-control failure
@@ -761,487 +794,93 @@ _MAX_EDIT_INTERVAL = 10.0
 # turn-end's `_deliver_response` send the rest as a fresh reply_text.
 _MAX_FLOOD_STRIKES = 3
 # A broken CPU stream is recoverable: reconnect the CPU and replay the active
-# V message before continuing later cut-ins. After this many immediate retries,
+# active user message before continuing later cut-ins. After this many immediate retries,
 # the turn remains unconsumed and queued, but later retries are logged as a
 # persistent fault instead of being treated as a consumed user update.
 _MAX_TURN_RECOVERY_ATTEMPTS = int(os.environ.get("BABATA_TURN_RECOVERY_ATTEMPTS", "2"))
 
-_TOOL_EMOJI = {
-    "Bash": "\U0001f4bb",           # 💻 terminal
-    "Read": "\U0001f4d6",           # 📖 book
-    "Write": "\u270d\ufe0f",        # ✍️ writing hand
-    "Edit": "\U0001f527",           # 🔧 patch
-    "MultiEdit": "\U0001f527",      # 🔧
-    "Glob": "\U0001f4c2",           # 📂 file match
-    "Grep": "\U0001f50d",           # 🔍 content search
-    "WebFetch": "\U0001f4c4",       # 📄 page fetch
-    "WebSearch": "\U0001f310",      # 🌐 web search
-    "Task": "\U0001f500",           # 🔀 delegate
-    "TodoWrite": "\u2705",          # ✅ (legacy SDK <=0.1.x; 0.2.x split into Task*)
-    "TaskCreate": "\u2705",         # ✅ task new (SDK 0.2.x)
-    "TaskUpdate": "\u2611\ufe0f",  # ☑️ task update
-    "TaskGet": "\U0001f4cb",        # 📋 task read
-    "TaskList": "\U0001f5c2\ufe0f",# 🗂️ task list
-    "NotebookEdit": "\U0001f4d3",   # 📓
-    "Skill": "\U0001f4da",          # 📚 skill library
-    "ToolSearch": "\U0001f9f0",     # 🧰 toolbox
-}
-
-_SENSITIVE_TOOL_ARG = re.compile(
-    r"(?:api[_-]?key|auth|bearer|credential|password|secret|token)",
-    re.IGNORECASE,
-)
-_SENSITIVE_VALUE = re.compile(
-    r"\b(?:sk|ghp|gho|github_pat|xox[baprs]?)-[A-Za-z0-9_\-]{8,}",
-    re.IGNORECASE,
+_RAW_TG_HTML_TAGS = (
+    "tg-spoiler", "strong", "strike", "code", "ins", "del",
+    "em", "b", "i", "s", "u",
 )
 
 
-def _compact_tool_text(value: Any, limit: int = 48) -> str:
-    text = " ".join(str(value).split())
-    if not text:
-        return ""
-    if _SENSITIVE_VALUE.search(text):
-        return "[secret]"
-    if len(text) > limit:
-        return text[: max(1, limit - 3)].rstrip() + "..."
+def _park_html_fragment(blocks: list[str], html_fragment: str) -> str:
+    blocks.append(html_fragment)
+    return f"\x00BLK{len(blocks) - 1}\x00"
+
+
+def _park_regex(
+    text: str,
+    blocks: list[str],
+    pattern: str,
+    render_html: Callable[[re.Match], str],
+    *,
+    flags: int = 0,
+) -> str:
+    def _save(m: re.Match) -> str:
+        return _park_html_fragment(blocks, render_html(m))
+    return re.sub(pattern, _save, text, flags=flags)
+
+
+def _park_fenced_code_blocks(text: str, blocks: list[str]) -> str:
+    def _render(m: re.Match) -> str:
+        lang = m.group(1) or ""
+        code = html.escape(m.group(2))
+        return (
+            f'<pre><code class="language-{lang}">{code}</code></pre>' if lang
+            else f"<pre>{code}</pre>"
+        )
+    return _park_regex(text, blocks, r"```(\w*)\n(.*?)```", _render, flags=re.DOTALL)
+
+
+def _park_raw_tg_html_tags(text: str, blocks: list[str]) -> str:
+    for raw_tag in _RAW_TG_HTML_TAGS:
+        text = _park_regex(
+            text,
+            blocks,
+            rf"<{raw_tag}>([^<]*)</{raw_tag}>",
+            lambda m, tag=raw_tag: f"<{tag}>{html.escape(m.group(1))}</{tag}>",
+        )
     return text
 
 
-def _tool_line(icon: str, label: str, detail: str = "") -> str:
-    detail = _compact_tool_text(detail, 72)
-    return f"{icon} {label} · {detail}" if detail else f"{icon} {label}"
+def _park_inline_code(text: str, blocks: list[str]) -> str:
+    return _park_regex(
+        text,
+        blocks,
+        r"`([^`\n]+)`",
+        lambda m: f"<code>{html.escape(m.group(1))}</code>",
+    )
 
 
-def _shell_label_icon(label: str) -> str:
-    return {
-        "Memory": "\U0001f9e0",  # 🧠
-        "Skill": "\U0001f4da",  # 📚
-        "Search": "\U0001f50d",  # 🔍
-        "Find": "\U0001f4c2",  # 📂
-        "List": "\U0001f4c2",  # 📂
-        "Read": "\U0001f4d6",  # 📖
-        "Smart-home": "\U0001f3e0",  # 🏠
-        "Time": "\U0001f551",  # 🕑
-        "Test": "\u2705",  # ✅
-        "Git": "\U0001f9fe",  # 🧾
-        "Launchd": "\U0001f680",  # 🚀
-        "Restart": "\U0001f501",  # 🔁
-        "Process": "\U0001f4cb",  # 📋
-    }.get(label, "\U0001f4bb")  # 💻
+def _blockquote_html(m: re.Match) -> str:
+    raw = m.group(0)
+    lines = [re.sub(r"^\s*>\s?", "", line) for line in raw.split("\n")]
+    inner = html.escape("\n".join(lines).strip())
+    return f"<blockquote>{inner}</blockquote>"
 
 
-def _tool_arg(inp: dict, *keys: str, limit: int = 48) -> str:
-    for key in keys:
-        if _SENSITIVE_TOOL_ARG.search(key):
-            continue
-        value = inp.get(key)
-        if value in (None, ""):
-            continue
-        if isinstance(value, (dict, list)):
-            try:
-                value = json.dumps(value, ensure_ascii=False, default=str)
-            except Exception:
-                value = str(value)
-        preview = _compact_tool_text(value, limit)
-        if preview:
-            return preview
-    return ""
+def _park_markdown_blocks_and_links(text: str, blocks: list[str]) -> str:
+    text = _park_regex(
+        text,
+        blocks,
+        r"(?m)^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$",
+        lambda m: f"<b>{html.escape(m.group(2).strip())}</b>",
+    )
+    text = _park_regex(text, blocks, r"(?m)(^[ \t]*>.*(?:\n[ \t]*>.*)*)", _blockquote_html)
+    return _park_regex(
+        text,
+        blocks,
+        r"\[([^\]\n]+)\]\(([^)\n]+)\)",
+        lambda m: f'<a href="{html.escape(m.group(2), quote=True)}">{html.escape(m.group(1))}</a>',
+    )
 
 
-def _codex_args(inp: dict) -> dict:
-    raw = inp.get("arguments")
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str) and raw.strip():
-        try:
-            parsed = json.loads(raw)
-        except Exception:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
-
-
-def _first_path_basename(text: str) -> str:
-    matches = re.findall(r"(?:~|/)[^\s'\"\]\)]+", text)
-    for match in matches:
-        name = Path(match).name
-        if name:
-            return name
-    return ""
-
-
-def _short_shell_path(value: str) -> str:
-    value = value.strip().strip("'\"").rstrip(",;")
-    if not value:
-        return ""
-    if not (value.startswith(("/", "~", ".")) or "/" in value):
-        return value
-    parts = [p for p in value.replace("\\ ", " ").split("/") if p and p != "."]
-    if not parts:
-        return value
-    if "skills-catalog" in parts:
-        idx = parts.index("skills-catalog")
-        tail = parts[idx + 1 :]
-        return "/".join(tail[-3:]) if tail else "skills-catalog"
-    if "cc-workspace" in parts:
-        idx = parts.index("cc-workspace")
-        tail = parts[idx:]
-        return "/".join(tail[:2]) if len(tail) > 1 else "cc-workspace"
-    if len(parts) >= 2 and parts[-1] in {"SKILL.md", "README.md"}:
-        return "/".join(parts[-2:])
-    return parts[-1]
-
-
-def _join_preview(items: list[str], limit: int = 6) -> str:
-    cleaned: list[str] = []
-    for item in items:
-        if item and item not in cleaned:
-            cleaned.append(item)
-    if not cleaned:
-        return ""
-    shown = cleaned[:limit]
-    suffix = "/..." if len(cleaned) > limit else ""
-    return "/".join(shown) + suffix
-
-
-def _split_shell_parts(command: str) -> list[str]:
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        parts = command.split()
-    return [p for p in parts if p and not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", p)]
-
-
-def _option_value(parts: list[str], option: str) -> str:
-    if option not in parts:
-        return ""
-    idx = parts.index(option)
-    return parts[idx + 1] if idx + 1 < len(parts) else ""
-
-
-def _memory_context_detail(command: str) -> str:
-    parts = _split_shell_parts(command)
-    profile = _option_value(parts, "--profile")
-    cpu = _option_value(parts, "--cpu")
-    source = _option_value(parts, "--source")
-    include_top = _option_value(parts, "--include-top")
-    profile_hint = {
-        "lite": "L0+daily-map",
-        "recent": "recent+L0",
-        "deep": "deep+L0",
-    }.get(profile, "")
-
-    detail = "inject"
-    if profile:
-        detail += f" {profile}"
-        if profile_hint:
-            detail += f" ({profile_hint})"
-    else:
-        detail += " context"
-    route = "/".join([p for p in (cpu, source) if p])
-    if route:
-        detail += f" · {route}"
-    if include_top:
-        detail += f" · top {include_top}"
-    return detail
-
-
-def _shell_find_detail(parts: list[str]) -> str:
-    roots: list[str] = []
-    patterns: list[str] = []
-    idx = 1
-    while idx < len(parts):
-        item = parts[idx]
-        if item in {"-name", "-iname", "-path", "-ipath"} and idx + 1 < len(parts):
-            pattern = parts[idx + 1].strip("*")
-            if pattern:
-                patterns.append(pattern)
-            idx += 2
-            continue
-        if item in {"-not", "!"}:
-            if idx + 2 < len(parts) and parts[idx + 1] in {"-name", "-iname", "-path", "-ipath"}:
-                idx += 3
-            else:
-                idx += 1
-            continue
-        if item.startswith("-") or item in {"(", ")", "!", "-o"}:
-            idx += 2 if item in {"-maxdepth", "-mindepth", "-type"} else 1
-            continue
-        if not item.startswith(("!", "(")):
-            roots.append(_short_shell_path(item))
-        idx += 1
-    root = ", ".join(roots[:2]) if roots else "files"
-    wanted = _join_preview(patterns)
-    return f"{root} · {wanted}" if wanted else root
-
-
-def _shell_rg_detail(parts: list[str]) -> str:
-    pattern = ""
-    roots: list[str] = []
-    skip_next = False
-    option_args = {"-g", "--glob", "-t", "--type", "-T", "--type-not", "-A", "-B", "-C", "-m", "--max-count"}
-    idx = 1
-    while idx < len(parts):
-        item = parts[idx]
-        if skip_next:
-            skip_next = False
-            idx += 1
-            continue
-        if item in {"-e", "--regexp"} and idx + 1 < len(parts):
-            pattern = pattern or parts[idx + 1]
-            idx += 2
-            continue
-        if item in option_args:
-            skip_next = True
-            idx += 1
-            continue
-        if item.startswith("-"):
-            idx += 1
-            continue
-        if not pattern:
-            pattern = item
-        else:
-            roots.append(_short_shell_path(item))
-        idx += 1
-    terms = _join_preview([p for p in re.split(r"\|+", pattern) if p], 4) or pattern
-    root = ", ".join(roots[:2])
-    if len(roots) > 2:
-        root += ", ..."
-    return f"{terms} in {root}" if root else terms
-
-
-def _shell_sed_detail(parts: list[str]) -> str:
-    line_range = ""
-    path = ""
-    idx = 1
-    while idx < len(parts):
-        item = parts[idx]
-        if item == "-n" and idx + 1 < len(parts):
-            line_range = parts[idx + 1].rstrip("p").replace(",", "-")
-            idx += 2
-            continue
-        if item.startswith("-"):
-            idx += 1
-            continue
-        if "/" in item or item.startswith((".", "~")):
-            path = _short_shell_path(item)
-        idx += 1
-    return f"{path}:{line_range}" if path and line_range else path or "stream"
-
-
-def _shell_ls_detail(parts: list[str]) -> str:
-    targets = [p for p in parts[1:] if not p.startswith("-")]
-    if not targets:
-        return "current dir"
-    labels = [_short_shell_path(p) for p in targets]
-    suffix = ", ..." if len(labels) > 2 else ""
-    return ", ".join(labels[:2]) + suffix
-
-
-def _shell_pytest_detail(parts: list[str]) -> str:
-    try:
-        idx = parts.index("pytest")
-    except ValueError:
-        return "pytest"
-    targets = [p for p in parts[idx + 1 :] if p and not p.startswith("-")]
-    if not targets:
-        return "all tests"
-    return ", ".join(_short_shell_path(p) for p in targets[:2])
-
-
-def _self_ops_restart_detail(command: str) -> str:
-    labels = re.findall(r"com\.babata(?:\.[A-Za-z0-9_-]+)?", command)
-    if not labels:
-        return "bot"
-    if len(labels) >= 3 and all(label.startswith("com.babata") for label in labels):
-        return "TG bots"
-    return ", ".join(labels[:2]) + (", ..." if len(labels) > 2 else "")
-
-
-def _launchctl_detail(parts: list[str], command: str) -> str:
-    action = parts[1] if len(parts) > 1 else "launchctl"
-    if "babata" in command:
-        return f"{action} babata labels"
-    label = next((p for p in parts[2:] if p.startswith("com.")), "")
-    return f"{action} {label}".strip()
-
-
-def _ps_detail(parts: list[str]) -> str:
-    if "-p" in parts:
-        idx = parts.index("-p")
-        if idx + 1 < len(parts):
-            pids = [p for p in parts[idx + 1].split(",") if p]
-            return f"{len(pids)} pids" if len(pids) > 1 else f"pid {pids[0]}"
-    return "processes"
-
-
-def _skill_name_from_text(text: str) -> str:
-    if "SKILL.md" not in text and "second-brain" not in text:
-        return ""
-    if "second-brain" in text:
-        return "second-brain"
-    parts = re.split(r"[\\/]+", text)
-    for idx, part in enumerate(parts):
-        if part == "SKILL.md" and idx > 0:
-            return parts[idx - 1]
-    return ""
-
-
-def _unwrap_shell_command(command: str) -> str:
-    command = _compact_tool_text(command, 4096)
-    if not command or command == "[secret]":
-        return command
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        return command
-    if len(parts) >= 3 and Path(parts[0]).name in {"bash", "sh", "zsh"} and parts[1] in {"-c", "-lc"}:
-        return parts[2]
-    return command
-
-
-def _shell_summary(command: str) -> tuple[str, str]:
-    command = _unwrap_shell_command(command)
-    if not command or command == "[secret]":
-        return "Shell", command
-
-    if "babata-memory-context" in command or "memory-inject.sh" in command:
-        return "Memory", _memory_context_detail(command)
-    if "babata-memory-reflex" in command:
-        return "Memory", "reflex"
-    if "self-ops.sh" in command and "restart" in command:
-        return "Restart", _self_ops_restart_detail(command)
-    if re.search(r"\blaunchctl\s+", command):
-        segment = command[command.find("launchctl") :]
-        segment = re.split(r"[|;]", segment, maxsplit=1)[0]
-        return "Launchd", _launchctl_detail(_split_shell_parts(segment), command)
-    if re.search(r"\bps\s+", command):
-        segment = command[command.find("ps") :]
-        segment = re.split(r"[|;]", segment, maxsplit=1)[0]
-        return "Process", _ps_detail(_split_shell_parts(segment))
-
-    skill_name = _skill_name_from_text(command)
-    if skill_name and "SKILL.md" in command:
-        return "Skill", skill_name
-
-    if "second-brain" in command:
-        try:
-            parts = shlex.split(command)
-        except ValueError:
-            parts = command.split()
-        action = next((Path(p).name for p in parts if p.startswith("-") is False and Path(p).name != "second-brain"), "")
-        if "append-diary" in parts:
-            action = "append diary"
-        elif "read-diary" in parts:
-            action = "read diary"
-        elif "list-diaries" in parts:
-            action = "list diaries"
-        detail = "second-brain" + (f" {action}" if action else "")
-        return "Skill", detail
-
-    skill_name = _skill_name_from_text(command)
-    if skill_name:
-        return "Skill", skill_name
-
-    parts = _split_shell_parts(command)
-    if not parts:
-        return "Shell", ""
-    tool = Path(parts[0]).name
-    if tool == "find":
-        return "Find", _shell_find_detail(parts)
-    if tool == "rg":
-        return "Search", _shell_rg_detail(parts)
-    if tool == "sed":
-        return "Read", _shell_sed_detail(parts)
-    if tool == "ls":
-        return "List", _shell_ls_detail(parts)
-    if tool == "date":
-        return "Time", "now"
-    if tool in {"ha", "smart-home"}:
-        detail = " ".join(parts[1:4]).strip() or tool
-        return "Smart-home", detail
-    if tool == "launchctl":
-        return "Launchd", _launchctl_detail(parts, command)
-    if tool == "ps":
-        return "Process", _ps_detail(parts)
-    if tool == "git":
-        return "Git", " ".join(parts[1:3]).strip() or "git"
-    if tool == "pytest" or (tool in {"python", "python3"} and "-m" in parts and "pytest" in parts):
-        return "Test", _shell_pytest_detail(parts)
-    if tool in {"python", "python3", "uv", "npm", "pnpm", "yarn", "curl"}:
-        detail = " ".join([tool, *parts[1:3]]).strip()
-    else:
-        detail = tool
-    return "Shell", detail
-
-
-def _fmt_tool(name: str, inp: dict) -> str:
-    name = str(name or "")
-    inp = inp or {}
-    codex_args = _codex_args(inp)
-    merged = {**codex_args, **inp}
-    lowered = name.lower()
-
-    command = _tool_arg(merged, "command", "cmd", limit=4096)
-    if lowered in {"/bin/zsh", "/bin/bash", "/bin/sh"} or merged.get("type") == "command_execution":
-        label, detail = _shell_summary(command)
-        return _tool_line(_shell_label_icon(label), label, detail)
-
-    if "memory" in lowered or "session_search" in lowered or "ask_memory" in lowered:
-        detail = _tool_arg(merged, "query", "target", "action", "source")
-        return _tool_line("\U0001f9e0", "Memory", detail)
-
-    if lowered in {"task", "delegate_task", "spawn_agent"} or "subagent" in lowered or lowered.startswith("subagent."):
-        detail = _tool_arg(merged, "description", "goal", "task", "prompt", limit=56)
-        return _tool_line("\U0001f465", "Subagent", detail)
-
-    if lowered in {"websearch", "web_search", "search_query"} or "websearch" in lowered:
-        detail = _tool_arg(merged, "query", "q", "search_query")
-        return _tool_line("\U0001f310", "WebSearch", detail)
-
-    if lowered in {"webfetch", "web_fetch", "web_extract"}:
-        detail = _tool_arg(merged, "url", "urls")
-        return _tool_line("\U0001f310", "WebFetch", detail)
-
-    if lowered in {"skill", "skill_view", "skill_manage", "skills_list", "toolsearch", "tool_search"} or "skill" in lowered:
-        detail = _tool_arg(merged, "name", "skill", "query", "category")
-        return _tool_line("\U0001f4da", "Skill", detail)
-
-    if lowered.startswith("browser_") or lowered.startswith("chrome_") or lowered in {"open", "click", "screenshot"}:
-        detail = _tool_arg(merged, "url", "title", "selector", "ref", "path")
-        return _tool_line("\U0001f5b1\ufe0f", "Browser", detail)
-
-    if name.startswith("mcp__"):
-        parts = name.split("__", 2)
-        detail = f"{parts[1]}/{parts[2]}" if len(parts) >= 3 else name
-        return _tool_line("\U0001f9e9", "MCP", detail)
-
-    display = {
-        "Bash": "Shell",
-        "Read": "Read",
-        "Write": "Write",
-        "Edit": "Edit",
-        "MultiEdit": "Edit",
-        "Glob": "Files",
-        "Grep": "Search",
-        "TodoWrite": "Todo",
-        "TaskCreate": "Task+",
-        "TaskUpdate": "Task~",
-        "TaskGet": "Task?",
-        "TaskList": "Tasks",
-        "NotebookEdit": "Notebook",
-    }.get(name, name or "Tool")
-    emoji = _TOOL_EMOJI.get(name, "\U0001f9f0")
-
-    if name == "Bash" and command:
-        label, detail = _shell_summary(command)
-        return _tool_line(_shell_label_icon(label), label, detail)
-
-    detail = _tool_arg(merged, "file_path", "path", "pattern", "query", "q", "url", "text", "name")
-    if not detail:
-        detail = _first_path_basename(json.dumps(merged, ensure_ascii=False, default=str))
-    return _tool_line(emoji, display, detail)
+def _restore_html_fragments(text: str, blocks: list[str]) -> str:
+    for i, block in enumerate(blocks):
+        text = text.replace(f"\x00BLK{i}\x00", block)
+    return text
 
 
 def _to_html(md: str) -> str:
@@ -1264,77 +903,33 @@ def _to_html(md: str) -> str:
 
     blocks: list[str] = []
 
-    def _park(html_fragment: str) -> str:
-        blocks.append(html_fragment)
-        return f"\x00BLK{len(blocks) - 1}\x00"
-
-    # 1a. Fenced code blocks (first — highest precedence, opaque)
-    def _save_code(m: re.Match) -> str:
-        lang = m.group(1) or ""
-        code = html.escape(m.group(2))
-        return _park(
-            f'<pre><code class="language-{lang}">{code}</code></pre>' if lang
-            else f"<pre>{code}</pre>"
-        )
-    text = re.sub(r"```(\w*)\n(.*?)```", _save_code, md, flags=re.DOTALL)
+    text = _park_fenced_code_blocks(md, blocks)
 
     # 1b. Pre-existing TG-compatible HTML inline tags. CC may write them
     # directly (e.g. `<b>核心</b>` instead of `**核心**`); we park them so
     # later `html.escape` doesn't turn `<b>` into `&lt;b&gt;` (which TG
-    # would render as literal text — exactly the bug V hit 2026-05-06).
+    # would render as literal text — the 2026-05-06 regression).
     # Single-level only (no nested tag parsing) — adequate for chat.
     # Order matters: longer tag names first so `<strong>` matches before
     # the regex would otherwise try `<s>` on the same span.
     # Keep `u/ins/tg-spoiler` (no markdown equivalent) + add `b/strong/
     # i/em/s/strike/del/code` (have markdown equivalent but model may
     # emit raw HTML directly).
-    _RAW_TAGS = (
-        "tg-spoiler", "strong", "strike", "code", "ins", "del",
-        "em", "b", "i", "s", "u",
-    )
-    for _raw_tag in _RAW_TAGS:
-        def _make_raw_saver(t: str):
-            def _save(m: re.Match) -> str:
-                return _park(f"<{t}>{html.escape(m.group(1))}</{t}>")
-            return _save
-        text = re.sub(
-            rf"<{_raw_tag}>([^<]*)</{_raw_tag}>",
-            _make_raw_saver(_raw_tag),
-            text,
-        )
+    text = _park_raw_tg_html_tags(text, blocks)
 
     # 1c. Inline backtick code — PARK (not just replace) so later bold/italic
     # regexes can't reach the `**` or `*` inside. Without this, `\`**粗**\``
     # gets turned into <code>**粗**</code>, then bold regex chews through the
     # <code> tag and produces <code><b>粗</b></code> which breaks TG parsing
     # entirely and falls back to plain text.
-    def _save_inline_code(m: re.Match) -> str:
-        inner = html.escape(m.group(1))
-        return _park(f"<code>{inner}</code>")
-    text = re.sub(r"`([^`\n]+)`", _save_inline_code, text)
+    text = _park_inline_code(text, blocks)
 
     # 1c. Markdown headings `# / ## / ###...` — TG has no heading tag, degrade
     # to <b> on its own line. Single-line form: `^#+ whatever` until EOL.
-    def _save_heading(m: re.Match) -> str:
-        inner = html.escape(m.group(2).strip())
-        return _park(f"<b>{inner}</b>")
-    text = re.sub(r"(?m)^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$", _save_heading, text)
-
     # 1d. Blockquote: consecutive `> line` merged into one <blockquote>
-    def _save_bq(m: re.Match) -> str:
-        raw = m.group(0)
-        lines = [re.sub(r"^\s*>\s?", "", l) for l in raw.split("\n")]
-        inner = html.escape("\n".join(lines).strip())
-        return _park(f"<blockquote>{inner}</blockquote>")
-    text = re.sub(r"(?m)(^[ \t]*>.*(?:\n[ \t]*>.*)*)", _save_bq, text)
-
     # 1e. Markdown links [text](url). Escape both pieces so user-provided `<`
     # can't break the HTML. href gets quote-escape too for the attribute.
-    def _save_link(m: re.Match) -> str:
-        label = html.escape(m.group(1))
-        href = html.escape(m.group(2), quote=True)
-        return _park(f'<a href="{href}">{label}</a>')
-    text = re.sub(r"\[([^\]\n]+)\]\(([^)\n]+)\)", _save_link, text)
+    text = _park_markdown_blocks_and_links(text, blocks)
 
     # 2. Escape everything else
     text = html.escape(text)
@@ -1346,9 +941,7 @@ def _to_html(md: str) -> str:
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
 
     # 4. Restore placeholders (NUL + 'BLK' + digits survives html.escape intact)
-    for i, blk in enumerate(blocks):
-        text = text.replace(f"\x00BLK{i}\x00", blk)
-    return text.strip()
+    return _restore_html_fragments(text, blocks).strip()
 
 
 def _utf16_len(s: str) -> int:
@@ -1376,24 +969,101 @@ def _utf16_to_cp(s: str, budget: int) -> int:
     return lo
 
 
+def _tg_split_headroom(prefix: str) -> int:
+    headroom = (
+        _MAX_TG
+        - _TG_INDICATOR_RESERVE
+        - _utf16_len(prefix)
+        - _utf16_len(_TG_FENCE_CLOSE)
+    )
+    return headroom if headroom >= 1 else _MAX_TG // 2
+
+
+def _tg_initial_split_at(remaining: str, cp_limit: int) -> int:
+    region = remaining[:cp_limit]
+    split_at = region.rfind("\n")
+    if split_at < cp_limit // 2:
+        split_at = region.rfind(" ")
+    return split_at if split_at >= 1 else cp_limit
+
+
+def _tg_avoid_open_html_tag(remaining: str, split_at: int) -> int:
+    last_lt = remaining.rfind("<", 0, split_at)
+    last_gt = remaining.rfind(">", 0, split_at)
+    if last_lt > last_gt and last_lt >= 1:
+        return last_lt
+    return split_at
+
+
+def _tg_avoid_unpaired_inline_backtick(
+    remaining: str,
+    split_at: int,
+    cp_limit: int,
+) -> int:
+    candidate = remaining[:split_at]
+    bt_count = candidate.count("`") - candidate.count("\\`")
+    if bt_count % 2 == 0:
+        return split_at
+
+    last_bt = candidate.rfind("`")
+    while last_bt > 0 and candidate[last_bt - 1] == "\\":
+        last_bt = candidate.rfind("`", 0, last_bt)
+    if last_bt <= 0:
+        return split_at
+
+    safe_split = max(
+        candidate.rfind(" ", 0, last_bt),
+        candidate.rfind("\n", 0, last_bt),
+    )
+    return safe_split if safe_split > cp_limit // 4 else split_at
+
+
+def _tg_avoid_unclosed_html_pair(
+    remaining: str,
+    split_at: int,
+    cp_limit: int,
+) -> int:
+    candidate = remaining[:split_at]
+    # `<code` covers both `<code>` and `<code class="language-x">`.
+    for open_pattern, close_tag in (("<pre>", "</pre>"), ("<code", "</code>")):
+        if candidate.count(open_pattern) <= candidate.count(close_tag):
+            continue
+        pos = candidate.rfind(open_pattern)
+        if pos >= 1:
+            safe = max(candidate.rfind("\n", 0, pos), candidate.rfind(" ", 0, pos))
+            split_at = safe if safe > cp_limit // 4 else pos
+            candidate = remaining[:split_at]
+    return split_at
+
+
+def _tg_safe_split_at(remaining: str, cp_limit: int) -> int:
+    split_at = _tg_initial_split_at(remaining, cp_limit)
+    split_at = _tg_avoid_open_html_tag(remaining, split_at)
+    split_at = _tg_avoid_unpaired_inline_backtick(remaining, split_at, cp_limit)
+    return _tg_avoid_unclosed_html_pair(remaining, split_at, cp_limit)
+
+
+def _tg_next_carry_lang(chunk_body: str, carry_lang: str | None) -> str | None:
+    in_code = carry_lang is not None
+    lang = carry_lang or ""
+    for line in chunk_body.split("\n"):
+        stripped = line.strip()
+        if not stripped.startswith("```"):
+            continue
+        if in_code:
+            in_code = False
+            lang = ""
+        else:
+            in_code = True
+            tag = stripped[3:].strip()
+            lang = tag.split()[0] if tag else ""
+    return lang if in_code else None
+
+
 def _split(text: str) -> list[str]:
-    """Split long message at safe boundaries, UTF-16 aware.
-
-    Borrows hermes pattern (`gateway/platforms/base.py:truncate_message`):
-      - Measures length in UTF-16 (TG's wire unit, not codepoints)
-      - Closes/reopens ``` code blocks across chunks (`carry_lang`)
-      - Avoids splitting inside inline backtick spans (parity check)
-      - Appends `(1/N)` indicators when split
-
-    Single message ≤ 4096 wire units returns unchanged. The HTML produced by
-    `_to_html` survives this (block placeholders are already restored before
-    `_split` runs, so no html-aware logic needed here — only markdown fences).
-    """
+    """Split long plain TG messages at UTF-16-safe boundaries."""
     if _utf16_len(text) <= _MAX_TG:
         return [text]
-
-    INDICATOR_RESERVE = 10  # " (XX/XX)"
-    FENCE_CLOSE = "\n```"
 
     parts: list[str] = []
     remaining = text
@@ -1401,11 +1071,9 @@ def _split(text: str) -> list[str]:
 
     while remaining:
         prefix = f"```{carry_lang}\n" if carry_lang is not None else ""
-        headroom = _MAX_TG - INDICATOR_RESERVE - _utf16_len(prefix) - _utf16_len(FENCE_CLOSE)
-        if headroom < 1:
-            headroom = _MAX_TG // 2
+        headroom = _tg_split_headroom(prefix)
 
-        if _utf16_len(prefix) + _utf16_len(remaining) <= _MAX_TG - INDICATOR_RESERVE:
+        if _utf16_len(prefix) + _utf16_len(remaining) <= _MAX_TG - _TG_INDICATOR_RESERVE:
             parts.append(prefix + remaining)
             break
 
@@ -1417,86 +1085,15 @@ def _split(text: str) -> list[str]:
         # 4096 limit has slack vs our 4000 _MAX_TG). Codex round-1 caught.
         if cp_limit < 1:
             cp_limit = 1
-        region = remaining[:cp_limit]
-        split_at = region.rfind("\n")
-        if split_at < cp_limit // 2:
-            split_at = region.rfind(" ")
-        if split_at < 1:
-            split_at = cp_limit
-
-        # HTML attribute-space protection (round-2 follow-up): _to_html emits
-        # `<code class="language-python">` with spaces *inside* the opening
-        # tag. The space-rfind above can land at the space between `<code`
-        # and `class=`, producing a 5-char fragment '<code' followed by a
-        # malformed continuation. If split_at falls inside an unclosed
-        # `<...>` (last `<` after last `>` before split_at), back off to
-        # before that `<`.
-        last_lt = remaining.rfind("<", 0, split_at)
-        last_gt = remaining.rfind(">", 0, split_at)
-        if last_lt > last_gt and last_lt >= 1:
-            split_at = last_lt
-
-        # Inline backtick parity: don't split inside `code` (would orphan tick).
-        candidate = remaining[:split_at]
-        bt_count = candidate.count("`") - candidate.count("\\`")
-        if bt_count % 2 == 1:
-            last_bt = candidate.rfind("`")
-            while last_bt > 0 and candidate[last_bt - 1] == "\\":
-                last_bt = candidate.rfind("`", 0, last_bt)
-            if last_bt > 0:
-                safe_split = max(candidate.rfind(" ", 0, last_bt), candidate.rfind("\n", 0, last_bt))
-                if safe_split > cp_limit // 4:
-                    split_at = safe_split
-
-        # HTML <pre>/<code> tag pairing (Codex round-1 fix 4a, refined round-2):
-        # _to_html converts ``` fences to `<pre><code class="language-X">...</code></pre>`
-        # (with class attribute), and inline backticks to `<code>...</code>`.
-        # Naive split mid-tag → malformed HTML → TG plain-text fallback or 400.
-        # Back the split off to before any unclosed open tag.
-        #
-        # Open-tag matching uses the prefix `<code` (no `>`) to catch BOTH
-        # bare `<code>` AND class-attributed `<code class="...">` — Codex
-        # round-2 caught that bare `<code>` prefix missed the class form.
-        # `<pre>` has no class form in `_to_html`, so exact match suffices.
-        #
-        # Limitation: when the unclosed opener sits at offset 0 of the
-        # candidate, no backoff is possible (can't split below 0). The
-        # chunk emits malformed HTML and TG falls back to plain-text
-        # rendering — visually degraded, not a hard failure.
-        candidate = remaining[:split_at]
-        for open_pattern, close_tag in (("<pre>", "</pre>"), ("<code", "</code>")):
-            opens = candidate.count(open_pattern)
-            closes = candidate.count(close_tag)
-            if opens > closes:
-                pos = candidate.rfind(open_pattern)
-                if pos >= 1:
-                    safe = max(candidate.rfind("\n", 0, pos), candidate.rfind(" ", 0, pos))
-                    split_at = safe if safe > cp_limit // 4 else pos
-                    candidate = remaining[:split_at]
+        split_at = _tg_safe_split_at(remaining, cp_limit)
 
         chunk_body = remaining[:split_at]
         remaining = remaining[split_at:].lstrip("\n")
         full_chunk = prefix + chunk_body
 
-        # Walk chunk_body to determine whether we end mid-fence.
-        in_code = carry_lang is not None
-        lang = carry_lang or ""
-        for line in chunk_body.split("\n"):
-            stripped = line.strip()
-            if stripped.startswith("```"):
-                if in_code:
-                    in_code = False
-                    lang = ""
-                else:
-                    in_code = True
-                    tag = stripped[3:].strip()
-                    lang = tag.split()[0] if tag else ""
-
-        if in_code:
-            full_chunk += FENCE_CLOSE
-            carry_lang = lang
-        else:
-            carry_lang = None
+        carry_lang = _tg_next_carry_lang(chunk_body, carry_lang)
+        if carry_lang is not None:
+            full_chunk += _TG_FENCE_CLOSE
 
         parts.append(full_chunk)
 
@@ -1520,6 +1117,19 @@ def _format_bubble_parts(text: str) -> tuple[list[str], str | None]:
     if html_text and _utf16_len(html_text) <= _MAX_TG:
         return [html_text], "HTML"
     return _split(bubble), None
+
+
+def _plain_bubble_parts(text: str) -> list[str]:
+    return _split(text) or [text[:_MAX_TG]]
+
+
+def _pending_response_bubbles(content: str, streamed_count: int) -> tuple[list[str], bool]:
+    bubbles = re.split(r"\n{3,}", content)
+    while bubbles and not bubbles[-1].strip():
+        bubbles.pop()
+    while bubbles and not bubbles[0].strip():
+        bubbles.pop(0)
+    return bubbles[streamed_count:], bool(bubbles or streamed_count)
 
 
 def _parse_kwargs(parse_mode: str | None) -> dict[str, str]:
@@ -1555,15 +1165,26 @@ class Payload:
     update_id: int | None = None  # idempotency: turn end 时 _mark_processed
 
 
+@dataclass(frozen=True)
+class ReplyAnchor:
+    generation: int
+    payload: Payload
+    chat: Any
+    message: Any
+
+
+@dataclass(frozen=True)
+class TextBubbleSendResult:
+    sent_ok: bool
+    shipped_msgs: list[Any]
+
+
 def _format_coalesced_tg_prompt(payloads: list[Payload]) -> str:
     if len(payloads) <= 1:
-        return payloads[0].text if payloads else ""
+        return _truncate_tg_input(payloads[0].text) if payloads else ""
 
     blocks = [
-        "The user sent these follow-up Telegram messages while the previous "
-        "turn was running.",
-        "Treat them as one user turn, ordered oldest to newest. Later messages "
-        "may clarify or supersede earlier messages.",
+        "Multiple Telegram messages, oldest to newest.",
         "",
     ]
     for idx, payload in enumerate(payloads, start=1):
@@ -1578,7 +1199,23 @@ def _format_coalesced_tg_prompt(payloads: list[Payload]) -> str:
         text = payload.text.strip() or "[empty message]"
         blocks.append(f"<user_message {' '.join(meta)}>\n{text}\n</user_message>")
         blocks.append("")
-    return "\n".join(blocks).strip()
+    return _truncate_tg_input("\n".join(blocks).strip())
+
+
+def _truncate_tg_input(text: str) -> str:
+    limit = max(1, _TG_INPUT_MAX_CHARS)
+    if len(text) <= limit:
+        return text
+    keep = max(0, limit - len(_TG_INPUT_TRUNCATED_NOTE))
+    if keep <= 0:
+        return _TG_INPUT_TRUNCATED_NOTE[-limit:]
+    return text[:keep].rstrip() + _TG_INPUT_TRUNCATED_NOTE
+
+
+def _stream_display_text(text: str) -> str:
+    if len(text) <= _MAX_TG:
+        return text
+    return "…" + text[-(_MAX_TG - 1):]
 
 
 class _ReplayChat:
@@ -1637,7 +1274,7 @@ def _payload_from_pending_record(bot_obj: Any, record: dict[str, Any]) -> Payloa
         update_id = int(record["update_id"])
         chat_id = int(record["chat_id"])
         message_id = int(record["message_id"])
-        text = str(record["text"])
+        text = _truncate_tg_input(str(record["text"]))
     except (KeyError, TypeError, ValueError):
         return None
     images = record.get("images") or None
@@ -1696,14 +1333,14 @@ class ChannelWorker:
         # 每条 mark = (bot, chat_id, message_id). bot 用 Any 因为 PTB Bot 实例 (含 ctx.bot)
         self._pending_marks: list[tuple[Any, int, int]] = []
         # idempotency: 跟 _pending_marks / _active_marks 同步, turn_end 时
-        # _mark_processed all (per-V-msg 标 done, 多 V msg batch 一个 turn 全标).
+        # _mark_processed all (per-user-msg 标 done, 多 user msg batch 一个 turn 全标).
         self._pending_update_ids: list[int | None] = []
         self._active_update_ids: list[int | None] = []
         self._active_marks: list[tuple[Any, int, int]] = []
         self._reaction_tasks: set[asyncio.Task[None]] = set()
         # P2-A: 串行所有 reaction API 调用, 保证 schedule 顺序 = 执行顺序
         # (turn_end finally 先 schedule 👌 再触发 _begin_turn → 👀, lock FIFO
-        # 保证 V 看到的最终 reaction 是 👌 不是 👀).
+        # 保证用户看到的最终 reaction 是 👌 不是 👀).
         self._reaction_lock = asyncio.Lock()
         # P1-A/B: anchor generation token. submit / _begin_turn 切 anchor 时 +1;
         # _handle_text_delta / _handle_tool_event 在 await 边界检查, 变了就 abort
@@ -1711,15 +1348,15 @@ class ChannelWorker:
         self._anchor_generation: int = 0
         # 流式输出 reply 的 anchor — 跟 _turn_payload 解耦.
         # _turn_payload 是 SDK turn 边界 anchor (P1.4 promote 用); 一个 turn 可能
-        # 跨多条 V 消息. _active_reply_payload 是 V 视角的 "当前活跃消息" — 每条
-        # V message 进来都切到自己, 让流式输出和 tool 状态走新 reply, 不混到上
+        # 跨多条 user 消息. _active_reply_payload 是用户视角的 "当前活跃消息" — 每条
+        # user message 进来都切到自己, 让流式输出和 tool 状态走新 reply, 不混到上
         # 一条的 reply 上 (即使 SDK 把多条 batch 成一个 turn 也能保持 per-message
         # reply 体验).
         self._active_reply_payload: Payload | None = None
         self._turn_payload_batch: list[Payload] = []
-        # Cut-in 队列 (interrupt 模式): V 流式中再发 → SDK interrupt + append 到这.
+        # Cut-in 队列 (interrupt 模式): 用户流式中再发 → SDK interrupt + append 到这.
         # _handle_turn_end 末尾 pop 出来 _begin_turn 启动新 turn. submit() 不再
-        # 改 anchor 状态 (留给老 turn 自然收尾), V 看到的 in-flight 气泡保留.
+        # 改 anchor 状态 (留给老 turn 自然收尾), 用户看到的 in-flight 气泡保留.
         self._pending_payloads: list[Payload] = []
         # Recoverable CPU stream failures replay the active payload before
         # continuing pending cut-ins. This counter is per active user turn and
@@ -1730,7 +1367,7 @@ class ChannelWorker:
         # check epoch 没变才继续 — 防 fire-and-forget interrupt 因 race 打断错的
         # 后续 turn (例: A 自然完 → _begin_turn(B) → 老 interrupt 命中 B).
         self._turn_epoch: int = 0
-        # Codex round-4 P2 (dedupe): 同 epoch 内多 cut-in (V 连发 m2 m3 m4) 别
+        # Codex round-4 P2 (dedupe): 同 epoch 内多 cut-in (m2 m3 m4) 别
         # 重复 spawn interrupt — SDK round-trip 浪费 + log noise. epoch bump 后
         # 自然对不上, 重置.
         self._interrupt_spawned_epoch: int = -1
@@ -1784,15 +1421,15 @@ class ChannelWorker:
             # next SDK turn if the race between submit and turn_end leaves
             # _turn_payload unset.
             self._latest_payload = payload
-            # 消息状态: append + 立即 fire 👀 — V 视角"看到这条了". 切入消息也即时
+            # 消息状态: append + 立即 fire 👀 — 用户视角"看到这条了". 切入消息也即时
             # 拿到 ack, 不再等下个 _begin_turn (_begin_turn 不再 fire 👀, 只挪账).
             new_mark = (payload.ctx.bot, chat.id, msg.message_id)
             self._pending_marks.append(new_mark)
             self._pending_update_ids.append(payload.update_id)
             self._schedule_marks([new_mark], "👀")
             if self._turn_active:
-                # Cut-in (interrupt 模式 + R3 P0 fix): V 流式中再发. 保留老 turn
-                # 状态 — 已 ship 气泡 + in-flight 气泡都不动 (V 看见 A 半句留在 A
+                # Cut-in (interrupt 模式 + R3 P0 fix): 用户流式中再发. 保留老 turn
+                # 状态 — 已 ship 气泡 + in-flight 气泡都不动 (用户看见 A 半句留在 A
                 # 下面). interrupt 让 SDK 尽快收尾老 turn. **不**立即 session.submit(B)
                 # — B 留在 _pending_payloads, 等 A's turn_end → _begin_turn(B) 时才
                 # 入 SDK inbox. 否则 stale interrupt 可能命中 B (race) + SDK batch
@@ -1841,9 +1478,9 @@ class ChannelWorker:
             if self._turn_active:
                 await self._surface_error(RuntimeError("会话已切换。"))
             # P2-D: drop_pending — resume 后 inbox drain (LiveSession.resume_live
-            # 内部 _stop_client_locked 会 drain), pending V messages 永远不会被
+            # 内部 _stop_client_locked 会 drain), pending user messages 永远不会被
             # 处理, 不能让它们的 mark 被下次 _begin_turn promote.
-            # 💔: 让 V 看到这些 V msg 被中止, reaction 状态不卡 👀.
+            # 💔: 让用户看到这些 user msg 被中止, reaction 状态不卡 👀.
             self._reset_turn_state(
                 exit_inflight=True, drop_pending=True, fail_emoji="💔"
             )
@@ -1854,7 +1491,7 @@ class ChannelWorker:
         if self._turn_active:
             await self._surface_error(RuntimeError("会话已重置。"))
         # P2-D: 同 resume — /new drain 后 pending marks 失效.
-        # 💔: 标记这些 V msg 为"未完成" (区别于 turn_end 的 👌).
+        # 💔: 标记这些 user msg 为"未完成" (区别于 turn_end 的 👌).
         self._reset_turn_state(
             exit_inflight=True, drop_pending=True, fail_emoji="💔"
         )
@@ -1864,7 +1501,7 @@ class ChannelWorker:
         self._apply_accounting(resp)
 
     def _session_supports_hot_input(self) -> bool:
-        return bool(getattr(self.session, "supports_hot_input", True))
+        return bool(getattr(self.session, "supports_hot_input", False))
 
     def _coalesce_payloads_for_turn(self, payloads: list[Payload]) -> Payload:
         if len(payloads) <= 1:
@@ -1920,7 +1557,7 @@ class ChannelWorker:
         self._turn_epoch += 1
         self._active_reply_payload = payload  # 同步切 reply anchor
         # Codex round-1 P1: bridge anchor 跟 turn 走 — cut-in 不动, _begin_turn
-        # 时切到当前 turn 的 V msg, 让 mcp_send (cron 等) reply 到对的 message.
+        # 时切到当前 turn 的 user msg, 让 mcp_send (cron 等) reply 到对的 message.
         chat = payload.update.effective_chat
         if msg is not None and chat is not None:
             bridge.set_context(payload.ctx.bot, chat.id, msg.message_id)
@@ -1936,9 +1573,9 @@ class ChannelWorker:
         self._streamed_bubble_count = 0
         self._stale_text_messages = []
         self._reset_flood_state()
-        # 消息状态 promote: pending → active. 👀 已在 submit fire (每条 V msg
+        # 消息状态 promote: pending → active. 👀 已在 submit fire (每条 user msg
         # 立即 ack), 这里只挪账, 不再 fire — 避免重复 setMessageReaction 调用.
-        # Hot-input sessions keep one V message per queued turn. Non-hot
+        # Hot-input sessions keep one user message per queued turn. Non-hot
         # sessions (Codex CLI) may coalesce several pending messages into one
         # physical model turn; all their marks/uids move together.
         promote_count = min(
@@ -1962,7 +1599,7 @@ class ChannelWorker:
 
     async def _consume_events(self) -> None:
         """P1.2 supervisor: re-establish the LiveSession when events() exits
-        on un-recovered error so V's next message still gets processed instead
+        on un-recovered error so the user's next message still gets processed instead
         of vanishing into a dead inbox.
         """
         backoff = 1.0
@@ -2089,43 +1726,138 @@ class ChannelWorker:
         self._tool_edit_supported = False
         self._tool_status = None
 
-    async def _handle_text_delta(self, chunk: str) -> None:
-        if not chunk:
-            return
-        # 优先用 _active_reply_payload (V 视角"当前活跃消息" — 每条 V msg 都切到
-        # 自己, 即使 SDK 还没 turn_end 也能让新消息有独立 reply).
-        # P1.4 fallback: turn_payload / latest_payload 兜底 (race 窗口).
-        # P1-A: snapshot generation 入口, 每次 await 边界检查; 变了就 abort
-        # 避免 stale write 覆盖新 anchor 状态.
-        gen = self._anchor_generation
+    def _current_reply_anchor(self) -> ReplyAnchor | None:
         payload = (
             self._active_reply_payload
             or self._turn_payload
             or self._latest_payload
         )
         if payload is None:
-            return
+            return None
         chat = payload.update.effective_chat
         msg = payload.update.effective_message
         if chat is None or msg is None:
-            return
+            return None
+        return ReplyAnchor(self._anchor_generation, payload, chat, msg)
 
-        self._text_buffer += chunk
+    async def _edit_completed_first_part(
+        self,
+        target: Any,
+        bubble: str,
+        first_part: str,
+        rest: list[str],
+        parse_mode: str | None,
+        gen: int,
+    ) -> tuple[bool, list[str], str | None]:
+        try:
+            await target.edit_text(first_part, **_parse_kwargs(parse_mode))
+            return True, rest, parse_mode
+        except Exception:
+            # Telegram may reject HTML; retry the whole bubble as plain text.
+            try:
+                raw_parts = _plain_bubble_parts(bubble)
+                await target.edit_text(raw_parts[0])
+                return True, raw_parts[1:], None
+            except Exception as plain_e:
+                if gen == self._anchor_generation:
+                    self._stale_text_messages.append(target)
+                    self._on_text_edit_failure(plain_e)
+                return False, rest, parse_mode
 
-        # Fallback mode (3 prior flood strikes): drop streaming edits entirely.
-        # Buffer stays accumulated so turn-end _deliver_response can ship it
-        # (it splits on \n\n\n itself).
-        if not self._text_edit_supported:
-            return
+    async def _reply_completed_first_part(
+        self,
+        msg: Any,
+        bubble: str,
+        first_part: str,
+        rest: list[str],
+        parse_mode: str | None,
+        gen: int,
+    ) -> tuple[bool, Any | None, list[str], str | None]:
+        try:
+            reply = await msg.reply_text(first_part, **_parse_kwargs(parse_mode))
+            return True, reply, rest, parse_mode
+        except Exception:
+            try:
+                raw_parts = _plain_bubble_parts(bubble)
+                reply = await msg.reply_text(raw_parts[0])
+                return True, reply, raw_parts[1:], None
+            except Exception as plain_e:
+                if gen == self._anchor_generation:
+                    self._on_text_edit_failure(plain_e)
+                return False, None, rest, parse_mode
 
-        # \n\n\n marker = LLM-driven bubble break (see _TG_SOURCE_PROMPT).
-        # Close the current bubble (final-edit it) and start a fresh one for
-        # the next chunks. Loop handles multiple markers in one delta (rare).
-        # streamed_bubble_count tracks bubbles successfully shipped — only
-        # increments on real send/edit success so _deliver_response can resend
-        # any that flood-failed mid-stream. Long bubbles are delivered as plain
-        # chunks because rendered HTML cannot be split safely at arbitrary
-        # Telegram boundaries.
+    async def _reply_completed_rest_parts(
+        self,
+        msg: Any,
+        rest: list[str],
+        parse_mode: str | None,
+    ) -> tuple[bool, list[Any]]:
+        shipped: list[Any] = []
+        for part in rest:
+            reply = None
+            try:
+                reply = await msg.reply_text(part, **_parse_kwargs(parse_mode))
+            except Exception:
+                if parse_mode:
+                    try:
+                        reply = await msg.reply_text(part)
+                    except Exception:
+                        return False, shipped
+                else:
+                    return False, shipped
+            if reply is not None:
+                shipped.append(reply)
+        return True, shipped
+
+    async def _send_completed_text_bubble(
+        self,
+        msg: Any,
+        prefix: str,
+        gen: int,
+    ) -> TextBubbleSendResult | None:
+        parts, parse_mode = _format_bubble_parts(prefix)
+        if not parts:
+            return None
+        first_part = parts[0]
+        rest = parts[1:]
+        sent_ok = False
+        shipped_msgs: list[Any] = []
+        target = self._text_message
+        if target is not None:
+            edit_ok, rest, parse_mode = await self._edit_completed_first_part(
+                target, prefix, first_part, rest, parse_mode, gen
+            )
+            if edit_ok and gen == self._anchor_generation:
+                self._text_flood_strikes = 0
+                self._text_edit_interval = _TEXT_EDIT_INTERVAL_BASE
+                sent_ok = True
+                shipped_msgs.append(target)
+        else:
+            reply_ok, new_msg, rest, parse_mode = await self._reply_completed_first_part(
+                msg, prefix, first_part, rest, parse_mode, gen
+            )
+            if reply_ok:
+                if gen != self._anchor_generation:
+                    if new_msg is not None:
+                        self._spawn_orphan_cleanup([new_msg])
+                else:
+                    sent_ok = True
+                    if new_msg is not None:
+                        shipped_msgs.append(new_msg)
+        if sent_ok and rest:
+            rest_ok, rest_msgs = await self._reply_completed_rest_parts(
+                msg, rest, parse_mode
+            )
+            shipped_msgs.extend(rest_msgs)
+            if not rest_ok:
+                # Whole-bubble rollback: stale-queue every shipped part
+                # so _deliver_response can resend the bubble cleanly.
+                self._stale_text_messages.extend(shipped_msgs)
+                sent_ok = False
+        return TextBubbleSendResult(sent_ok=sent_ok, shipped_msgs=shipped_msgs)
+
+    async def _close_completed_text_bubbles(self, msg: Any, gen: int) -> bool:
+        # Triple newline is the source-prompt boundary between Telegram bubbles.
         while "\n\n\n" in self._text_buffer:
             prefix, tail = self._text_buffer.split("\n\n\n", 1)
             prefix = prefix.rstrip()
@@ -2133,124 +1865,39 @@ class ChannelWorker:
             shipped_msgs: list[Any] = []
             if prefix:
                 if gen != self._anchor_generation:
-                    return
-                parts, parse_mode = _format_bubble_parts(prefix)
-                if not parts:
+                    return False
+                sent = await self._send_completed_text_bubble(msg, prefix, gen)
+                if sent is None:
                     self._text_buffer = tail.lstrip("\n")
                     continue
-                first_part = parts[0]
-                rest = parts[1:]
-                if self._text_message is not None:
-                    edit_ok = False
-                    try:
-                        await self._text_message.edit_text(
-                            first_part, **_parse_kwargs(parse_mode)
-                        )
-                        edit_ok = True
-                    except Exception:
-                        # HTML may be rejected; retry the whole bubble as plain.
-                        try:
-                            raw_parts = _split(prefix) or [prefix[:_MAX_TG]]
-                            await self._text_message.edit_text(raw_parts[0])
-                            rest = raw_parts[1:]
-                            parse_mode = None
-                            edit_ok = True
-                        except Exception as plain_e:
-                            if gen == self._anchor_generation:
-                                self._stale_text_messages.append(self._text_message)
-                                self._on_text_edit_failure(plain_e)
-                    if edit_ok and gen == self._anchor_generation:
-                        self._text_flood_strikes = 0
-                        self._text_edit_interval = _TEXT_EDIT_INTERVAL_BASE
-                        sent_ok = True
-                        shipped_msgs.append(self._text_message)
-                else:
-                    reply_ok = False
-                    new_msg = None
-                    try:
-                        new_msg = await msg.reply_text(
-                            first_part, **_parse_kwargs(parse_mode)
-                        )
-                        reply_ok = True
-                    except Exception:
-                        try:
-                            raw_parts = _split(prefix) or [prefix[:_MAX_TG]]
-                            new_msg = await msg.reply_text(raw_parts[0])
-                            rest = raw_parts[1:]
-                            parse_mode = None
-                            reply_ok = True
-                        except Exception as plain_e:
-                            if gen == self._anchor_generation:
-                                self._on_text_edit_failure(plain_e)
-                    if reply_ok:
-                        if gen != self._anchor_generation:
-                            self._spawn_orphan_cleanup([new_msg])
-                        else:
-                            sent_ok = True
-                            shipped_msgs.append(new_msg)
-                if sent_ok and rest:
-                    rest_failed = False
-                    for p in rest:
-                        rp = None
-                        try:
-                            rp = await msg.reply_text(
-                                p, **_parse_kwargs(parse_mode)
-                            )
-                        except Exception:
-                            if parse_mode:
-                                try:
-                                    rp = await msg.reply_text(p)
-                                except Exception:
-                                    rest_failed = True
-                                    break
-                            else:
-                                rest_failed = True
-                                break
-                        if rp is not None:
-                            shipped_msgs.append(rp)
-                    if rest_failed:
-                        # Whole-bubble rollback: stale-queue every shipped part
-                        # so _deliver_response can resend the bubble cleanly.
-                        self._stale_text_messages.extend(shipped_msgs)
-                        sent_ok = False
-            # P0 gen check: close-bubble state writes must not pollute new anchor.
+                sent_ok = sent.sent_ok
+                shipped_msgs = sent.shipped_msgs
             if gen != self._anchor_generation:
-                # shipped_msgs are now orphan replies under the old anchor.
                 if shipped_msgs:
                     self._spawn_orphan_cleanup(shipped_msgs)
-                return
+                return False
             self._text_message = None
             self._text_buffer = tail.lstrip("\n")
             self._text_last_edit = 0.0
             if sent_ok:
                 self._streamed_bubble_count += 1
+        return True
 
-        now = time.monotonic()
-        if not self._text_buffer:
-            return
-        if len(self._text_buffer) <= _MAX_TG:
-            display = self._text_buffer
-        else:
-            display = "…" + self._text_buffer[-(_MAX_TG - 1):]
-
+    async def _update_stream_text_message(
+        self,
+        chat: Any,
+        msg: Any,
+        display: str,
+        now: float,
+        gen: int,
+    ) -> None:
         if self._text_message is None:
             try:
                 new_reply = await msg.reply_text(display or "…")
             except Exception as e:
-                # First-send flood: classify and possibly enter fallback so we
-                # don't pound TG with retries. Tail still in _text_buffer →
-                # _deliver_response covers it at turn end.
-                # Gen-check before mutating shared state: cut-in may have
-                # bumped generation while reply_text awaited; this failure
-                # belongs to the now-stale anchor, don't poison new state.
-                # Codex round-1 fix.
                 if gen == self._anchor_generation:
                     self._on_text_edit_failure(e)
                 return
-            # P1-A: gen 没变才装回 _text_message. 变了说明 submit 已切到新 anchor,
-            # 这条 reply 在旧 m_old 下是 orphan — 删掉, 让 V 只看到 m_new 下的新
-            # reply (符合 V spec "切入后回复在对应消息下面"; 留着会让 V 看到 m_old
-            # 下的 "…"/half-chunk 残留, 跟终端体感不齐).
             if gen == self._anchor_generation:
                 self._text_message = new_reply
                 self._text_last_edit = now
@@ -2258,22 +1905,14 @@ class ChannelWorker:
                 self._spawn_orphan_cleanup([new_reply])
             return
 
-        # Adaptive interval: doubles on each flood strike, resets to base on
-        # successful edit (handled below). _text_edit_interval is per-stream
-        # state set by `_on_text_edit_failure`.
         if now - self._text_last_edit < self._text_edit_interval:
             return
-        # P1-A: 在 edit await 前再查一次 gen — 变了就 abort, 不把新 chunk
-        # 写到旧 reply (chunk 在 V 视角属于新 anchor).
         if gen != self._anchor_generation:
             return
         self._text_last_edit = now
         target = self._text_message
         try:
             await target.edit_text(display)
-            # Gen-check after await: if cut-in landed while edit awaited,
-            # this success belongs to the old anchor — don't reset *new*
-            # anchor's flood state with this stale outcome. Codex round-1.
             if gen == self._anchor_generation:
                 self._text_flood_strikes = 0
                 self._text_edit_interval = _TEXT_EDIT_INTERVAL_BASE
@@ -2285,24 +1924,43 @@ class ChannelWorker:
         except Exception:
             pass
 
+    async def _handle_text_delta(self, chunk: str) -> None:
+        if not chunk:
+            return
+        anchor = self._current_reply_anchor()
+        if anchor is None:
+            return
+        gen = anchor.generation
+        chat = anchor.chat
+        msg = anchor.message
+
+        self._text_buffer += chunk
+
+        if not self._text_edit_supported:
+            return
+
+        if not await self._close_completed_text_bubbles(msg, gen):
+            return
+
+        now = time.monotonic()
+        if not self._text_buffer:
+            return
+        display = _stream_display_text(self._text_buffer)
+
+        await self._update_stream_text_message(chat, msg, display, now, gen)
+
     async def _handle_tool_event(self, ev: Event) -> None:
         if _verbose == 0:
             return
         # 同 _handle_text_delta: per-message reply anchor 优先, 让 tool 状态也
-        # 跟着新 V 消息走 (不混到上一条 reply 链).
+        # 跟着新 user 消息走 (不混到上一条 reply 链).
         # P1-B: gen check 同 _handle_text_delta.
-        gen = self._anchor_generation
-        payload = (
-            self._active_reply_payload
-            or self._turn_payload
-            or self._latest_payload
-        )
-        if payload is None:
+        anchor = self._current_reply_anchor()
+        if anchor is None:
             return
-        chat = payload.update.effective_chat
-        msg = payload.update.effective_message
-        if chat is None or msg is None:
-            return
+        gen = anchor.generation
+        chat = anchor.chat
+        msg = anchor.message
 
         if ev.kind == "tool_use" and ev.name:
             self._tool_entries.append(_fmt_tool(ev.name, ev.input_dict or {}))
@@ -2316,7 +1974,7 @@ class ChannelWorker:
 
         body = "\n".join(self._tool_entries[-30:])[:_MAX_TG]
         # Fallback mode: stop editing tool_status. Tool entries continue to
-        # accumulate in _tool_entries (V loses live progress, but turn-end
+        # accumulate in _tool_entries (user loses live progress, but turn-end
         # still shows the work via _deliver_response's resp.tools / final
         # response text). We don't try to flush tool entries as a fresh
         # message because they're transient by design (verbose=1 deletes
@@ -2332,7 +1990,7 @@ class ChannelWorker:
                     self._on_tool_edit_failure(e)
                 return
             # P1-B 同 _handle_text_delta: gen mismatch = orphan tool_status 在 m_old
-            # 下, 删掉避免 V 在错误 anchor 下看到孤立 tool 状态.
+            # 下, 删掉避免用户在错误 anchor 下看到孤立 tool 状态.
             if gen == self._anchor_generation:
                 self._tool_status = new_status
                 self._tool_last_edit = time.monotonic()
@@ -2365,9 +2023,9 @@ class ChannelWorker:
             # P1.4: race window — if submit() acquired _state_lock between SDK's
             # ResultMessage and consume_events reaching here, _turn_payload may
             # already point at a newer Payload. Either way, fall back to
-            # _latest_payload so V never sees a silent drop.
-            # P1-C/D: 优先用 _active_reply_payload (V 视角"当前活跃") — final
-            # response 落到 V 最新 message 的 reply, 跟流式期间的 _text_message
+            # _latest_payload so the user never sees a silent drop.
+            # P1-C/D: 优先用 _active_reply_payload (用户视角"当前活跃") — final
+            # response 落到用户最新 message 的 reply, 跟流式期间的 _text_message
             # 同 anchor; 否则 long-response overflow parts 会跨两个 anchor 分裂.
             payload = (
                 self._active_reply_payload
@@ -2376,7 +2034,6 @@ class ChannelWorker:
             )
             active_uids = list(self._active_update_ids)
             delivery_ok = False
-            delivery_id: str | None = None
             # P1.3: try/finally guarantees turn state resets even if TG edits
             # raise — otherwise _in_flight stays >0 and graceful shutdown hangs.
             try:
@@ -2386,38 +2043,17 @@ class ChannelWorker:
                     )
                     self._apply_accounting(resp)
                     return
-                delivery_id = await _record_pending_delivery(
-                    payload=payload,
-                    resp=resp,
-                    update_ids=active_uids,
+                delivery_ok = await self._deliver_turn_response(
+                    payload,
+                    resp,
+                    active_uids,
                 )
-                try:
-                    delivery_ok = await self._deliver_response(payload, resp)
-                except Exception as e:
-                    log.exception("deliver_response failed: %s", e)
-                    delivery_ok = False
-                if delivery_ok:
-                    await _ack_pending_delivery(delivery_id)
-                else:
-                    log.warning(
-                        "turn_end response not acknowledged by TG delivery; "
-                        "leaving update_ids=%s pending",
-                        [u for u in active_uids if u is not None],
-                    )
-                self._apply_accounting(resp)
-                if resp.cost > 0:
-                    log.info(
-                        "Cost: $%.4f | Session: %s",
-                        resp.cost,
-                        resp.session_id[:8] if resp.session_id else "new",
-                    )
-                self._turn_recovery_attempts = 0
             finally:
-                # 只 fire 完成态给 _active_marks (= 当前 turn 的 V msgs). _pending_marks
-                # 是 cut-in 期间 push 的 (= 下一 turn 的 V msgs), 留着等 _begin_turn
-                # promote 进 _active_marks. SDK 真 batch 多 V msg 进一个 turn 的话,
+                # 只 fire 完成态给 _active_marks (= 当前 turn 的 user msgs). _pending_marks
+                # 是 cut-in 期间 push 的 (= 下一 turn 的 user msgs), 留着等 _begin_turn
+                # promote 进 _active_marks. SDK 真 batch 多 user msg 进一个 turn 的话,
                 # _pending_marks 在那时本就是空 (submit 只在 turn_active 才 push 到
-                # pending). 所以这里只动 active 是对的. stopped=True 是 V 主动
+                # pending). 所以这里只动 active 是对的. stopped=True 是用户主动
                 # /stop, 不是正常完成, 要标成未完成态而不是 👌.
                 done_marks = self._active_marks
                 done_uids = self._active_update_ids
@@ -2431,10 +2067,10 @@ class ChannelWorker:
                     for _uid in done_uids:
                         await _mark_processed(_uid)
                 self._reset_turn_state(exit_inflight=True)
-                # Turn 结束 → 清 bridge.reply_to. 不清的话, V turn 之后 cron
+                # Turn 结束 → 清 bridge.reply_to. 不清的话, user turn 之后 cron
                 # 走 mcp__tg__tg_send_* 发的消息 (gmail PR-merged 通报 / weekly
-                # report / X 日报...) 都会带上 V 上一条 message_id 当 reply_to,
-                # TG 渲染成"引用 V 上一条". chat_id 保留 — cron 还得知道发哪
+                # report / X 日报...) 都会带上上一条 user message_id 当 reply_to,
+                # TG 渲染成"引用上一条". chat_id 保留 — cron 还得知道发哪
                 # 个 chat. 只清 reply_to.
                 with suppress(Exception):
                     bridge.reply_to = None
@@ -2445,6 +2081,47 @@ class ChannelWorker:
                 # interrupt + SDK batch 卡死.
                 if self._pending_payloads:
                     await self._start_next_pending_locked()
+
+    async def _deliver_turn_response(
+        self,
+        payload: Payload,
+        resp: Response,
+        update_ids: list[int | None],
+    ) -> bool:
+        delivery_key = _delivery_id_for_update_ids(update_ids)
+        if delivery_key:
+            _delivery_in_progress.add(delivery_key)
+        try:
+            delivery_id = await _record_pending_delivery(
+                payload=payload,
+                resp=resp,
+                update_ids=update_ids,
+            )
+            try:
+                delivery_ok = await self._deliver_response(payload, resp)
+            except Exception as e:
+                log.exception("deliver_response failed: %s", e)
+                delivery_ok = False
+            if delivery_ok:
+                await _ack_pending_delivery(delivery_id)
+        finally:
+            if delivery_key:
+                _delivery_in_progress.discard(delivery_key)
+        if not delivery_ok:
+            log.warning(
+                "turn_end response not acknowledged by TG delivery; "
+                "leaving update_ids=%s pending",
+                [u for u in update_ids if u is not None],
+            )
+        self._apply_accounting(resp)
+        if resp.cost > 0:
+            log.info(
+                "Cost: $%.4f | Session: %s",
+                resp.cost,
+                resp.session_id[:8] if resp.session_id else "new",
+            )
+        self._turn_recovery_attempts = 0
+        return delivery_ok
 
     async def _handle_error(self, exc: Exception) -> None:
         log.error("CC stream failed: %s", exc)
@@ -2496,7 +2173,7 @@ class ChannelWorker:
         """After a supervised reconnect, resume the queued FIFO work.
 
         This is the recovery actuator for a broken CPU stream: _handle_error()
-        puts the active V message back at the front of _pending_payloads, then
+        puts the active user message back at the front of _pending_payloads, then
         the supervisor reconnects the physical session and calls here.
         """
         async with self._state_lock:
@@ -2505,7 +2182,7 @@ class ChannelWorker:
             await self._start_next_pending_locked()
 
     def _requeue_active_turn_for_recovery(self) -> bool:
-        """Put the active V message back before pending cut-ins.
+        """Put the active user message back before pending cut-ins.
 
         Returns False when there is no reliable active payload anchor. Must be
         called with _state_lock held.
@@ -2542,7 +2219,7 @@ class ChannelWorker:
                 continue
         if surfaced:
             return
-        # P2-C: 用 _active_reply_payload 优先 (errors 应落 V 最新 message reply,
+        # P2-C: 用 _active_reply_payload 优先 (errors 应落用户最新 message reply,
         # 不是旧 turn anchor).
         payload = (
             self._active_reply_payload
@@ -2555,10 +2232,87 @@ class ChannelWorker:
             except Exception:
                 pass
 
+    async def _send_response_bubble(self, msg: Any, bubble: str) -> bool:
+        bubble = bubble.strip()
+        if not bubble:
+            return True
+        parts, parse_mode = _format_bubble_parts(bubble)
+        for part in parts:
+            try:
+                await msg.reply_text(part, **_parse_kwargs(parse_mode))
+            except Exception:
+                if parse_mode:
+                    try:
+                        for pp in _plain_bubble_parts(bubble):
+                            await msg.reply_text(pp)
+                        return True
+                    except Exception:
+                        return False
+                return False
+        return True
+
+    async def _finalize_stream_text_message(self, msg: Any, target_text: str) -> bool:
+        target_text = target_text.strip()
+        parts, parse_mode = _format_bubble_parts(target_text)
+        if not parts:
+            return True
+        first_delivered = False
+        try:
+            await self._text_message.edit_text(parts[0], **_parse_kwargs(parse_mode))
+            first_delivered = True
+        except Exception:
+            try:
+                raw_parts = _plain_bubble_parts(target_text)
+                await self._text_message.edit_text(raw_parts[0])
+                for pp in raw_parts[1:]:
+                    await msg.reply_text(pp)
+                parts = []
+                first_delivered = True
+            except Exception:
+                self._stale_text_messages.append(self._text_message)
+        if not first_delivered:
+            if not await self._send_response_bubble(msg, target_text):
+                return False
+            parts = []
+        for part in parts[1:]:
+            try:
+                await msg.reply_text(part, **_parse_kwargs(parse_mode))
+            except Exception:
+                if parse_mode:
+                    try:
+                        await msg.reply_text(part)
+                    except Exception:
+                        return False
+                else:
+                    return False
+        return True
+
     async def _deliver_response(self, payload: Payload, resp: Response) -> bool:
         msg = payload.update.effective_message
         if msg is None:
             return False
+
+        if resp.generated_images:
+            chat = payload.update.effective_chat
+            bot_obj = getattr(payload.ctx, "bot", None)
+            if chat is None or bot_obj is None:
+                return False
+            for raw_path in resp.generated_images:
+                path = Path(raw_path).expanduser()
+                if not path.is_file():
+                    log.warning("generated image missing before TG delivery: %s", path)
+                    return False
+                try:
+                    with path.open("rb") as handle:
+                        await bot_obj.send_document(
+                            chat_id=chat.id,
+                            document=handle,
+                            filename=path.name,
+                            reply_to_message_id=msg.message_id,
+                        )
+                except Exception as e:
+                    log.warning("generated image delivery failed: %s: %s", path, e)
+                    return False
 
         if self._tool_status and _verbose == 1:
             try:
@@ -2583,87 +2337,33 @@ class ChannelWorker:
             self._stale_text_messages = []
 
         if not resp.content:
+            if resp.generated_images:
+                return True
             await msg.reply_text("(no response)")
             return True
 
-        # Streaming has already shipped `_streamed_bubble_count` bubbles via
-        # reply_text in _handle_text_delta; _text_message (if any) holds the
-        # trailing partial. Compute what's still pending from the final.
-        bubbles = re.split(r"\n{3,}", resp.content)
-        # Drop leading + trailing empty bubbles (LLM may bracket with markers).
-        while bubbles and not bubbles[-1].strip():
-            bubbles.pop()
-        while bubbles and not bubbles[0].strip():
-            bubbles.pop(0)
-        pending = bubbles[self._streamed_bubble_count:]
+        pending, has_bubbles = _pending_response_bubbles(
+            resp.content,
+            self._streamed_bubble_count,
+        )
         if not pending:
-            if bubbles or self._streamed_bubble_count:
+            if has_bubbles:
+                return True
+            if resp.generated_images:
                 return True
             await msg.reply_text("(no response)")
-            return True
-
-        async def _send_bubble(bubble: str) -> bool:
-            bubble = bubble.strip()
-            if not bubble:
-                return True
-            parts, parse_mode = _format_bubble_parts(bubble)
-            for part in parts:
-                try:
-                    await msg.reply_text(part, **_parse_kwargs(parse_mode))
-                except Exception:
-                    if parse_mode:
-                        try:
-                            for pp in _split(bubble):
-                                await msg.reply_text(pp)
-                            return True
-                        except Exception:
-                            return False
-                    return False
             return True
 
         if self._text_message:
             # First pending bubble = trailing partial in _text_message; finalize.
-            target = pending[0]
-            target_text = target.strip()
-            parts, parse_mode = _format_bubble_parts(target_text)
-            if parts:
-                first_delivered = False
-                try:
-                    await self._text_message.edit_text(
-                        parts[0], **_parse_kwargs(parse_mode)
-                    )
-                    first_delivered = True
-                except Exception:
-                    try:
-                        raw_parts = _split(target_text)
-                        await self._text_message.edit_text(raw_parts[0])
-                        for pp in raw_parts[1:]:
-                            await msg.reply_text(pp)
-                        parts = []
-                        first_delivered = True
-                    except Exception:
-                        self._stale_text_messages.append(self._text_message)
-                if not first_delivered:
-                    if not await _send_bubble(target_text):
-                        return False
-                    parts = []
-                for part in parts[1:]:
-                    try:
-                        await msg.reply_text(part, **_parse_kwargs(parse_mode))
-                    except Exception:
-                        if parse_mode:
-                            try:
-                                await msg.reply_text(part)
-                            except Exception:
-                                return False
-                        else:
-                            return False
+            if not await self._finalize_stream_text_message(msg, pending[0]):
+                return False
             for bubble in pending[1:]:
-                if not await _send_bubble(bubble):
+                if not await self._send_response_bubble(msg, bubble):
                     return False
         else:
             for bubble in pending:
-                if not await _send_bubble(bubble):
+                if not await self._send_response_bubble(msg, bubble):
                     return False
         return True
 
@@ -2673,8 +2373,11 @@ class ChannelWorker:
         if not resp.session_id and resp.cost == 0.0 and not resp.tools:
             _session_cost = 0.0
             _session_turns = 0
+            _last_model = None
+            _last_context_window = None
             _last_used_tokens = 0
             _last_cost = 0.0
+            _last_session_id = None
         else:
             _session_cost += resp.cost
             _session_turns += 1
@@ -2697,10 +2400,16 @@ class ChannelWorker:
         _state["last_used_tokens"] = _last_used_tokens
         if _last_model:
             _state["last_model"] = _last_model
+        else:
+            _state.pop("last_model", None)
         if _last_context_window:
             _state["last_context_window"] = _last_context_window
+        else:
+            _state.pop("last_context_window", None)
         if _last_session_id:
             _state["last_session_id"] = _last_session_id
+        else:
+            _state.pop("last_session_id", None)
         _save_state()
 
     def _reset_turn_state(
@@ -2728,7 +2437,7 @@ class ChannelWorker:
         self._stale_text_messages = []
         self._reset_flood_state()
         # 失败路径 (error / reset / resume / submit retry fail): fire 💔 给
-        # active + (drop 模式下) pending 让 V 一眼看到这些 V message 没正常完成.
+        # active + (drop 模式下) pending 让用户一眼看到这些 user message 没正常完成.
         # turn_end 路径不传 fail_emoji — finally 段已经手动 fire 过 👌.
         if fail_emoji:
             failed = list(self._active_marks)
@@ -2784,16 +2493,17 @@ class ChannelWorker:
         turn state + 💔. 从 submit() else 分支 + _handle_turn_end finally 调.
         Codex R3 P0 fix: cut-in 路径不再立即 submit, 等 A's turn_end 后由
         _begin_turn(B) 触发本函数 — 防 stale interrupt 命中 B + SDK batch 卡死."""
+        text = _truncate_tg_input(payload.text)
         try:
-            self.session.submit(payload.text, payload.images)
+            self.session.submit(text, payload.images)
             return
         except RuntimeError:
             log.warning("LiveSession was disconnected; reconnecting before submit")
         try:
             await self.session.connect()
-            self.session.submit(payload.text, payload.images)
+            self.session.submit(text, payload.images)
         except Exception as e:
-            log.error("Second submit failed: %s — keeping V message pending", e)
+            log.error("Second submit failed: %s — keeping user message pending", e)
             self._requeue_active_turn_for_recovery()
             self._reset_turn_state(
                 exit_inflight=True,
@@ -2809,7 +2519,7 @@ class ChannelWorker:
         interrupt 此时 fire 会打断 B 而不是 A. epoch != captured → 直接 return.
         reset/error 也 bump epoch, 防 interrupt 命中 dead/reset client.
 
-        Codex round-4 P2 dedupe: 同 epoch 已 spawn 过 → return (V 连发 m2 m3 m4
+        Codex round-4 P2 dedupe: 同 epoch 已 spawn 过 → return (m2 m3 m4
         在 m1 turn 内, 三次都触发 cut-in, 但 SDK 只需 interrupt 一次)."""
         captured_epoch = self._turn_epoch
         if self._interrupt_spawned_epoch == captured_epoch:
@@ -2850,7 +2560,7 @@ class ChannelWorker:
     ) -> None:
         # P2-A: 全局串行所有 reaction API 调用. asyncio.Lock FIFO 保证 schedule
         # 顺序 = 执行顺序 — turn_end finally 先 schedule 👌(active) 再触发
-        # _begin_turn → 👀(next), V 看到的最终 reaction 一定是后者覆盖前者.
+        # _begin_turn → 👀(next), 用户看到的最终 reaction 一定是后者覆盖前者.
         # 没这个 lock, 两个 create_task 并发可能让快的 👀 覆盖慢的 👌, 那条
         # 消息卡在 👀 永远不变 👌 (TG setMessageReaction 是 last-write-wins).
         async with self._reaction_lock:
@@ -2934,72 +2644,119 @@ async def _replay_pending_updates(app: Application) -> PendingReplaySummary:
     )
 
 
+def _pending_delivery_sort_key(record: dict[str, Any]) -> tuple[float, str]:
+    try:
+        created = float(record.get("created_at") or 0)
+    except (TypeError, ValueError):
+        created = 0.0
+    return (created, str(record.get("delivery_id") or ""))
+
+
+def _parse_pending_delivery_record(record: dict[str, Any]) -> PendingDeliveryRecord:
+    update_ids = tuple(int(u) for u in (record.get("update_ids") or []))
+    return PendingDeliveryRecord(
+        delivery_id=str(record.get("delivery_id") or ""),
+        update_ids=update_ids,
+        chat_id=int(record["chat_id"]),
+        message_id=int(record["message_id"]),
+        anchor_update_id=int(record.get("anchor_update_id") or update_ids[-1]),
+        content=str(record.get("content") or ""),
+        session_id=str(record.get("session_id") or ""),
+        resume_note=record.get("resume_note") or None,
+        generated_images=tuple(str(path) for path in (record.get("generated_images") or [])),
+    )
+
+
+def _payload_for_pending_delivery(
+    bot_obj: Any,
+    record: PendingDeliveryRecord,
+) -> Payload | None:
+    return _payload_from_pending_record(
+        bot_obj,
+        {
+            "update_id": record.anchor_update_id,
+            "chat_id": record.chat_id,
+            "message_id": record.message_id,
+            "text": "[pending delivery replay]",
+            "images": [],
+        },
+    )
+
+
+async def _replay_pending_delivery_record(
+    app: Application,
+    record: PendingDeliveryRecord,
+) -> str:
+    if record.update_ids and all(uid in _processed_set for uid in record.update_ids):
+        await _ack_pending_delivery(record.delivery_id)
+        return "skipped_processed"
+
+    payload = _payload_for_pending_delivery(app.bot, record)
+    if payload is None:
+        log.warning("pending delivery payload is malformed: delivery_id=%s", record.delivery_id)
+        return "malformed"
+
+    try:
+        # A cached reply must not edit or consume the active turn's streaming
+        # bubbles. This delivery-only worker never connects or calls the CPU.
+        delivery_worker = ChannelWorker(_worker().session, instance_label=_CURRENT_LABEL)
+        ok = await delivery_worker._deliver_response(
+            payload,
+            Response(
+                content=record.content,
+                session_id=record.session_id,
+                cost=0.0,
+                resume_note=record.resume_note,
+                generated_images=list(record.generated_images),
+            ),
+        )
+    except Exception as e:
+        log.warning("pending delivery replay failed: delivery_id=%s: %s", record.delivery_id, e)
+        ok = False
+    if not ok:
+        return "failed"
+
+    for uid in record.update_ids:
+        await _mark_processed(uid)
+    await _ack_pending_delivery(record.delivery_id)
+    return "delivered"
+
+
 async def _replay_pending_deliveries(app: Application) -> DeliveryReplaySummary:
     async with _pending_deliveries_lock:
         records = list(_pending_delivery_records.values())
     if not records:
         return DeliveryReplaySummary()
 
-    def _sort_key(record: dict[str, Any]) -> tuple[float, str]:
-        try:
-            created = float(record.get("created_at") or 0)
-        except (TypeError, ValueError):
-            created = 0.0
-        return (created, str(record.get("delivery_id") or ""))
-
     delivered = 0
     skipped_processed = 0
     malformed = 0
     failed = 0
-    for record in sorted(records, key=_sort_key):
-        delivery_id = str(record.get("delivery_id") or "")
+    for raw_record in sorted(records, key=_pending_delivery_sort_key):
+        if _shutdown_requested:
+            break
         try:
-            update_ids = [int(u) for u in (record.get("update_ids") or [])]
-            chat_id = int(record["chat_id"])
-            message_id = int(record["message_id"])
-            anchor_update_id = int(record.get("anchor_update_id") or update_ids[-1])
+            record = _parse_pending_delivery_record(raw_record)
         except (KeyError, TypeError, ValueError, IndexError):
+            delivery_id = str(raw_record.get("delivery_id") or "")
             log.warning("pending delivery record is malformed: delivery_id=%s", delivery_id)
             malformed += 1
             continue
-        if update_ids and all(uid in _processed_set for uid in update_ids):
-            await _ack_pending_delivery(delivery_id)
-            skipped_processed += 1
+        if record.delivery_id in _delivery_in_progress:
             continue
-        payload = _payload_from_pending_record(
-            app.bot,
-            {
-                "update_id": anchor_update_id,
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": "[pending delivery replay]",
-                "images": [],
-            },
-        )
-        if payload is None:
-            log.warning("pending delivery payload is malformed: delivery_id=%s", delivery_id)
-            malformed += 1
-            continue
+        _delivery_in_progress.add(record.delivery_id)
         try:
-            ok = await _worker()._deliver_response(
-                payload,
-                Response(
-                    content=str(record.get("content") or ""),
-                    session_id=str(record.get("session_id") or ""),
-                    cost=0.0,
-                    resume_note=record.get("resume_note") or None,
-                ),
-            )
-        except Exception as e:
-            log.warning("pending delivery replay failed: delivery_id=%s: %s", delivery_id, e)
-            ok = False
-        if not ok:
+            result = await _replay_pending_delivery_record(app, record)
+        finally:
+            _delivery_in_progress.discard(record.delivery_id)
+        if result == "delivered":
+            delivered += 1
+        elif result == "skipped_processed":
+            skipped_processed += 1
+        elif result == "malformed":
+            malformed += 1
+        else:
             failed += 1
-            continue
-        for uid in update_ids:
-            await _mark_processed(uid)
-        await _ack_pending_delivery(delivery_id)
-        delivered += 1
     if delivered:
         log.warning("replayed %d pending TG response delivery record(s)", delivered)
     return DeliveryReplaySummary(
@@ -3009,6 +2766,24 @@ async def _replay_pending_deliveries(app: Application) -> DeliveryReplaySummary:
         malformed=malformed,
         failed=failed,
     )
+
+
+async def _retry_pending_deliveries_loop(app: Application) -> None:
+    """Retry saved replies after network recovery without restarting the CPU."""
+    delay = _DELIVERY_RETRY_INITIAL_S
+    while not _shutdown_requested:
+        await asyncio.sleep(delay)
+        if _shutdown_requested:
+            return
+        try:
+            summary = await _replay_pending_deliveries(app)
+            failed = bool(summary.failed or summary.malformed)
+            if summary.total and not _in_flight:
+                _write_runtime_status("delivery_retry")
+        except Exception:
+            log.exception("pending TG delivery retry failed")
+            failed = True
+        delay = min(delay * 2, _DELIVERY_RETRY_MAX_S) if failed else _DELIVERY_RETRY_INITIAL_S
 
 
 # ── Handlers ──────────────────────────────────────────────────────────
@@ -3048,7 +2823,7 @@ def _scan_recent_session_model() -> str | None:
     model name (e.g. 'claude-opus-4-N') even before this bot instance has run
     a turn, so /status after a restart shows something specific."""
     try:
-        recent = cc._load_state().get("recent_sids") or []
+        recent = cc.recent_session_ids()
     except Exception:
         recent = []
     proj_dir = Path.home() / ".claude" / "projects" / str(Path.home()).replace("/", "-")
@@ -3076,7 +2851,7 @@ def _cc_version() -> str:
     """Ask the actual claude binary for its version. Same binary bot spawns per
     query — so this number = what /new will run. Subprocess each call (low-
     frequency command, no cache needed)."""
-    cli = os.environ.get("CLAUDE_CLI_PATH") or shutil.which("claude")
+    cli = env_cli_path("CLAUDE_CLI_PATH") or shutil.which("claude")
     if not cli:
         return "—"
     try:
@@ -3098,11 +2873,7 @@ def _sdk_version() -> str:
 
 
 def _codex_cli_path() -> str | None:
-    return (
-        os.environ.get("BABATA_CODEX_CLI_PATH")
-        or os.environ.get("CODEX_CLI_PATH")
-        or shutil.which("codex")
-    )
+    return env_cli_path("BABATA_CODEX_CLI_PATH", "CODEX_CLI_PATH") or shutil.which("codex")
 
 
 def _codex_version() -> str:
@@ -3114,6 +2885,70 @@ def _codex_version() -> str:
         return r.stdout.strip().split()[-1] if r.stdout else "—"
     except Exception:
         return "—"
+
+
+def _grok_cli_path() -> str | None:
+    return env_cli_path("BABATA_GROK_CLI_PATH", "GROK_CLI_PATH") or shutil.which("grok")
+
+
+def _grok_version() -> str:
+    cli = _grok_cli_path()
+    if not cli:
+        return "—"
+    try:
+        r = subprocess.run([cli, "--version"], capture_output=True, text=True, timeout=3)
+        return r.stdout.strip().split()[1] if r.stdout else "—"
+    except Exception:
+        return "—"
+
+
+def _grok_model_label() -> str:
+    raw_model = os.environ.get("BABATA_GROK_MODEL")
+    model = (raw_model or "").strip()
+    if model.lower() in {"auto", "default", "cli-default"}:
+        model = ""
+    return (
+        os.environ.get("BABATA_GROK_DISPLAY_MODEL")
+        or model
+        or (Path(_grok_cli_path() or "grok").name)
+    )
+
+
+def _grok_session_dir(sid: str) -> Path:
+    root = urllib.parse.quote(str(Path(__file__).parent), safe="")
+    return Path.home() / ".grok" / "sessions" / root / sid
+
+
+def _grok_session_model(sid: str | None) -> str | None:
+    if not sid:
+        return None
+    session_dir = _grok_session_dir(sid)
+    for filename, keys in (
+        ("summary.json", ("current_model_id",)),
+        ("signals.json", ("primaryModelId", "modelsUsed")),
+    ):
+        try:
+            data = json.loads((session_dir / filename).read_text())
+        except Exception:
+            continue
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, list):
+                for item in reversed(value):
+                    if isinstance(item, str) and item.strip():
+                        return item.strip()
+    return None
+
+
+def _grok_status_model(sid: str | None) -> str:
+    session_model = _grok_session_model(sid)
+    if session_model:
+        return session_model
+    if sid and _last_model:
+        return _last_model
+    return _grok_model_label()
 
 
 def _codex_config() -> dict[str, Any]:
@@ -3228,6 +3063,136 @@ def _normalize_codex_rate_limits_response(result: Any) -> dict[str, Any] | None:
     return _normalize_codex_rate_limit_snapshot(snapshot)
 
 
+def _codex_turn_context_model_effort(
+    payload: Any,
+    model: str,
+    effort: str,
+) -> tuple[str, str]:
+    if not isinstance(payload, dict):
+        return model, effort
+    model = str(payload.get("model") or model)
+    effort = str(payload.get("effort") or effort)
+    collab = payload.get("collaboration_mode") or {}
+    settings = collab.get("settings") if isinstance(collab, dict) else {}
+    if isinstance(settings, dict):
+        model = str(settings.get("model") or model)
+        effort = str(settings.get("reasoning_effort") or effort)
+    return model, effort
+
+
+def _codex_token_count_status(
+    event: dict[str, Any],
+    info: dict[str, Any],
+    rate_limits: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    payload = event.get("payload") if isinstance(event, dict) else {}
+    if not isinstance(payload, dict) or payload.get("type") != "token_count":
+        return info, rate_limits
+    event_info = payload.get("info")
+    if isinstance(event_info, dict):
+        info = event_info
+    event_rl = _codex_event_rate_limits(event)
+    if isinstance(event_rl, dict):
+        rate_limits = event_rl
+    return info, rate_limits
+
+
+def _codex_session_status_from_file(
+    fp: Path,
+    model: str,
+    effort: str,
+) -> tuple[str, str, dict[str, Any], dict[str, Any] | None]:
+    info: dict[str, Any] = {}
+    rate_limits: dict[str, Any] | None = None
+    try:
+        with fp.open() as f:
+            for line in f:
+                has_turn_context = '"turn_context"' in line
+                has_token_count = '"token_count"' in line
+                if not has_turn_context and not has_token_count:
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                if has_turn_context:
+                    payload = event.get("payload") if isinstance(event, dict) else {}
+                    model, effort = _codex_turn_context_model_effort(payload, model, effort)
+                elif has_token_count:
+                    info, rate_limits = _codex_token_count_status(event, info, rate_limits)
+    except Exception:
+        pass
+    return model, effort, info, rate_limits
+
+
+def _codex_app_server_requests() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "babata-status", "version": "0"},
+                "capabilities": {"experimentalApi": True},
+            },
+        },
+        {"id": 2, "method": "account/rateLimits/read"},
+    ]
+
+
+async def _write_codex_app_server_requests(proc: Any) -> bool:
+    if proc.stdin is None:
+        return False
+    for req in _codex_app_server_requests():
+        proc.stdin.write((json.dumps(req, separators=(",", ":")) + "\n").encode())
+    await proc.stdin.drain()
+    return True
+
+
+def _codex_app_server_rate_limit_message(raw: bytes) -> dict[str, Any] | None:
+    try:
+        msg = json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    if not isinstance(msg, dict) or msg.get("id") != 2:
+        return None
+    result = msg.get("result")
+    if not isinstance(result, dict):
+        return {}
+    return _normalize_codex_rate_limits_response(result)
+
+
+async def _read_codex_app_server_rate_limits(proc: Any, timeout: float) -> dict[str, Any] | None:
+    if proc.stdout is None:
+        return None
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return None
+        try:
+            raw = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return None
+        if not raw:
+            return None
+        parsed = _codex_app_server_rate_limit_message(raw)
+        if parsed is None:
+            continue
+        return parsed or None
+
+
+async def _close_codex_app_server_proc(proc: Any) -> None:
+    if proc is None or proc.returncode is not None:
+        return
+    if proc.stdin is not None:
+        with suppress(Exception):
+            proc.stdin.close()
+    with suppress(ProcessLookupError, Exception):
+        proc.terminate()
+    with suppress(asyncio.TimeoutError, Exception):
+        await asyncio.wait_for(proc.wait(), timeout=1)
+
+
 async def _fetch_codex_app_rate_limits() -> dict[str, Any] | None:
     """Read current Codex quota from the local app-server account API.
 
@@ -3254,53 +3219,14 @@ async def _fetch_codex_app_rate_limits() -> dict[str, Any] | None:
         )
         assert proc.stdin is not None
         assert proc.stdout is not None
-        requests = [
-            {
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "clientInfo": {"name": "babata-status", "version": "0"},
-                    "capabilities": {"experimentalApi": True},
-                },
-            },
-            {"id": 2, "method": "account/rateLimits/read"},
-        ]
-        for req in requests:
-            proc.stdin.write((json.dumps(req, separators=(",", ":")) + "\n").encode())
-        await proc.stdin.drain()
-
-        deadline = asyncio.get_running_loop().time() + 8.0
-        while True:
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                return None
-            try:
-                raw = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
-            except asyncio.TimeoutError:
-                return None
-            if not raw:
-                return None
-            try:
-                msg = json.loads(raw.decode("utf-8", errors="replace"))
-            except Exception:
-                continue
-            if msg.get("id") != 2:
-                continue
-            if isinstance(msg.get("result"), dict):
-                return _normalize_codex_rate_limits_response(msg["result"])
+        if not await _write_codex_app_server_requests(proc):
             return None
+        return await _read_codex_app_server_rate_limits(proc, timeout=8.0)
     except Exception as e:
         log.debug("codex app-server rate-limit refresh failed: %s", e)
         return None
     finally:
-        if proc is not None and proc.returncode is None:
-            if proc.stdin is not None:
-                with suppress(Exception):
-                    proc.stdin.close()
-            with suppress(ProcessLookupError, Exception):
-                proc.terminate()
-            with suppress(asyncio.TimeoutError, Exception):
-                await asyncio.wait_for(proc.wait(), timeout=1)
+        await _close_codex_app_server_proc(proc)
 
 
 def _codex_status_snapshot(sid: str | None) -> dict[str, Any]:
@@ -3320,39 +3246,7 @@ def _codex_status_snapshot(sid: str | None) -> dict[str, Any]:
 
     fp = _codex_session_file(sid)
     if fp:
-        try:
-            with fp.open() as f:
-                for line in f:
-                    if '"turn_context"' in line:
-                        try:
-                            d = json.loads(line)
-                        except Exception:
-                            continue
-                        payload = d.get("payload") if isinstance(d, dict) else {}
-                        if isinstance(payload, dict):
-                            model = str(payload.get("model") or model)
-                            effort = str(payload.get("effort") or effort)
-                            collab = payload.get("collaboration_mode") or {}
-                            settings = collab.get("settings") if isinstance(collab, dict) else {}
-                            if isinstance(settings, dict):
-                                model = str(settings.get("model") or model)
-                                effort = str(settings.get("reasoning_effort") or effort)
-                    elif '"token_count"' in line:
-                        try:
-                            d = json.loads(line)
-                        except Exception:
-                            continue
-                        payload = d.get("payload") if isinstance(d, dict) else {}
-                        if not isinstance(payload, dict) or payload.get("type") != "token_count":
-                            continue
-                        event_info = payload.get("info")
-                        if isinstance(event_info, dict):
-                            info = event_info
-                        event_rl = _codex_event_rate_limits(d)
-                        if isinstance(event_rl, dict):
-                            rate_limits = event_rl
-        except Exception:
-            pass
+        model, effort, info, rate_limits = _codex_session_status_from_file(fp, model, effort)
 
     last = info.get("last_token_usage") if isinstance(info, dict) else {}
     if not isinstance(last, dict):
@@ -3423,7 +3317,7 @@ def _fmt_codex_limit(
 
 # ── Status: quota / today cost / formatting helpers ──────────────────
 #
-# V's terminal CC /status shows:
+# Terminal CC /status shows:
 #   [bar] N% · <model> (<window> context)
 #   session N% · resets Npm  |  week N% · resets Mon DD  |  $X today
 #
@@ -3432,7 +3326,7 @@ def _fmt_codex_limit(
 # numbers the official CLI's TUI surfaces (claude_agent_sdk's RateLimitEvent
 # strips utilization in print/SDK mode, and /api/oauth/usage is rate-limited
 # upstream, so neither works as a fallback). Costs ~9 input + 1 output token
-# of the cheapest model per /status invocation; not cached because V wants
+# of the cheapest model per /status invocation; not cached because status
 # real-time numbers.
 
 
@@ -3674,7 +3568,7 @@ def _short_window(tokens: int | None) -> str:
 
 
 _CCUSAGE_BIN = Path.home() / ".bun" / "bin" / "ccusage"
-# Share cache with statusline.sh — when V has a terminal CC open, its
+# Share cache with statusline.sh — when a terminal CC is open, its
 # statusline keeps this cache fresh, and /status hits it for free. When
 # nothing is keeping it warm, our own daemon thread refreshes it.
 _CCUSAGE_CACHE = Path(f"/tmp/cc-ccusage-{os.getuid()}.txt")
@@ -3781,88 +3675,174 @@ def _last_prompt_tokens(sid: str | None) -> int:
     return 0
 
 
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show current model, context usage, cost, session state."""
-    if not _allowed(update):
-        return
+async def _cmd_status_codex(update: Update) -> None:
+    sid = cc.session_id
+    snap = _codex_status_snapshot(sid)
+    fresh_limits = await _fetch_codex_app_rate_limits()
+    if fresh_limits:
+        snap["rate_limits"] = fresh_limits
+    snap_model = str(snap.get("model") or "")
+    state_model = _last_model if _last_model and _last_model != "codex" else ""
+    actual = (
+        snap_model
+        if snap_model and snap_model != "codex"
+        else state_model or snap_model or os.environ.get("BABATA_CODEX_MODEL") or "codex"
+    )
+    effort = snap.get("effort") or "—"
+    used = int(snap.get("context_used") or 0)
+    win = int(snap.get("context_window") or 0)
+    fallback_used = _last_used_tokens if _last_session_id == sid else 0
+    if not used:
+        used = fallback_used
+    pct_ctx = (used / win * 100) if (win and used > 0) else 0.0
+    bar = _progress_bar(pct_ctx)
+    window_short = _short_window(win)
+    last_usage = snap.get("last_usage") if isinstance(snap.get("last_usage"), dict) else {}
+    out_tokens = int(last_usage.get("output_tokens") or 0)
+    reason_tokens = int(last_usage.get("reasoning_output_tokens") or 0)
+    token_bits = []
+    if used:
+        token_bits.append(f"{_fmt_tok(used)} in")
+    if out_tokens:
+        token_bits.append(f"{_fmt_tok(out_tokens)} out")
+    if reason_tokens:
+        token_bits.append(f"{_fmt_tok(reason_tokens)} reasoning")
+    token_line = " · ".join(token_bits) if token_bits else "tokens —"
+    limits = snap.get("rate_limits") if isinstance(snap.get("rate_limits"), dict) else None
+    five_hour_line = _fmt_codex_limit(limits, "primary", "5h limit", 300)
+    week_line = _fmt_codex_limit(limits, "secondary", "weekly limit", 10_080)
+    plan_type = (limits or {}).get("plan_type") if isinstance(limits, dict) else None
+    sids = cc.recent_session_ids()
+    sid_now = sid if sid else "(new)"
+    labels = {0: "hidden", 1: "flash", 2: "keep"}
+    lines = [
+        "<b>📊 Status</b>",
+        "",
+        f"{bar} {pct_ctx:.0f}% · {html.escape(_short_model(actual))} {html.escape(str(effort))} ({window_short})",
+        "",
+        html.escape(token_line),
+        html.escape(_fmt_review_health_line()),
+    ]
+    if five_hour_line:
+        lines.append(html.escape(five_hour_line))
+    if week_line:
+        lines.append(html.escape(week_line))
+    if plan_type:
+        lines.append(html.escape(f"plan {plan_type}"))
+    lines += [
+        "",
+        f"Codex v{_codex_version()} · {labels.get(_verbose, _verbose)}",
+        f"<code>{sid_now}</code> · {len(sids)} recent",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
-    if _current_cpu_name() == "codex":
-        snap = _codex_status_snapshot(cc._session_id)
-        fresh_limits = await _fetch_codex_app_rate_limits()
-        if fresh_limits:
-            snap["rate_limits"] = fresh_limits
-        snap_model = str(snap.get("model") or "")
-        state_model = _last_model if _last_model and _last_model != "codex" else ""
-        actual = (
-            snap_model
-            if snap_model and snap_model != "codex"
-            else state_model or snap_model or os.environ.get("BABATA_CODEX_MODEL") or "codex"
-        )
-        effort = snap.get("effort") or "—"
-        used = int(snap.get("context_used") or 0)
-        win = int(snap.get("context_window") or 0)
-        fallback_used = _last_used_tokens if _last_session_id == cc._session_id else 0
-        if not used:
-            used = fallback_used
-        pct_ctx = (used / win * 100) if (win and used > 0) else 0.0
-        bar = _progress_bar(pct_ctx)
-        window_short = _short_window(win)
-        last_usage = snap.get("last_usage") if isinstance(snap.get("last_usage"), dict) else {}
-        out_tokens = int(last_usage.get("output_tokens") or 0)
-        reason_tokens = int(last_usage.get("reasoning_output_tokens") or 0)
-        token_bits = []
-        if used:
-            token_bits.append(f"{_fmt_tok(used)} in")
-        if out_tokens:
-            token_bits.append(f"{_fmt_tok(out_tokens)} out")
-        if reason_tokens:
-            token_bits.append(f"{_fmt_tok(reason_tokens)} reasoning")
-        token_line = " · ".join(token_bits) if token_bits else "tokens —"
-        limits = snap.get("rate_limits") if isinstance(snap.get("rate_limits"), dict) else None
-        five_hour_line = _fmt_codex_limit(limits, "primary", "5h limit", 300)
-        week_line = _fmt_codex_limit(limits, "secondary", "weekly limit", 10_080)
-        plan_type = (limits or {}).get("plan_type") if isinstance(limits, dict) else None
-        sids = cc._load_state().get("recent_sids") or []
-        sid_now = cc._session_id if cc._session_id else "(new)"
-        labels = {0: "hidden", 1: "flash", 2: "keep"}
-        lines = [
-            "<b>📊 Status</b>",
-            "",
-            f"{bar} {pct_ctx:.0f}% · {html.escape(_short_model(actual))} {html.escape(str(effort))} ({window_short})",
-            "",
-            html.escape(token_line),
-            html.escape(_fmt_review_health_line()),
-        ]
-        if five_hour_line:
-            lines.append(html.escape(five_hour_line))
-        if week_line:
-            lines.append(html.escape(week_line))
-        if plan_type:
-            lines.append(html.escape(f"plan {plan_type}"))
-        lines += [
-            "",
-            f"Codex v{_codex_version()} · {labels.get(_verbose, _verbose)}",
-            f"<code>{sid_now}</code> · {len(sids)} recent",
-        ]
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-        return
 
-    # Config-level model (what settings.json asks for — may be alias like "opus[1m]").
-    # Differs from actual model name SDK reports (resolved full version).
-    cfg_model = "—"
-    try:
-        cfg = json.loads((Path.home() / ".claude/settings.json").read_text())
-        cfg_model = cfg.get("model", "—")
-    except Exception:
-        pass
+async def _cmd_status_grok(update: Update) -> None:
+    sid = cc.session_id
+    sid_now = sid if sid else "(new)"
+    sids = cc.recent_session_ids()
+    labels = {0: "hidden", 1: "flash", 2: "keep"}
+    model = _grok_status_model(sid)
+    lines = [
+        "<b>📊 Status</b>",
+        "",
+        f"Grok · {html.escape(model)}",
+        "",
+        html.escape(_fmt_review_health_line()),
+        "",
+        f"Grok v{html.escape(_grok_version())} · {labels.get(_verbose, _verbose)}",
+        f"<code>{html.escape(sid_now)}</code> · {len(sids)} recent",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
-    # Actual model resolution order:
-    #   1. _last_model — set by this bot instance from ResultMessage.model_usage
-    #      (full alias-suffixed form like 'claude-opus-4-N[1m]').
-    #   2. Scan recent session JSONL (survives bot restart with no turns yet) —
-    #      gives bare 'claude-opus-4-N'; re-attach cfg's [..] suffix so the
-    #      displayed string stays consistent with what model_usage would show.
-    #   3. Fall back to cfg alias — at least shows something concrete.
+
+def _claude_status_lines(
+    *,
+    bar: str,
+    pct_ctx: float,
+    model_short: str,
+    window_short: str,
+    review_line: str,
+    session_line: str | None,
+    week_line: str | None,
+    or_today_line: str | None,
+    or_balance_line: str | None,
+    or_compact_line: str | None,
+    today_line: str,
+    cc_version: str,
+    sdk_version: str,
+    verbose: int,
+    actual: str,
+    sid_now: str,
+    recent_count: int,
+) -> list[str]:
+    labels = {0: "hidden", 1: "flash", 2: "keep"}
+    lines = [
+        "<b>📊 Status</b>",
+        "",
+        f"{bar} {pct_ctx:.0f}% · {html.escape(model_short)} ({window_short})",
+        "",
+        html.escape(review_line),
+    ]
+    if session_line:
+        lines.append(html.escape(session_line))
+    if week_line:
+        lines.append(html.escape(week_line))
+    if or_today_line:
+        lines.append(html.escape(or_today_line))
+        lines.append(html.escape(or_balance_line or ""))
+    if or_compact_line:
+        lines.append(html.escape(or_compact_line))
+    lines += [
+        today_line,
+        "",
+        f"CC v{cc_version} · SDK v{sdk_version} · {labels.get(verbose, verbose)}",
+        f"<code>{html.escape(actual)}</code>",
+        f"<code>{sid_now}</code> · {recent_count} recent",
+    ]
+    return lines
+
+
+def _openrouter_usage_lines(
+    *,
+    is_current: bool,
+    data: dict[str, Any] | None,
+) -> tuple[str | None, str | None, str | None]:
+    if is_current:
+        if not data:
+            return "today —", "usage —", None
+        usage = data.get("usage")
+        today = data.get("usage_daily")
+        remaining = data.get("limit_remaining")
+        limit = data.get("limit")
+        today_line = f"${today:.2f} today" if today is not None else "today —"
+        if usage is not None and remaining is not None:
+            return today_line, f"${usage:.2f} used · ${remaining:.2f} left USD", None
+        if usage is not None and limit is not None:
+            return today_line, f"${usage:.2f} used · ${(limit - usage):.2f} left USD", None
+        if usage is not None:
+            return today_line, f"${usage:.2f} used · no limit USD", None
+        return today_line, "usage —", None
+
+    if not data:
+        return None, None, None
+    usage = data.get("usage")
+    today = data.get("usage_daily")
+    remaining = data.get("limit_remaining")
+    limit = data.get("limit")
+    parts = ["openrouter"]
+    if today is not None:
+        parts.append(f"${today:.2f} today")
+    if remaining is not None:
+        parts.append(f"${remaining:.2f} left")
+    elif usage is not None and limit is not None:
+        parts.append(f"${(limit - usage):.2f} left")
+    elif usage is not None:
+        parts.append(f"${usage:.2f} used")
+    return None, None, " · ".join(parts) if len(parts) > 1 else None
+
+
+def _claude_actual_model(cfg_model: str) -> str:
     actual = _last_model
     if not actual:
         scanned = _scan_recent_session_model()
@@ -3871,19 +3851,48 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             actual = f"{scanned}{suffix_match.group(0)}" if suffix_match else scanned
     if not actual:
         actual = cfg_model
+    return actual
 
+
+def _claude_status_context_snapshot(sid: str | None) -> dict[str, Any]:
+    # Config-level model (what settings.json asks for — may be alias like "opus[1m]").
+    # Differs from actual model name SDK reports (resolved full version).
+    try:
+        cfg = json.loads((Path.home() / ".claude/settings.json").read_text())
+        cfg_model = cfg.get("model", "—")
+    except Exception:
+        cfg_model = "—"
+    actual = _claude_actual_model(cfg_model)
     win = _last_context_window or _infer_window_from_alias(cfg_model)
     # Fallback to _last_used_tokens only when it belongs to the current session.
     # Otherwise idle-reset (4am daily restart spawns a fresh sid) leaks the
     # previous session's inflated model_usage aggregate into the new session's
     # bar — observed as "317% of 1M" before JSONL flushed the first turn.
-    fallback_used = _last_used_tokens if _last_session_id == cc._session_id else 0
-    used = _last_prompt_tokens(cc._session_id) or fallback_used
+    sid = cc.session_id
+    fallback_used = _last_used_tokens if _last_session_id == sid else 0
+    used = _last_prompt_tokens(sid) or fallback_used
     pct_ctx = (used / win * 100) if (win and used > 0) else 0.0
     bar = _progress_bar(pct_ctx)
     model_short = _short_model(actual)
     window_short = _short_window(win)
+    return {
+        "actual": actual,
+        "bar": bar,
+        "model_short": model_short,
+        "pct_ctx": pct_ctx,
+        "window_short": window_short,
+    }
 
+
+def _anthropic_quota_line(rl: dict[str, Any], window_key: str, label: str) -> str:
+    entry = rl.get(window_key) or {}
+    util = entry.get("utilization")
+    if util is None:
+        return f"{label} —"
+    return f"{label} {util * 100:.0f}% · resets {_fmt_reset(entry.get('resets_at'))}"
+
+
+async def _claude_provider_usage_snapshot() -> dict[str, str | None]:
     # Quota policy: show whatever the current /provider points at, plus a
     # secondary OpenRouter line if current isn't already OR. Tokens for other
     # OAuth accounts in providers.json may lack `user:profile` scope (403), so
@@ -3900,103 +3909,80 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     current_oauth_token = current_env.get("CLAUDE_CODE_OAUTH_TOKEN")
     is_or_current = "openrouter" in (current_env.get("ANTHROPIC_BASE_URL", "") or "").lower()
 
-    # Active provider's primary quota — POST a 1-token Claude request live and
-    # read the rate-limit response headers. Real-time, no cache, ~10 tokens
-    # of the cheapest model per /status. The request uses the *current*
-    # provider token, so quota always matches the active provider.
     session_line = week_line = None
     if current_oauth_token and not is_or_current:
         quota = await _fetch_anthropic_quota(current_oauth_token)
         rl = quota or {}
-
-        def _format(window_key: str, label: str) -> str:
-            entry = rl.get(window_key) or {}
-            util = entry.get("utilization")
-            if util is None:
-                return f"{label} —"
-            return f"{label} {util * 100:.0f}% · resets {_fmt_reset(entry.get('resets_at'))}"
-
-        session_line = _format("five_hour", "session")
-        week_line = _format("seven_day", "week")
+        session_line = _anthropic_quota_line(rl, "five_hour", "session")
+        week_line = _anthropic_quota_line(rl, "seven_day", "week")
 
     # OpenRouter — full 2-line layout when OR is current, compact 1-line
     # secondary otherwise. OR data is always fetched (cached, non-blocking).
     # Pass key from the same snapshot that drove provider_key/label so a
     # /provider switch mid-render can't desync them.
     or_key = _openrouter_key_from_providers(snapshot)
-    or_today_line = or_balance_line = or_compact_line = None
     or_data = await _fetch_or_usage(or_key)
-    if is_or_current:
-        if or_data:
-            d = or_data.get("data") or {}
-            or_used = d.get("usage")
-            or_today = d.get("usage_daily")
-            or_rem = d.get("limit_remaining")
-            or_limit = d.get("limit")
-            or_today_line = f"${or_today:.2f} today" if or_today is not None else "today —"
-            if or_used is not None and or_rem is not None:
-                or_balance_line = f"${or_used:.2f} used · ${or_rem:.2f} left USD"
-            elif or_used is not None and or_limit is not None:
-                or_balance_line = f"${or_used:.2f} used · ${(or_limit - or_used):.2f} left USD"
-            elif or_used is not None:
-                or_balance_line = f"${or_used:.2f} used · no limit USD"
-            else:
-                or_balance_line = "usage —"
-        else:
-            or_today_line, or_balance_line = "today —", "usage —"
-    elif or_data:
-        d = or_data.get("data") or {}
-        or_used = d.get("usage")
-        or_today = d.get("usage_daily")
-        or_rem = d.get("limit_remaining")
-        or_limit = d.get("limit")
-        parts = ["openrouter"]
-        if or_today is not None:
-            parts.append(f"${or_today:.2f} today")
-        if or_rem is not None:
-            parts.append(f"${or_rem:.2f} left")
-        elif or_used is not None and or_limit is not None:
-            parts.append(f"${(or_limit - or_used):.2f} left")
-        elif or_used is not None:
-            parts.append(f"${or_used:.2f} used")
-        or_compact_line = " · ".join(parts) if len(parts) > 1 else None
+    or_today_line, or_balance_line, or_compact_line = _openrouter_usage_lines(
+        is_current=is_or_current,
+        data=(or_data.get("data") or {}) if or_data else None,
+    )
 
     today_cost = await _fetch_ccusage_today()
     today_str = f"${today_cost:.2f}" if today_cost is not None else "—"
-    today_line = f"{today_str} today (ccusage) · {provider_label}"
+    return {
+        "or_balance_line": or_balance_line,
+        "or_compact_line": or_compact_line,
+        "or_today_line": or_today_line,
+        "session_line": session_line,
+        "today_line": f"{today_str} today (ccusage) · {provider_label}",
+        "week_line": week_line,
+    }
 
-    sids = cc._load_state().get("recent_sids") or []
-    sid_now = cc._session_id if cc._session_id else "(new)"
 
-    labels = {0: "hidden", 1: "flash", 2: "keep"}
+async def _cmd_status_claude(update: Update) -> None:
+    sid = cc.session_id
+    context = _claude_status_context_snapshot(sid)
+    usage = await _claude_provider_usage_snapshot()
+
+    sids = cc.recent_session_ids()
+    sid_now = sid if sid else "(new)"
 
     # Layout: header two lines in default font (no <code> — TG renders ▓/░ as
     # noisy stipple inside code blocks). Quota broken into separate lines so
     # mobile doesn't wrap awkwardly. Session UUID on its own line, same reason.
-    lines = [
-        "<b>📊 Status</b>",
-        "",
-        f"{bar} {pct_ctx:.0f}% · {html.escape(model_short)} ({window_short})",
-        "",
-        html.escape(_fmt_review_health_line()),
-    ]
-    if session_line:
-        lines.append(html.escape(session_line))
-    if week_line:
-        lines.append(html.escape(week_line))
-    if or_today_line:
-        lines.append(html.escape(or_today_line))
-        lines.append(html.escape(or_balance_line))
-    if or_compact_line:
-        lines.append(html.escape(or_compact_line))
-    lines += [
-        today_line,
-        "",
-        f"CC v{_cc_version()} · SDK v{_sdk_version()} · {labels.get(_verbose, _verbose)}",
-        f"<code>{html.escape(actual)}</code>",
-        f"<code>{sid_now}</code> · {len(sids)} recent",
-    ]
+    lines = _claude_status_lines(
+        bar=context["bar"],
+        pct_ctx=context["pct_ctx"],
+        model_short=context["model_short"],
+        window_short=context["window_short"],
+        review_line=_fmt_review_health_line(),
+        session_line=usage["session_line"],
+        week_line=usage["week_line"],
+        or_today_line=usage["or_today_line"],
+        or_balance_line=usage["or_balance_line"],
+        or_compact_line=usage["or_compact_line"],
+        today_line=usage["today_line"],
+        cc_version=_cc_version(),
+        sdk_version=_sdk_version(),
+        verbose=_verbose,
+        actual=context["actual"],
+        sid_now=sid_now,
+        recent_count=len(sids),
+    )
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current model, context usage, cost, session state."""
+    if not _allowed(update):
+        return
+    cpu_name = _current_cpu_name()
+    if cpu_name == "codex":
+        await _cmd_status_codex(update)
+    elif cpu_name == "claude":
+        await _cmd_status_claude(update)
+    else:
+        await _cmd_status_grok(update)
 
 
 def _fmt_tok(n: int) -> str:
@@ -4012,8 +3998,9 @@ async def cmd_context(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """TG /context — query the live SDK context-usage control API."""
     if not _allowed(update):
         return
-    if _current_cpu_name() != "claude":
-        await update.message.reply_text("当前 CPU 是 Codex，/context 不支持。")
+    cpu_name = _current_cpu_name()
+    if cpu_name != "claude":
+        await update.message.reply_text(f"当前 CPU 是 {engine_label(cpu_name)}，/context 不支持。")
         return
 
     wait_msg = await update.message.reply_text("查询中…")
@@ -4050,7 +4037,7 @@ async def cmd_context(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Graceful restart: 等 in-flight CC 任务跑完再让 launchd (KeepAlive=true)
-    重拉. 和 SIGTERM 走同一条 _graceful_shutdown 路径, 保证 V 手动 /restart
+    重拉. 和 SIGTERM 走同一条 _graceful_shutdown 路径, 保证手动 /restart
     不中断任务.
 
     ThrottleInterval=10s + ExitTimeOut=600s 在 plist 里设置, 最多等 10 分钟
@@ -4081,9 +4068,9 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         cpu_name = _current_cpu_name()
         had_work = await worker.has_unfinished_work()
         await worker.interrupt()
-        if cpu_name == "codex" and had_work:
+        if cpu_name != "claude" and had_work:
             return
-        if cpu_name == "codex":
+        if cpu_name != "claude":
             await update.message.reply_text("当前没有正在运行的 turn")
         else:
             await update.message.reply_text("⏸  当前 turn 已请求中断")
@@ -4122,9 +4109,8 @@ async def _switch_cpu(target: str) -> str:
     # Older state files only have one top-level session_id. Snapshot the
     # current CPU's sid into the per-engine slot before the top-level value can
     # be replaced by the target CPU.
-    if hasattr(cc, "_record_sid"):
-        with suppress(Exception):
-            cc._record_sid(getattr(cc, "_session_id", None))
+    with suppress(Exception):
+        cc.persist_current_session()
 
     new_cc = _make_tg_engine(target_name)
     new_worker = ChannelWorker(new_cc, instance_label=_CURRENT_LABEL)
@@ -4202,7 +4188,7 @@ async def on_cpu_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await q.edit_message_text(f"/cpu 失败: {type(e).__name__}: {e}")
 
 
-# cc-router 是可选外部服务 (V 私人多 Anthropic 账号切换). 没设 BABATA_CC_ROUTER_DIR
+# cc-router 是可选外部服务 (多 Anthropic 账号切换). 没设 BABATA_CC_ROUTER_DIR
 # = OSS 用户没这服务, /provider 命令降级 "未配置". V .env 设路径走原行为.
 _CC_ROUTER_DIR = os.environ.get("BABATA_CC_ROUTER_DIR", "")
 _CC_ROUTER_CLI = str(Path(_CC_ROUTER_DIR) / "cli.py") if _CC_ROUTER_DIR else ""
@@ -4357,7 +4343,7 @@ async def _run_cc_router_codex_add_relay(base_url: str, api_key: str) -> tuple[i
 
 def _codex_main_menu_markup(current_key: str):
     """Inline keyboard for the codex /provider main view. Reused on entry and
-    on back-button so the menu looks identical regardless of how V got there."""
+    on back-button so the menu looks identical regardless of navigation path."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     choices = _codex_choices()
     buttons = [
@@ -4382,7 +4368,7 @@ async def cmd_provider(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     cc-router cli 改完 ~/.claude/settings.json env 会同步清 4 个 channel 的
     session_id (避免跨 provider 续 redacted_thinking 爆), 然后 self-ops.sh
-    detached restart 4 个 launchd 实例. V 在 TG 体感 ~10s 断线再上线, 下条消息
+    detached restart 4 个 launchd 实例. TG 体感 ~10s 断线再上线, 下条消息
     走新 provider, 新 session 无上下文 (跟手动 /new 一样).
     """
     # Infrastructure-changing command: fail-closed even if ALLOWED_USER==0 (开发态后门).
@@ -4393,7 +4379,8 @@ async def cmd_provider(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     arg = args[1].strip() if len(args) > 1 else ""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-    if _current_cpu_name() == "codex":
+    cpu_name = _current_cpu_name()
+    if cpu_name == "codex":
         # codex CPU: 切 codex 账号 (symlink swap, 不重启 babata, 下条 message 生效)
         if arg:
             rc, body = await _run_cc_router_codex(arg)
@@ -4406,12 +4393,15 @@ async def cmd_provider(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("⚠️ codex_accounts 未配置 (cc-router codex init 没跑过)")
             return
         # Entering the menu clears any half-finished relay-add state from a
-        # previous turn, so V can't accidentally treat normal chat as URL+key.
+        # previous turn, so normal chat cannot accidentally be treated as URL+key.
         _ctx_user_data(ctx).pop("pending_relay_add", None)
         await update.message.reply_text(
             f"Codex 账号 (当前: {current_label}):",
             reply_markup=_codex_main_menu_markup(current_key),
         )
+        return
+    if cpu_name != "claude":
+        await update.message.reply_text(f"当前 CPU 是 {engine_label(cpu_name)}，/provider 不支持。")
         return
 
     # claude CPU: 切 Anthropic 渠道 (改 settings.json + 重启 babata)
@@ -4444,8 +4434,9 @@ async def on_provider_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     if not await _callback_allowed(q):
         return
     await q.answer()
-    if _current_cpu_name() != "claude":
-        await q.edit_message_text("CPU 已切到 Codex, Anthropic 渠道按钮失效。重新 /provider 看 codex 账号选项。")
+    cpu_name = _current_cpu_name()
+    if cpu_name != "claude":
+        await q.edit_message_text(f"CPU 已切到 {engine_label(cpu_name)}, Anthropic 渠道按钮失效。")
         return
     data = q.data or ""
     if ":" not in data:
@@ -4463,8 +4454,9 @@ async def on_codex_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     if not await _callback_allowed(q):
         return
     await q.answer()
-    if _current_cpu_name() != "codex":
-        await q.edit_message_text("CPU 已切到 Claude, Codex 账号按钮失效。重新 /provider 看 Anthropic 渠道选项。")
+    cpu_name = _current_cpu_name()
+    if cpu_name != "codex":
+        await q.edit_message_text(f"CPU 已切到 {engine_label(cpu_name)}, Codex 账号按钮失效。")
         return
     data = q.data or ""
     if ":" not in data:
@@ -4497,6 +4489,10 @@ async def on_codex_add_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     if not await _callback_allowed(q):
         return
     await q.answer()
+    cpu_name = _current_cpu_name()
+    if cpu_name != "codex":
+        await q.edit_message_text(f"CPU 已切到 {engine_label(cpu_name)}, Codex 新增入口失效。")
+        return
     data = q.data or ""
     action = data.split(":", 1)[1] if ":" in data else ""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -4574,13 +4570,14 @@ async def on_codex_add_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 async def on_codex_del_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Dispatcher for `codex_del:*`: menu → pick:<slot> → do:<slot> → back.
     Two-step (pick then confirm) because removing an entry drops the api_key
-    along with it — V's only copy if they didn't save it elsewhere."""
+    along with it — possibly the user's only copy if not saved elsewhere."""
     q = update.callback_query
     if not await _callback_allowed(q):
         return
     await q.answer()
-    if _current_cpu_name() != "codex":
-        await q.edit_message_text("CPU 已切到 Claude, Codex 删除入口失效。")
+    cpu_name = _current_cpu_name()
+    if cpu_name != "codex":
+        await q.edit_message_text(f"CPU 已切到 {engine_label(cpu_name)}, Codex 删除入口失效。")
         return
     data = q.data or ""
     action_and_arg = data.split(":", 2)
@@ -4652,9 +4649,9 @@ async def on_codex_del_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def _parse_relay_add_text(text: str) -> tuple[str, str] | tuple[None, str]:
-    """Pick a URL and an API key out of free-form V input. Returns (url, key)
+    """Pick a URL and an API key out of free-form user input. Returns (url, key)
     on success or (None, error_msg) on failure. Robust against pasted lines
-    with extra prose because V types fast."""
+    with extra prose because users type fast."""
     import re as _re
     tokens = _re.split(r"\s+", text.strip())
     url = next((t for t in tokens if t.startswith(("http://", "https://"))), None)
@@ -4669,7 +4666,7 @@ def _parse_relay_add_text(text: str) -> tuple[str, str] | tuple[None, str]:
 
 
 async def _handle_relay_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Consume V's URL+key reply after `codex_add:relay` was clicked.
+    """Consume the user's URL+key reply after `codex_add:relay` was clicked.
     Returns True if the message was consumed (don't fall through to chat).
     State is cleared whether parse succeeds or fails so a typo doesn't trap V."""
     _ctx_user_data(ctx).pop("pending_relay_add", None)
@@ -4691,13 +4688,51 @@ async def _handle_relay_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
         return
-    # If V just clicked "新增中转", the next plaintext message is the URL+key
+    # If the user just clicked "新增中转", the next plaintext message is the URL+key
     # payload — divert to add-relay handler so it never reaches CC as chat (key
     # would leak into the transcript otherwise).
     if _ctx_user_data(ctx).get("pending_relay_add"):
         if await _handle_relay_add_input(update, ctx):
             return
     await _process(update, ctx, update.message.text)
+
+
+def _consume_voice_clone_pending(file_id: str) -> Path | None:
+    """Atomically consume a pending voice-clone request and return a WAV target."""
+    pending = STATE_DIR / f"voice-clone-pending-{INSTANCE}.json"
+    try:
+        meta = json.loads(pending.read_text())
+    except FileNotFoundError:
+        return None
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("voice-clone state malformed: %s", e)
+        return None
+
+    if meta.get("expires_at", 0) <= time.time():
+        try:
+            pending.unlink(missing_ok=True)
+        except OSError as e:
+            log.warning("voice-clone stale state cleanup failed: %s", e)
+        return None
+
+    if meta.get("stage") != "awaiting_voice":
+        return None
+
+    consumed = pending.with_suffix(".json.consumed")
+    try:
+        pending.rename(consumed)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        log.warning("voice-clone state consume failed: %s", e)
+        return None
+
+    keep_wav = Path(f"/tmp/voice-clone-{INSTANCE}-{file_id}.wav")
+    try:
+        consumed.unlink(missing_ok=True)
+    except OSError as e:
+        log.warning("voice-clone consumed state cleanup failed: %s", e)
+    return keep_wav
 
 
 async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4711,28 +4746,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     path = Path(f"/tmp/voice_{voice.file_id}.ogg")
     await file.download_to_drive(path)
 
-    # voice-clone skill: 检测 pending state, 让 CC 拿到 wav 路径做声音克隆.
-    # state 文件按 BABATA_INSTANCE 隔离 (4 launchd 实例不串). 含 expires_at
-    # TTL + atomic rename consume 防 race + JSON 校验防 partial state.
-    voice_clone_state = STATE_DIR / f"voice-clone-pending-{INSTANCE}.json"
-    keep_wav: Path | None = None
-    if voice_clone_state.exists():
-        try:
-            import json as _json
-            meta = _json.loads(voice_clone_state.read_text())
-            if meta.get("expires_at", 0) > time.time():
-                # atomic consume: rename → 仅一个 handler 拿到 wav (FileNotFoundError = race lose)
-                consumed = voice_clone_state.with_suffix(".json.consumed")
-                try:
-                    voice_clone_state.rename(consumed)
-                    keep_wav = Path(f"/tmp/voice-clone-{INSTANCE}-{voice.file_id}.wav")
-                    consumed.unlink(missing_ok=True)
-                except FileNotFoundError:
-                    pass  # 别的 handler 抢到了
-            else:
-                voice_clone_state.unlink(missing_ok=True)  # stale, 自清
-        except (_json.JSONDecodeError, OSError) as _e:
-            log.warning("voice-clone state malformed: %s", _e)
+    keep_wav = _consume_voice_clone_pending(voice.file_id)
 
     try:
         text = await transcribe_voice(path, keep_wav=keep_wav)
@@ -4913,7 +4927,7 @@ _CURRENT_LABEL = INSTANCE_LABELS.get(INSTANCE, INSTANCE or PROJECT)
 # (category_id, 中文显示名, channel labels in cc.py, scan_all_buckets)
 # scan_all_buckets=True: 跨 ~/.claude/projects/<cwd-hash>/ 全部 bucket 扫.
 # tg/wx 是 babata 自己拥有的 channel, sids 在 babata 自己 cwd 对应的单 bucket
-# 里, 不用全扫. term/oneshot 是 V 在终端 (任意 cwd) 开的原生 CC, sessions
+# 里, 不用全扫. term/oneshot 是终端 (任意 cwd) 开的原生 CC, sessions
 # 散落在不同 bucket, 必须全扫才能跟终端 /resume 对齐.
 _RESUME_CATEGORIES: list[tuple[str, str, list[str], bool]] = [
     ("tg",      "当前",   [_CURRENT_LABEL],            False),
@@ -4924,13 +4938,14 @@ _RESUME_CATEGORIES: list[tuple[str, str, list[str], bool]] = [
 
 
 def _resume_categories_for_current_cpu() -> list[tuple[str, str, list[str], bool]]:
-    if _current_cpu_name() != "codex":
+    cpu_name = _current_cpu_name()
+    if cpu_name not in {"codex", "grok"}:
         return _RESUME_CATEGORIES
     cat_id, _name, labels, scan_all = _RESUME_CATEGORIES[0]
-    return [(cat_id, "当前 Codex", labels, scan_all)]
+    return [(cat_id, f"当前 {engine_label(cpu_name)}", labels, scan_all)]
 
 
-def _render_resume_channel_picker() -> tuple[str, "InlineKeyboardMarkup"]:
+def _render_resume_channel_picker() -> tuple[str, Any]:
     """Build the Level-1 渠道 picker (header text + keyboard).
 
     Shared between /resume command (initial display) and resume-back callback
@@ -4943,7 +4958,7 @@ def _render_resume_channel_picker() -> tuple[str, "InlineKeyboardMarkup"]:
         [InlineKeyboardButton(name, callback_data=f"resume-ch:{cat}")]
         for cat, name, _, _ in categories
     ]
-    cur = cc._session_id
+    cur = cc.session_id
     header = f"当前: {cur[:8]}\n选一个渠道:" if cur else "当前: (无)\n选一个渠道:"
     return header, InlineKeyboardMarkup(buttons)
 
@@ -4954,7 +4969,7 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     Level 1: 选渠道 (TG / 微信 / 终端 / 一次性). /resume 直接给的这层.
     Level 2: 选具体 session. 对应渠道内最近 5 条, 底部带"← 返回"回到 Level 1.
 
-    两级设计避免跨渠道 session 混在一个 list 里噪音大, V 明确指定"在哪个渠道
+    两级设计避免跨渠道 session 混在一个 list 里噪音大, 用户明确指定"在哪个渠道
     的历史里挑"让 picker 更聚焦. 仍然跨渠道可见 — 在 TG 里也能看到终端 /微信开的
     session, 只是需要先点对应按钮.
     """
@@ -5028,7 +5043,7 @@ async def on_resume_channel_pick(
         buttons.append([
             InlineKeyboardButton(label, callback_data=f"resume:{s['sid']}"),
         ])
-    # 底部"← 返回"回到 Level 1 渠道 picker — V 选错渠道时不用重发 /resume.
+    # 底部"← 返回"回到 Level 1 渠道 picker — 选错渠道时不用重发 /resume.
     buttons.append([
         InlineKeyboardButton("← 返回", callback_data="resume-back"),
     ])
@@ -5085,9 +5100,9 @@ async def on_resume_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     _save_state()
 
     # Cross-bucket fork: 跨 cwd-bucket 选的 sid, cc 已 import 成新 uuid 写到
-    # babata bucket (见 cc._import_jsonl_to_bucket). 这里用 cc._session_id 反映
-    # 真实激活的 sid, 让 V 知道发生了 fork.
-    active_sid = cc._session_id or sid
+    # babata bucket (见 cc._import_jsonl_to_bucket). 这里用公开 session_id 反映
+    # 真实激活的 sid, 让用户知道发生了 fork.
+    active_sid = cc.session_id or sid
     forked = active_sid != sid
 
     # 读 turn 用 *原* sid — 源文件还在原 bucket 完整可读, fork 后的副本内容跟原
@@ -5102,8 +5117,7 @@ async def on_resume_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     if turns:
         blocks = []
         for role, text in turns:
-            who = "V" if role == "user" else "CC"
-            blocks.append(f"<b>{who}:</b> {html.escape(text)}")
+            blocks.append(f"<b>{role}:</b> {html.escape(text)}")
         preview = "\n\n".join(blocks)
         body = (
             f"{head}\n\n"
@@ -5169,7 +5183,7 @@ async def _process(
 ) -> None:
     """Enqueue user input into the live CC session and return immediately."""
     update_id = getattr(update, "update_id", None)
-    # Idempotency: 重启后 TG 重交付的 update 跳过, V 不会看到重做的 reply.
+    # Idempotency: 重启后 TG 重交付的 update 跳过, 用户不会看到重做的 reply.
     if update_id in _processed_set:
         log.info("idempotent skip: update_id=%s already processed", update_id)
         return
@@ -5197,6 +5211,7 @@ async def _process(
             or "[a message]"
         )
         text = f"[Replying to]: {quoted}\n\n{text}"
+    text = _truncate_tg_input(text)
 
     try:
         payload = Payload(
@@ -5231,13 +5246,13 @@ def _with_transcript(source: str, handler):
 # ── Main ──────────────────────────────────────────────────────────────
 
 async def _post_init(app: Application) -> None:
-    global _channel_worker
+    global _channel_worker, _delivery_retry_task
     install_bot_transcript(app.bot)
     _write_runtime_status("post_init")
     await bridge.start()
     asyncio.create_task(_heartbeat_loop(app))
-    # Default context so terminal CC (no TG message yet) can push to user's TG
-    if ALLOWED_USER:
+    # Proactive TG bridge writes are opt-in; active turns set context in _begin_turn.
+    if ALLOWED_USER and os.environ.get("BABATA_TG_ENABLE_PROACTIVE_BRIDGE") == "1":
         bridge.set_context(app.bot, ALLOWED_USER, None)
     _channel_worker = ChannelWorker(cc, instance_label=_CURRENT_LABEL)
     await _channel_worker.start()
@@ -5246,18 +5261,19 @@ async def _post_init(app: Application) -> None:
     _install_signal_handlers(app)
     await _sync_bot_commands(app.bot)
     delivery_replay = await _replay_pending_deliveries(app)
+    _delivery_retry_task = asyncio.create_task(_retry_pending_deliveries_loop(app))
     pending_replay = await _replay_pending_updates(app)
 
-    # 意外重启 / launchd kickstart / 任务中 /restart → bot 重连后主动告知 V 当
+    # 意外重启 / launchd kickstart / 任务中 /restart → bot 重连后主动告知用户当
     # 前 session 号. 不走 hook (hook 只在 session 边界触发, bot 重启时 sid 没变).
     # sid 可能为 None (新进程还没跑过任何 CC session) — 显示 (new) 提示 V "接下来
     # 第一句话会开一个新 session".
     #
     # 孤儿 turn 告警: graceful shutdown 正常走完不会留孤儿; 但 SIGKILL / OOM /
     # 硬崩 绕过 graceful 时, CC CLI 被强杀来不及写完 assistant turn, jsonl 里会
-    # 留一条 user 没回复. 检测到就附警告让 V 决定 /resume (看片段) 或 /new.
+    # 留一条 user 没回复. 检测到就附警告让用户决定 /resume (看片段) 或 /new.
     if ALLOWED_USER:
-        sid = cc._session_id
+        sid = cc.session_id
         sid_display = sid if sid else "(new)"
         lines = [f"[{_CURRENT_LABEL}] 上线 · session: {sid_display}"]
         # Startup alert must always carry a reason. Graceful shutdown only peeks
@@ -5276,7 +5292,7 @@ async def _post_init(app: Application) -> None:
 
 def _spawn_weixin_if_configured() -> "subprocess.Popen | None":
     """装了 WX 就 spawn weixin_bot.py 子进程 — 让 babata 一条命令跑 TG+WX.
-    判据: WEIXIN_DATA_DIR/accounts/ 有 token 文件. 没有则 V 没装 WX, 不 spawn.
+    判据: WEIXIN_DATA_DIR/accounts/ 有 token 文件. 没有则未装 WX, 不 spawn.
     生产 launchd 模式各 channel 独立 plist 跑, 通过 BABATA_NO_AUTO_WX=1 关掉.
     """
     if os.environ.get("BABATA_NO_AUTO_WX"):
@@ -5299,32 +5315,41 @@ def main() -> None:
     _spawn_weixin_if_configured()
     app = Application.builder().token(TOKEN).concurrent_updates(True).post_init(_post_init).build()
 
-    app.add_handler(CommandHandler("status", _with_transcript("cmd_status", cmd_status)))
-    app.add_handler(CommandHandler("context", _with_transcript("cmd_context", cmd_context)))
-    app.add_handler(CommandHandler("verbose", _with_transcript("cmd_verbose", cmd_verbose)))
-    app.add_handler(CommandHandler("cpu", _with_transcript("cmd_cpu", cmd_cpu)))
-    app.add_handler(CommandHandler("resume", _with_transcript("cmd_resume", cmd_resume)))
-    app.add_handler(CommandHandler("stop", _with_transcript("cmd_stop", cmd_stop)))
-    app.add_handler(CommandHandler("restart", _with_transcript("cmd_restart", cmd_restart)))
-    app.add_handler(CommandHandler("provider", _with_transcript("cmd_provider", cmd_provider)))
-    app.add_handler(CommandHandler("new", _with_transcript("cmd_new", on_text)))
-    app.add_handler(CallbackQueryHandler(_with_transcript("cb_verbose", on_verbose_click), pattern=r"^verbose:"))
-    app.add_handler(CallbackQueryHandler(_with_transcript("cb_cpu", on_cpu_click), pattern=r"^cpu:"))
-    app.add_handler(CallbackQueryHandler(_with_transcript("cb_provider", on_provider_click), pattern=r"^provider:"))
-    app.add_handler(CallbackQueryHandler(_with_transcript("cb_codex", on_codex_click), pattern=r"^codex:"))
-    app.add_handler(CallbackQueryHandler(_with_transcript("cb_codex_add", on_codex_add_click), pattern=r"^codex_add:"))
-    app.add_handler(CallbackQueryHandler(_with_transcript("cb_codex_del", on_codex_del_click), pattern=r"^codex_del:"))
+    def add_cmd(command: str, source: str, handler) -> None:
+        app.add_handler(CommandHandler(command, _with_transcript(source, handler)))
+
+    def add_cb(source: str, handler, pattern: str) -> None:
+        app.add_handler(CallbackQueryHandler(_with_transcript(source, handler), pattern=pattern))
+
+    def add_msg(filter_expr, source: str, handler) -> None:
+        app.add_handler(MessageHandler(filter_expr, _with_transcript(source, handler)))
+
+    add_cmd("status", "cmd_status", cmd_status)
+    add_cmd("context", "cmd_context", cmd_context)
+    add_cmd("verbose", "cmd_verbose", cmd_verbose)
+    add_cmd("cpu", "cmd_cpu", cmd_cpu)
+    add_cmd("resume", "cmd_resume", cmd_resume)
+    add_cmd("stop", "cmd_stop", cmd_stop)
+    add_cmd("restart", "cmd_restart", cmd_restart)
+    add_cmd("provider", "cmd_provider", cmd_provider)
+    add_cmd("new", "cmd_new", on_text)
+    add_cb("cb_verbose", on_verbose_click, r"^verbose:")
+    add_cb("cb_cpu", on_cpu_click, r"^cpu:")
+    add_cb("cb_provider", on_provider_click, r"^provider:")
+    add_cb("cb_codex", on_codex_click, r"^codex:")
+    add_cb("cb_codex_add", on_codex_add_click, r"^codex_add:")
+    add_cb("cb_codex_del", on_codex_del_click, r"^codex_del:")
     # resume-ch: / resume-back / resume: 三个 pattern 互斥 (第 7 字符不同),
     # 注册顺序无关紧要; 仍按 specific → generic 排列利于阅读.
-    app.add_handler(CallbackQueryHandler(_with_transcript("cb_resume_channel", on_resume_channel_pick), pattern=r"^resume-ch:"))
-    app.add_handler(CallbackQueryHandler(_with_transcript("cb_resume_back", on_resume_back), pattern=r"^resume-back$"))
-    app.add_handler(CallbackQueryHandler(_with_transcript("cb_resume", on_resume_click), pattern=r"^resume:"))
-    app.add_handler(CallbackQueryHandler(_with_transcript("cb_mcp", on_button_click), pattern=r"^mcp:"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _with_transcript("text", on_text)))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, _with_transcript("voice", on_voice)))
-    app.add_handler(MessageHandler(filters.PHOTO, _with_transcript("photo", on_photo)))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, _with_transcript("video", on_video)))
-    app.add_handler(MessageHandler(filters.Document.ALL, _with_transcript("document", on_document)))
+    add_cb("cb_resume_channel", on_resume_channel_pick, r"^resume-ch:")
+    add_cb("cb_resume_back", on_resume_back, r"^resume-back$")
+    add_cb("cb_resume", on_resume_click, r"^resume:")
+    add_cb("cb_mcp", on_button_click, r"^mcp:")
+    add_msg(filters.TEXT & ~filters.COMMAND, "text", on_text)
+    add_msg(filters.VOICE | filters.AUDIO, "voice", on_voice)
+    add_msg(filters.PHOTO, "photo", on_photo)
+    add_msg(filters.VIDEO | filters.VIDEO_NOTE, "video", on_video)
+    add_msg(filters.Document.ALL, "document", on_document)
 
     log.info("Bot starting (user: %s)", ALLOWED_USER)
     # stop_signals=None: 禁用 PTB 默认 SIGTERM/SIGINT 立即停止逻辑; 我们在

@@ -1,15 +1,8 @@
 import asyncio
 import json
 import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
-
-_REPO = Path(__file__).resolve().parents[1]
-_SDK_SITE = next(iter((_REPO / ".venv/lib").glob("python*/site-packages")), None)
-if _SDK_SITE:
-    sys.path.insert(0, str(_SDK_SITE))
-sys.path.insert(0, str(_REPO))
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:test")
 os.environ.setdefault("ALLOWED_USER_ID", "0")
@@ -72,6 +65,14 @@ class FakeUpdate:
         self.callback_query = None
 
 
+class FakeCallbackQuery:
+    def __init__(self, message: FakeMessage):
+        self.id = "cb-1"
+        self.data = "action:ok"
+        self.from_user = FakeUser(43)
+        self.message = message
+
+
 def _read_one(path: Path) -> dict:
     return json.loads(path.read_text().splitlines()[0])
 
@@ -80,7 +81,14 @@ def _read_all(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
-def test_record_update_keeps_text_reply_and_media(tmp_path, monkeypatch):
+def test_truncate_is_idempotent(monkeypatch):
+    monkeypatch.setattr(tg_transcript, "_MAX_TEXT", 8)
+    truncated = tg_transcript._truncate("abcdefghijk")
+
+    assert tg_transcript._truncate(truncated) == truncated
+
+
+def test_record_update_keeps_primary_text_but_not_reply_text(tmp_path, monkeypatch):
     transcript = tmp_path / "tg.jsonl"
     monkeypatch.setattr(tg_transcript, "TRANSCRIPT_FILE", transcript)
     msg = FakeMessage(10, "hello")
@@ -94,10 +102,44 @@ def test_record_update_keeps_text_reply_and_media(tmp_path, monkeypatch):
     assert event["source"] == "text"
     assert event["update_id"] == 99
     assert event["message"]["text"] == "hello"
-    assert event["message"]["reply_to"]["text"] == "older"
+    assert event["message"]["reply_to"]["message_id"] == 9
+    assert "text" not in event["message"]["reply_to"]
+    assert "older" not in transcript.read_text(encoding="utf-8")
     assert event["message"]["media"][0]["kind"] == "photo"
     assert event["message"]["media"][0]["file_id"] == "large"
     assert event["message"]["media"][0]["photo_count"] == 2
+
+
+def test_record_update_caps_primary_text_with_hash(tmp_path, monkeypatch):
+    transcript = tmp_path / "tg.jsonl"
+    monkeypatch.setattr(tg_transcript, "TRANSCRIPT_FILE", transcript)
+    monkeypatch.setattr(tg_transcript, "_MAX_TEXT", 32)
+    text = "hello-" + ("x" * 80) + "-TEXT-TAIL"
+
+    tg_transcript.record_update(FakeUpdate(FakeMessage(10, text)), "text")
+
+    raw = transcript.read_text(encoding="utf-8")
+    assert "TEXT-TAIL" not in raw
+    event = _read_one(transcript)
+    assert event["message"]["text"].endswith("chars]")
+    assert event["message"]["text_sha256"] == tg_transcript._sha256_text(text)
+    assert event["message"]["text_bytes"] == len(text.encode("utf-8"))
+
+
+def test_record_update_keeps_callback_data_but_not_callback_message_text(tmp_path, monkeypatch):
+    transcript = tmp_path / "tg.jsonl"
+    monkeypatch.setattr(tg_transcript, "TRANSCRIPT_FILE", transcript)
+    msg = FakeMessage(10, "button context")
+    update = FakeUpdate(msg)
+    update.callback_query = FakeCallbackQuery(msg)
+
+    tg_transcript.record_update(update, "callback")
+
+    event = _read_one(transcript)
+    assert event["callback_query"]["data"] == "action:ok"
+    assert event["callback_query"]["message"]["message_id"] == 10
+    assert "text" not in event["callback_query"]["message"]
+    assert transcript.read_text(encoding="utf-8").count("button context") == 1
 
 
 def test_record_update_summary_failure_does_not_raise(tmp_path, monkeypatch):
@@ -153,6 +195,36 @@ def test_install_bot_transcript_logs_outbound_even_for_slot_bot(tmp_path, monkey
     assert result["phase"] == "result"
     assert result["event_id"] == attempt["event_id"]
     assert result["result"]["message_id"] == 44
+    assert "text" not in result["result"]
+
+
+def test_install_bot_transcript_caps_outbound_text_with_hash(tmp_path, monkeypatch):
+    transcript = tmp_path / "tg.jsonl"
+    monkeypatch.setattr(tg_transcript, "TRANSCRIPT_FILE", transcript)
+    monkeypatch.setattr(tg_transcript, "_MAX_TEXT", 32)
+    text = "reply-" + ("r" * 80) + "-OUTBOUND-TAIL"
+
+    class SlotBot:
+        __slots__ = ()
+
+        async def send_message(self, chat_id, text, **kwargs):
+            msg = FakeMessage(44, text)
+            msg.chat = FakeChat(chat_id)
+            return msg
+
+    async def run():
+        bot = SlotBot()
+        tg_transcript.install_bot_transcript(bot)
+        await bot.send_message(chat_id=123, text=text)
+
+    asyncio.run(run())
+
+    raw = transcript.read_text(encoding="utf-8")
+    assert "OUTBOUND-TAIL" not in raw
+    attempt, _result = _read_all(transcript)
+    assert attempt["request"]["text"].endswith("chars]")
+    assert attempt["request"]["text_sha256"] == tg_transcript._sha256_text(text)
+    assert attempt["request"]["text_bytes"] == len(text.encode("utf-8"))
 
 
 def test_install_bot_transcript_summary_failure_still_sends(tmp_path, monkeypatch):
@@ -186,12 +258,14 @@ def test_install_bot_transcript_summary_failure_still_sends(tmp_path, monkeypatc
 def test_install_bot_transcript_logs_outbound_error_after_attempt(tmp_path, monkeypatch):
     transcript = tmp_path / "tg.jsonl"
     monkeypatch.setattr(tg_transcript, "TRANSCRIPT_FILE", transcript)
+    monkeypatch.setattr(tg_transcript, "_MAX_TEXT", 32)
+    error_message = "telegram-" + ("e" * 80) + "-ERROR-TAIL"
 
     class FailingBot:
         __slots__ = ()
 
         async def send_message(self, chat_id, text, **kwargs):
-            raise RuntimeError("telegram down")
+            raise RuntimeError(error_message)
 
     async def run():
         bot = FailingBot()
@@ -211,3 +285,7 @@ def test_install_bot_transcript_logs_outbound_error_after_attempt(tmp_path, monk
     assert error["phase"] == "error"
     assert error["event_id"] == attempt["event_id"]
     assert error["error"]["type"] == "RuntimeError"
+    assert "ERROR-TAIL" not in transcript.read_text(encoding="utf-8")
+    assert error["error"]["message_preview"].endswith("chars]")
+    assert error["error"]["message_sha256"] == tg_transcript._sha256_text(error_message)
+    assert error["error"]["message_bytes"] == len(error_message.encode("utf-8"))

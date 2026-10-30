@@ -1,7 +1,8 @@
 """Weixin iLink bot protocol — HTTP client + QR login + CDN AES.
 
-Raw protocol layer. No state persistence, no business logic; caller owns
-token / sync_buf / context_tokens / account index storage. Port of
+Raw protocol layer. Caller owns token / sync_buf / context_tokens / account
+index storage; the client only keeps the per-message reply quota (see
+REPLY_QUOTA) in the file the caller names. Port of
 @tencent-weixin/openclaw-weixin (MIT) src/api/api.ts + src/auth/login-qr.ts
 + src/cdn/upload.ts + aes-ecb.ts.
 """
@@ -9,12 +10,15 @@ token / sync_buf / context_tokens / account index storage. Port of
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
-from pathlib import Path
 import secrets
+import stat
+import tempfile
 from secrets import token_bytes
 from typing import Any
 from urllib.parse import quote
@@ -36,7 +40,7 @@ ILINK_APP_ID = os.environ.get("WEIXIN_ILINK_APP_ID", "bot")
 
 # Mirror the upstream plugin version so the server-side client-version gate
 # behaves the same. Bump when the iLink protocol changes materially.
-CLIENT_VERSION_STR = "2.1.8"  # mirror npm openclaw-weixin; "1.0.0" 直接 CDN 404
+CLIENT_VERSION_STR = "2.4.10"  # mirror npm openclaw-weixin; "1.0.0" 直接 CDN 404
 CLIENT_VERSION_INT = (
     ((int(CLIENT_VERSION_STR.split(".")[0]) & 0xFF) << 16)
     | ((int(CLIENT_VERSION_STR.split(".")[1]) & 0xFF) << 8)
@@ -59,7 +63,11 @@ LOGIN_TOTAL_TIMEOUT_S = 480
 MEDIA_IMAGE = 1
 MEDIA_VIDEO = 2
 MEDIA_FILE = 3
-MEDIA_VOICE = 4
+
+IMAGE_FETCH_MAX = 20 * 1024 * 1024
+# Big PNGs (GPT images run 2-3MB) upload slowly and fail more often on the WeChat CDN.
+UPLOAD_JPEG_OVER = 1024 * 1024
+UPLOAD_REENCODE_MAX_PIXELS = 40_000_000  # decompression-bomb guard for sips
 
 # Inbound MessageItem type values (proto: MessageItemType).
 ITEM_TEXT = 1
@@ -75,6 +83,20 @@ class WeixinSessionExpired(Exception):
 
 class WeixinApiError(Exception):
     """Non-zero ret or HTTP error."""
+
+
+class WeixinQuotaExhausted(WeixinApiError):
+    """Reply quota used up: the send is queued and goes out after the peer's next message."""
+
+
+# iLink lets the bot send about 10 messages (text or media) per inbound message; each
+# inbound message brings a fresh context_token and resets the count. Past it every send
+# is ret=-2 "prepare failed". No official doc: third-party SDKs (weilink) state 10, and
+# our 2026-10-30 log matched it. The last slot is kept for QUOTA_NOTICE.
+REPLY_QUOTA = 10
+QUOTA_NOTICE = "（微信限制：你每发一条消息，我最多回 10 条。这次的额度用完了，回我任意一句，我就把剩下的发出来。）"
+QUOTA_KEEP_TOKENS = 20
+BACKLOG_MAX = 30
 
 
 # ── header helpers ────────────────────────────────────────────────────
@@ -96,12 +118,7 @@ def _common_headers() -> dict[str, str]:
 # ── AES-128-ECB (CDN media crypto) ────────────────────────────────────
 
 
-def aes_ecb_padded_size(rawsize: int) -> int:
-    """PKCS7 pads to next 16-byte boundary; full block added when already aligned."""
-    return ((rawsize // 16) + 1) * 16
-
-
-def encrypt_aes_ecb(plaintext: bytes, key: bytes) -> bytes:
+def _encrypt_aes_ecb(plaintext: bytes, key: bytes) -> bytes:
     if len(key) != 16:
         raise ValueError(f"AES-128 key must be 16 bytes, got {len(key)}")
     padder = PKCS7(128).padder()
@@ -110,7 +127,7 @@ def encrypt_aes_ecb(plaintext: bytes, key: bytes) -> bytes:
     return enc.update(padded) + enc.finalize()
 
 
-def decrypt_aes_ecb(ciphertext: bytes, key: bytes) -> bytes:
+def _decrypt_aes_ecb(ciphertext: bytes, key: bytes) -> bytes:
     if len(key) != 16:
         raise ValueError(f"AES-128 key must be 16 bytes, got {len(key)}")
     dec = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
@@ -119,7 +136,7 @@ def decrypt_aes_ecb(ciphertext: bytes, key: bytes) -> bytes:
     return unpadder.update(padded) + unpadder.finalize()
 
 
-def parse_inbound_aes_key(raw: str | None) -> bytes | None:
+def _parse_inbound_aes_key(raw: str | None) -> bytes | None:
     """Decode inbound AES key from one of 3 protocol shapes.
 
     The protocol emits keys in inconsistent encodings across media types:
@@ -150,7 +167,7 @@ def parse_inbound_aes_key(raw: str | None) -> bytes | None:
     return None
 
 
-def encode_outbound_aes_key(key: bytes) -> str:
+def _encode_outbound_aes_key(key: bytes) -> str:
     """CDNMedia.aes_key = base64 of hex-string (not base64 of raw bytes)."""
     return base64.b64encode(key.hex().encode()).decode()
 
@@ -292,12 +309,78 @@ class WeixinClient:
         token: str,
         account_id: str = "",
         cdn_base_url: str | None = None,
+        quota_path: str | os.PathLike | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.account_id = account_id
         self.cdn_base_url = (cdn_base_url or DEFAULT_CDN_BASE_URL).rstrip("/")
         self._paused_until: float = 0.0
+        self._quota_path = quota_path
+        self._quota = self._load_quota()
+
+    # ── reply quota ──────────────────────────────────────────────────
+
+    def _load_quota(self) -> dict[str, Any]:
+        data: Any = {}
+        if self._quota_path:
+            try:
+                with open(self._quota_path) as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                pass
+        if not isinstance(data, dict):
+            data = {}
+        return {"sent": dict(data.get("sent") or {}), "backlog": list(data.get("backlog") or [])}
+
+    def _save_quota(self) -> None:
+        sent = self._quota["sent"]
+        for old in list(sent)[:-QUOTA_KEEP_TOKENS]:
+            del sent[old]
+        if not self._quota_path:
+            return
+        tmp = f"{self._quota_path}.tmp"
+        # Holds context tokens and media keys: owner-only.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(self._quota, f, ensure_ascii=False)
+        os.replace(tmp, self._quota_path)
+
+    def quota_left(self, context_token: str | None) -> int | None:
+        """Sends left for content (the notice slot excluded); None when untracked."""
+        if not context_token:
+            return None
+        return max(0, REPLY_QUOTA - 1 - self._quota["sent"].get(context_token, 0))
+
+    def _queue(self, to_user_id: str, item_list: list[dict[str, Any]]) -> None:
+        backlog = self._quota["backlog"]
+        if len(backlog) < BACKLOG_MAX:
+            backlog.append({"to": to_user_id, "items": item_list})
+        else:
+            log.warning("reply backlog full (%d), dropping a send to %s", BACKLOG_MAX, to_user_id)
+
+    def _exhaust(self, to_user_id: str, item_list: list[dict[str, Any]], context_token: str) -> None:
+        self._quota["sent"][context_token] = REPLY_QUOTA
+        self._queue(to_user_id, item_list)
+        self._save_quota()
+
+    async def flush_backlog(self, to_user_id: str, context_token: str | None) -> int:
+        """Send what queued up for this peer with its fresh token, oldest first; returns how many went out."""
+        mine = [b for b in self._quota["backlog"] if b.get("to") == to_user_id]
+        if not mine or not context_token:
+            return 0
+        self._quota["backlog"] = [b for b in self._quota["backlog"] if b.get("to") != to_user_id]
+        self._save_quota()
+        for i, entry in enumerate(mine):
+            try:
+                await self.send_message(to_user_id, entry["items"], context_token=context_token)
+            except WeixinQuotaExhausted:  # send_message re-queued this one; the rest follow it
+                self._quota["backlog"].extend(mine[i + 1:])
+                self._save_quota()
+                return i
+            except Exception as e:  # e.g. a media ref that expired meanwhile
+                log.warning("dropping queued send to %s: %s", to_user_id, e)
+        return len(mine)
 
     # ── session pause ────────────────────────────────────────────────
 
@@ -311,10 +394,6 @@ class WeixinClient:
     def _pause(self) -> None:
         self._paused_until = time.time() + SESSION_PAUSE_SECONDS
         log.warning("session paused 1h for accountId=%s", self.account_id)
-
-    @property
-    def is_paused(self) -> bool:
-        return self._paused_until > time.time()
 
     # ── core POST ────────────────────────────────────────────────────
 
@@ -371,7 +450,7 @@ class WeixinClient:
         item_list: list[dict[str, Any]],
         *,
         context_token: str | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Send one message. `item_list` is 1+ MessageItem dicts.
 
         Every call auto-generates a fresh `client_id` and carries an empty
@@ -383,7 +462,36 @@ class WeixinClient:
         Caller builds each item, e.g.
             {"type": 1, "text_item": {"text": "hi"}}
             {"type": 2, "image_item": {"media": {...}, "mid_size": N}}
+
+        With a context_token the reply quota applies: once the content slots are
+        used, the send is queued, the peer gets QUOTA_NOTICE once, and
+        WeixinQuotaExhausted is raised.
         """
+        if context_token and not self.quota_left(context_token):
+            first_refusal = self._quota["sent"].get(context_token, 0) < REPLY_QUOTA
+            self._exhaust(to_user_id, item_list, context_token)
+            if first_refusal:
+                try:
+                    await self._send(to_user_id, [text_item(QUOTA_NOTICE)], context_token)
+                except WeixinApiError as e:
+                    log.warning("quota notice not delivered: %s", e)
+            raise WeixinQuotaExhausted("reply quota used up; queued until the peer's next message")
+        try:
+            resp = await self._send(to_user_id, item_list, context_token)
+        except WeixinApiError as e:
+            if context_token and "ret=-2" in str(e):  # the server counted more than we did
+                self._exhaust(to_user_id, item_list, context_token)
+                raise WeixinQuotaExhausted(f"{e}; queued until the peer's next message") from e
+            raise
+        if context_token:
+            sent = self._quota["sent"]
+            sent[context_token] = sent.pop(context_token, 0) + 1  # re-insert: newest last
+            self._save_quota()
+        return resp
+
+    async def _send(
+        self, to_user_id: str, item_list: list[dict[str, Any]], context_token: str | None,
+    ) -> dict[str, Any]:
         client_id = f"babata-weixin-{secrets.token_hex(12)}"
         msg: dict[str, Any] = {
             "from_user_id": "",
@@ -407,6 +515,12 @@ class WeixinClient:
             [it.get("type") for it in item_list],
             resp,
         )
+        # HTTP 200 with non-zero ret is a rejected send, not a delivered one.
+        if resp.get("ret"):
+            raise WeixinApiError(
+                f"sendmessage ret={resp.get('ret')} errmsg={resp.get('errmsg') or ''}"
+            )
+        return resp
 
     async def get_upload_url(
         self,
@@ -487,7 +601,7 @@ class WeixinClient:
         """
         key = token_bytes(16)
         filekey = token_bytes(16).hex()
-        ciphertext = encrypt_aes_ecb(data, key)
+        ciphertext = _encrypt_aes_ecb(data, key)
         rawsize = len(data)
         filesize = len(ciphertext)
         md5 = hashlib.md5(data).hexdigest()
@@ -519,7 +633,7 @@ class WeixinClient:
 
         return {
             "encrypt_query_param": download_param,
-            "aes_key": encode_outbound_aes_key(key),
+            "aes_key": _encode_outbound_aes_key(key),
             "full_url": (
                 f"{self.cdn_base_url}/download"
                 f"?encrypted_query_param={quote(download_param, safe='')}"
@@ -589,9 +703,10 @@ class WeixinClient:
                     key = None
             except ValueError:
                 key = None
+        raw_key = cdn_media.get("aes_key")
         if key is None:
-            key = parse_inbound_aes_key(cdn_media.get("aes_key"))
-        if key is None:
+            key = _parse_inbound_aes_key(raw_key)
+        if key is None and raw_key:
             raise WeixinApiError("download_media: could not parse aes_key")
 
         full_url = (cdn_media.get("full_url") or "").strip()
@@ -599,14 +714,65 @@ class WeixinClient:
             qp = cdn_media.get("encrypt_query_param")
             if not qp:
                 raise WeixinApiError("download_media: no full_url or encrypt_query_param")
-            full_url = f"{self.cdn_base_url}/{qp.lstrip('/')}"
+            full_url = (
+                f"{self.cdn_base_url}/download"
+                f"?encrypted_query_param={quote(qp, safe='')}"
+            )
 
         async with httpx.AsyncClient(timeout=120) as c:
             r = await c.get(full_url)
             r.raise_for_status()
-            ciphertext = r.content
+            content = r.content
 
-        return decrypt_aes_ecb(ciphertext, key)
+        # Some images arrive without any key: the CDN serves them in plaintext.
+        return _decrypt_aes_ecb(content, key) if key else content
+
+
+# ── WeChat Markdown compat (mirror of plugin markdown-filter.ts) ───────
+# The WeChat client renders headings H1-H4, bold, lists, quotes, tables,
+# inline code and fences. It garbles italics around CJK text, ignores
+# H5/H6, and cannot render images inline, so those are rewritten here.
+
+_MD_PROTECTED_RE = re.compile(r"```.*?(?:```|\Z)|`[^`\n]+`", re.DOTALL)
+_MD_IMAGE_RE = re.compile(r'!\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)')
+_MD_DEEP_HEADING_RE = re.compile(r"^#{5,6}[ \t]+", re.MULTILINE)
+_MD_EMPHASIS_RE = re.compile(
+    r"(?<![*_\\])(\*{3}|_{3}|\*|_)(?=[^\s*_])([^\n]+?)(?<=[^\s*_])\1(?![*_])"
+)
+_CJK_RE = re.compile(r"[\u2E80-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF]")
+
+
+def _unwrap_cjk_emphasis(m: re.Match) -> str:
+    marker, body = m.group(1), m.group(2)
+    if "_" in marker and re.search(r"\w", m.string[m.start() - 1:m.start()] or ""):
+        return m.group(0)  # snake_case identifiers are not emphasis
+    return body if _CJK_RE.search(body) else m.group(0)
+
+
+def wechat_markdown(text: str) -> tuple[str, list[str]]:
+    """Adapt Markdown for the WeChat client. Returns (text, image_targets).
+
+    image_targets are the `![alt](target)` paths/URLs removed from the text;
+    the caller uploads them as real image messages. Code is left untouched.
+    """
+    images: list[str] = []
+
+    def outside(seg: str) -> str:
+        def take_image(m: re.Match) -> str:
+            images.append(m.group(2))
+            return ""
+        seg = _MD_IMAGE_RE.sub(take_image, seg)
+        seg = _MD_DEEP_HEADING_RE.sub("", seg)
+        return _MD_EMPHASIS_RE.sub(_unwrap_cjk_emphasis, seg)
+
+    out: list[str] = []
+    pos = 0
+    for m in _MD_PROTECTED_RE.finditer(text):
+        out.append(outside(text[pos:m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(outside(text[pos:]))
+    return "".join(out), images
 
 
 # ── item builders (convenience for send_message) ──────────────────────
@@ -645,6 +811,101 @@ def video_item(uploaded: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")
+
+
+def _is_image_bytes(data: bytes) -> bool:
+    if data.startswith(_IMAGE_MAGIC):
+        return True
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return True
+    # BMP: "BM" alone is too weak; its header also carries the exact file size.
+    return data[:2] == b"BM" and int.from_bytes(data[2:6], "little") == len(data)
+
+
+async def send_image(
+    client: "WeixinClient",
+    to_user_id: str,
+    source: str,
+    *,
+    context_token: str | None = None,
+) -> dict[str, Any]:
+    """Upload a local image path or http(s) URL, then send it as an image.
+
+    Only real image bytes are sent, so a Markdown image pointing at some other
+    file can never upload that file.
+    """
+    if source.startswith(("http://", "https://")):
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
+            async with c.stream("GET", source) as r:
+                r.raise_for_status()
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in r.aiter_bytes():
+                    size += len(chunk)
+                    if size > IMAGE_FETCH_MAX:
+                        raise WeixinApiError(f"image larger than {IMAGE_FETCH_MAX} bytes")
+                    chunks.append(chunk)
+        data = b"".join(chunks)
+    else:
+        path = os.path.realpath(os.path.expanduser(source.removeprefix("file://")))
+        with open(path, "rb") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                raise WeixinApiError("not a regular file")
+            data = fh.read(IMAGE_FETCH_MAX + 1)
+        if len(data) > IMAGE_FETCH_MAX:
+            raise WeixinApiError(f"image larger than {IMAGE_FETCH_MAX} bytes")
+    if not _is_image_bytes(data):
+        raise WeixinApiError("not an image (jpg/png/gif/webp/bmp)")
+    data = await _jpeg_for_upload(data)
+    uploaded = await client.upload_media(data, to_user_id=to_user_id, media_type=MEDIA_IMAGE)
+    return await client.send_message(
+        to_user_id, [image_item(uploaded)], context_token=context_token,
+    )
+
+
+async def _sips(args: list[str], timeout: float) -> bytes:
+    """Run sips; on timeout or error the process is killed, never left running."""
+    proc = await asyncio.create_subprocess_exec(
+        "sips", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+    if proc.returncode != 0:
+        raise WeixinApiError(f"sips exit {proc.returncode}")
+    return out
+
+
+async def _jpeg_for_upload(data: bytes) -> bytes:
+    """Re-encode a large still image as quality-90 JPEG at full resolution; the original wins
+    if it's small, animated (GIF), oversized in pixels, or the conversion fails or doesn't help."""
+    if len(data) <= UPLOAD_JPEG_OVER or data.startswith((b"GIF87a", b"GIF89a")):
+        return data
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = os.path.join(tmp, "in"), os.path.join(tmp, "out.jpg")
+        with open(src, "wb") as fh:
+            fh.write(data)
+        try:
+            # Header-only read first: a small file can still decode to a huge bitmap.
+            dims = re.findall(rb"pixel(?:Width|Height): (\d+)", await _sips(
+                ["-g", "pixelWidth", "-g", "pixelHeight", src], timeout=10))
+            if len(dims) != 2 or int(dims[0]) * int(dims[1]) > UPLOAD_REENCODE_MAX_PIXELS:
+                return data
+            await _sips(["-s", "format", "jpeg", "-s", "formatOptions", "90", src, "--out", dst], timeout=30)
+            if os.path.getsize(dst) >= len(data):
+                return data
+            with open(dst, "rb") as fh:
+                jpeg = fh.read()
+        except Exception as e:
+            log.warning("jpeg re-encode failed, sending original: %s", e)
+            return data
+    return jpeg if jpeg.startswith(b"\xff\xd8\xff") else data
+
+
 def file_item(uploaded: dict[str, Any], file_name: str) -> dict[str, Any]:
     return {
         "type": ITEM_FILE,
@@ -653,29 +914,5 @@ def file_item(uploaded: dict[str, Any], file_name: str) -> dict[str, Any]:
             "file_name": file_name,
             "md5": uploaded["md5"],
             "len": str(uploaded["raw_size"]),
-        },
-    }
-
-
-def voice_item(uploaded: dict[str, Any], *, playtime: int = 0, **_unused: Any) -> dict[str, Any]:
-    """[NOT REACHABLE — see weixin_mcp.py / weixin_bridge.py 同名 verdict]
-
-    2026-04-26 round 2 verdict 实证: ilink server silent filter bot→user voice.
-    保留函数仅为 import 不破裂; wx_send_voice MCP tool 已下线, _handle_send_voice
-    fail-fast 兜底, 这里不会被调到. 字段是 Java SDK live wire dump 实测值
-    (encode_type=7, playtime, sample_rate=24000, media has 3 fields) — 即使将来
-    协议放开重启探索, 这是已知最贴近的起点. 实证证据见
-    `~/cc-workspace/memory/feedback_ilink_voice_send_blocked.md`.
-    """
-    media = _media_ref(uploaded)
-    if uploaded.get("full_url"):
-        media["full_url"] = uploaded["full_url"]
-    return {
-        "type": ITEM_VOICE,
-        "voice_item": {
-            "media": media,
-            "encode_type": 7,
-            "playtime": int(playtime or 0),
-            "sample_rate": 24000,
         },
     }

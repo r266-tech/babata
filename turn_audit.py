@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 import uuid
@@ -22,9 +23,8 @@ from typing import Any
 from constants import NAMESPACE, STATE_DIR
 
 
-_MAX_PROMPT_PREVIEW = 500
-_MAX_FINAL_PREVIEW = 800
-_MAX_COMMAND_PREVIEW = 500
+_MAX_ERROR_PREVIEW = 240
+_MAX_COMMAND_PREVIEW = 240
 _MAX_CHECK_OUTPUT = 4000
 _MAX_FILE_BYTES = 512 * 1024
 _DEFAULT_CHECK_TIMEOUT_SECONDS = 180
@@ -90,11 +90,11 @@ class TurnAudit:
     record: dict[str, Any] = field(default_factory=dict)
 
 
-def audit_enabled() -> bool:
+def _audit_enabled() -> bool:
     return os.environ.get("BABATA_TURN_LEDGER", "1") != "0"
 
 
-def guard_mode() -> str:
+def _guard_mode() -> str:
     mode = os.environ.get("BABATA_DETERMINISTIC_GUARDS", "observe").strip().lower()
     if mode in {"0", "off", "false", "disabled"}:
         return "off"
@@ -103,11 +103,11 @@ def guard_mode() -> str:
     return "observe"
 
 
-def declared_checks_enabled() -> bool:
+def _declared_checks_enabled() -> bool:
     return os.environ.get("BABATA_DECLARED_CHECKS", "1") != "0"
 
 
-def review_bus_mode() -> str:
+def _review_bus_mode() -> str:
     mode = os.environ.get("BABATA_REVIEW_BUS", "off").strip().lower()
     if mode in {"0", "off", "false", "disabled"}:
         return "off"
@@ -132,7 +132,7 @@ def begin_turn(
     Disabled audit is a true no-op, so tests and special runtimes can opt out by
     setting BABATA_TURN_LEDGER=0.
     """
-    if not audit_enabled():
+    if not _audit_enabled():
         return None
 
     actual_cwd = Path(cwd or os.getcwd()).expanduser().resolve()
@@ -181,7 +181,8 @@ def begin_turn(
             "baseline_sensitive_files": sorted(baseline_sensitive_files),
         },
         "declared_checks_config": checks_config_rel,
-        "prompt_preview": _preview(prompt, _MAX_PROMPT_PREVIEW),
+        "prompt_sha256": _sha256_text(prompt),
+        "prompt_bytes": _text_bytes(prompt),
         "images_count": images_count,
     }
     _append_jsonl(_ledger_path(), turn.record)
@@ -240,16 +241,14 @@ def finish_turn(
         },
         "tools": tool_names,
         "tool_uses": _compact_tool_uses(tool_uses),
-        "guard_mode": guard_mode(),
+        "guard_mode": _guard_mode(),
         "guard_findings": guard_findings,
         "declared_checks": check_results,
-        "review_bus_mode": review_bus_mode(),
+        "review_bus_mode": _review_bus_mode(),
         "review_tasks": review_tasks,
-        "final_preview": _preview(final_content, _MAX_FINAL_PREVIEW),
-        "error": {
-            "type": type(error).__name__,
-            "message": str(error),
-        } if error else None,
+        "final_sha256": _sha256_text(final_content),
+        "final_bytes": _text_bytes(final_content),
+        "error": _error_record(error),
     }
     _append_jsonl(_ledger_path(), record)
     return _public_summary(record)
@@ -261,133 +260,200 @@ def run_deterministic_guards(
     changed_files: list[str],
     tool_uses: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    mode = guard_mode()
+    mode = _guard_mode()
     if mode == "off":
         return []
 
     findings: list[dict[str, Any]] = []
     for rel in changed_files:
-        rel_posix = rel.replace("\\", "/")
-        name = Path(rel_posix).name
-        lower = rel_posix.lower()
-        if name == ".env" or name.startswith(".env."):
-            findings.append(_finding(
-                "high",
-                "env-file-changed",
-                "Environment/secret file changed; keep local secrets out of repo commits and public artifacts.",
-                path=rel,
-                blocking=True,
-            ))
-        if "chat-archive" in lower or "/raw/" in lower and "archive" in lower:
-            findings.append(_finding(
-                "medium",
-                "raw-archive-change",
-                "Raw/archive layer changed; babata raw records are append-only unless explicitly authorized.",
-                path=rel,
-            ))
-        if _is_ops_path(rel_posix):
-            findings.append(_finding(
-                "medium",
-                "ops-boundary-file",
-                "Launchd/self-ops surface changed; verify rollout uses scripts/self-ops.sh instead of inline service mutation.",
-                path=rel,
-            ))
-
-        if repo_root is None:
-            continue
-        fp = (repo_root / rel).resolve()
-        if not _safe_child(repo_root, fp) or not fp.is_file() or not _looks_text(fp):
-            continue
-        content = _read_small_text(fp)
-        if not content:
-            continue
-        for rule, pattern in _SECRET_PATTERNS:
-            if pattern.search(content):
-                findings.append(_finding(
-                    "high",
-                    f"secret-pattern:{rule}",
-                    "Changed file contains a token-like secret pattern.",
-                    path=rel,
-                    blocking=True,
-                ))
-        if "launchctl kickstart" in content or "launchctl bootstrap" in content or "launchctl bootout" in content:
-            if rel_posix != "scripts/self-ops.sh":
-                findings.append(_finding(
-                    "high",
-                    "inline-launchctl",
-                    "Service mutation must go through scripts/self-ops.sh for detached self-ops safety.",
-                    path=rel,
-                    blocking=True,
-                ))
+        findings.extend(_changed_file_guard_findings(repo_root, rel))
 
     for tool in tool_uses:
-        name = str(tool.get("name") or "")
-        path = _tool_path(tool)
-        if path:
-            path_name = Path(path.replace("\\", "/")).name
-            if path_name == ".env" or path_name.startswith(".env."):
-                findings.append(_finding(
-                    "high",
-                    "env-file-tool-request",
-                    "Tool request targets an environment/secret file.",
-                    path=path,
-                    blocking=True,
-                ))
-            if _is_ops_path(path):
-                findings.append(_finding(
-                    "medium",
-                    "ops-boundary-tool-request",
-                    "Tool request targets launchd/self-ops surface.",
-                    path=path,
-                ))
-        if tool.get("content_has_secret"):
-            findings.append(_finding(
-                "high",
-                "secret-pattern:tool-input",
-                "Tool input contains a token-like secret pattern.",
-                path=path,
-                blocking=True,
-            ))
-        if tool.get("content_has_launchctl") and path != "scripts/self-ops.sh":
-            findings.append(_finding(
-                "high",
-                "inline-launchctl-tool-input",
-                "Tool input contains launchd mutation outside scripts/self-ops.sh.",
-                path=path,
-                blocking=True,
-            ))
-        command = _tool_command(tool)
-        if not command:
-            continue
-        lowered = command.lower()
-        if name.lower() == "bash" or "bash" in name.lower() or "command" in tool:
-            if re.search(r"\bgit\s+(?:reset\s+--hard|checkout\s+--|clean\s+-[fd])\b", command):
-                findings.append(_finding(
-                    "high",
-                    "dangerous-git-command",
-                    "Dangerous git command was requested; only run with explicit user authorization.",
-                    command=command,
-                    blocking=True,
-                ))
-            if "launchctl kickstart" in lowered or "launchctl bootstrap" in lowered or "launchctl bootout" in lowered:
-                if "scripts/self-ops.sh" not in lowered:
-                    findings.append(_finding(
-                        "high",
-                        "inline-launchctl-command",
-                        "Launchd mutation command bypassed scripts/self-ops.sh.",
-                        command=command,
-                        blocking=True,
-                    ))
-            if re.search(r"\b(?:rm\s+-rf|trash\s+).*(?:/state/|chat-archive|memory)\b", lowered):
-                findings.append(_finding(
-                    "high",
-                    "destructive-memory-command",
-                    "Command appears to delete state/memory/archive data.",
-                    command=command,
-                    blocking=True,
-                ))
+        findings.extend(_tool_guard_findings(tool))
 
     return _dedupe_findings(findings)
+
+
+def _changed_file_guard_findings(repo_root: Path | None, rel: str) -> list[dict[str, Any]]:
+    rel_posix = rel.replace("\\", "/")
+    name = Path(rel_posix).name
+    lower = rel_posix.lower()
+    findings: list[dict[str, Any]] = []
+
+    if name == ".env" or name.startswith(".env."):
+        findings.append(_finding(
+            "high",
+            "env-file-changed",
+            "Environment/secret file changed; keep local secrets out of repo commits and public artifacts.",
+            path=rel,
+            blocking=True,
+        ))
+    if "chat-archive" in lower or ("/raw/" in lower and "archive" in lower):
+        findings.append(_finding(
+            "medium",
+            "raw-archive-change",
+            "Raw/archive layer changed; babata raw records are append-only unless explicitly authorized.",
+            path=rel,
+        ))
+    if _is_ops_path(rel_posix):
+        findings.append(_finding(
+            "medium",
+            "ops-boundary-file",
+            "Launchd/self-ops surface changed; verify rollout uses scripts/self-ops.sh instead of inline service mutation.",
+            path=rel,
+        ))
+
+    if repo_root is None:
+        return findings
+    fp = (repo_root / rel).resolve()
+    if not _safe_child(repo_root, fp) or not fp.is_file() or not _looks_text(fp):
+        return findings
+    content = _read_small_text(fp)
+    if not content:
+        return findings
+    for rule, pattern in _SECRET_PATTERNS:
+        if pattern.search(content):
+            findings.append(_finding(
+                "high",
+                f"secret-pattern:{rule}",
+                "Changed file contains a token-like secret pattern.",
+                path=rel,
+                blocking=True,
+            ))
+    if "launchctl kickstart" in content or "launchctl bootstrap" in content or "launchctl bootout" in content:
+        if rel_posix != "scripts/self-ops.sh":
+            findings.append(_finding(
+                "high",
+                "inline-launchctl",
+                "Service mutation must go through scripts/self-ops.sh for detached self-ops safety.",
+                path=rel,
+                blocking=True,
+            ))
+    return findings
+
+
+def _tool_guard_findings(tool: dict[str, Any]) -> list[dict[str, Any]]:
+    name = str(tool.get("name") or "")
+    path = _tool_path(tool)
+    findings = _tool_path_guard_findings(path)
+    findings.extend(_tool_content_guard_findings(tool, path))
+
+    command = _tool_command(tool)
+    if not command:
+        return findings
+    if name.lower() != "bash" and "bash" not in name.lower() and "command" not in tool:
+        return findings
+    findings.extend(_tool_command_guard_findings(command))
+    return findings
+
+
+def _tool_path_guard_findings(path: str | None) -> list[dict[str, Any]]:
+    if not path:
+        return []
+    path_name = Path(path.replace("\\", "/")).name
+    findings: list[dict[str, Any]] = []
+    if path_name == ".env" or path_name.startswith(".env."):
+        findings.append(_finding(
+            "high",
+            "env-file-tool-request",
+            "Tool request targets an environment/secret file.",
+            path=path,
+            blocking=True,
+        ))
+    if _is_ops_path(path):
+        findings.append(_finding(
+            "medium",
+            "ops-boundary-tool-request",
+            "Tool request targets launchd/self-ops surface.",
+            path=path,
+        ))
+    return findings
+
+
+def _tool_content_guard_findings(
+    tool: dict[str, Any],
+    path: str | None,
+) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    if tool.get("content_has_secret"):
+        findings.append(_finding(
+            "high",
+            "secret-pattern:tool-input",
+            "Tool input contains a token-like secret pattern.",
+            path=path,
+            blocking=True,
+        ))
+    if tool.get("content_has_launchctl") and path != "scripts/self-ops.sh":
+        findings.append(_finding(
+            "high",
+            "inline-launchctl-tool-input",
+            "Tool input contains launchd mutation outside scripts/self-ops.sh.",
+            path=path,
+            blocking=True,
+        ))
+    return findings
+
+
+# rg flags that run another program over the searched files.
+_SEARCH_EXEC_FLAGS = ("--pre", "--pre-glob", "--hostname-bin", "--search-zip", "-z")
+
+
+def _is_read_only_search_command(command: str) -> bool:
+    # Newlines chain commands; $ and ` substitute them.
+    if any(ch in command for ch in "\n\r$`"):
+        return False
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    if not tokens or any(re.fullmatch(r"[;&|<>()]+", token) for token in tokens):
+        return False
+    if any(token.split("=", 1)[0] in _SEARCH_EXEC_FLAGS for token in tokens[1:]):
+        return False
+    return Path(tokens[0]).name in {"rg", "grep"}
+
+
+def _tool_command_guard_findings(command: str) -> list[dict[str, Any]]:
+    lowered = command.lower()
+    if _is_read_only_search_command(command):
+        lowered = ""
+    findings: list[dict[str, Any]] = []
+    if _is_dangerous_git_command(command):
+        findings.append(_finding(
+            "high",
+            "dangerous-git-command",
+            "Dangerous git command was requested; only run with explicit user authorization.",
+            command=command,
+            blocking=True,
+        ))
+    if "launchctl kickstart" in lowered or "launchctl bootstrap" in lowered or "launchctl bootout" in lowered:
+        if "scripts/self-ops.sh" not in lowered:
+            findings.append(_finding(
+                "high",
+                "inline-launchctl-command",
+                "Launchd mutation command bypassed scripts/self-ops.sh.",
+                command=command,
+                blocking=True,
+            ))
+    if re.search(r"\b(?:rm\s+-rf|trash\s+).*(?:/state/|chat-archive|memory)\b", lowered):
+        findings.append(_finding(
+            "high",
+            "destructive-memory-command",
+            "Command appears to delete state/memory/archive data.",
+            command=command,
+            blocking=True,
+        ))
+    return findings
+
+
+def _is_dangerous_git_command(command: str) -> bool:
+    return bool(
+        re.search(r"\bgit\s+(?:reset\s+--hard|checkout\s+--)\b", command)
+        or re.search(r"\bgit\s+clean\s+-[A-Za-z]*[fd][A-Za-z]*\b", command)
+    )
 
 
 def run_declared_checks(
@@ -399,91 +465,118 @@ def run_declared_checks(
     baseline_config_fingerprint: str | None = None,
     require_baseline_config: bool = False,
 ) -> list[dict[str, Any]]:
-    if not declared_checks_enabled():
-        return [{"status": "skipped", "reason": "BABATA_DECLARED_CHECKS=0"}]
+    checks, early_result = _declared_check_items(
+        repo_root=repo_root,
+        baseline_config_rel=baseline_config_rel,
+        baseline_config_fingerprint=baseline_config_fingerprint,
+        require_baseline_config=require_baseline_config,
+    )
+    if early_result is not None:
+        return early_result
+
+    context = _check_context(changed_files, guard_findings)
+    results = [
+        _run_declared_check_item(repo_root, item, idx, context)
+        for idx, item in enumerate(checks)
+    ]
+    return results or [{"status": "skipped", "reason": "no checks declared"}]
+
+
+def _declared_check_items(
+    *,
+    repo_root: Path | None,
+    baseline_config_rel: str | None,
+    baseline_config_fingerprint: str | None,
+    require_baseline_config: bool,
+) -> tuple[list[Any], list[dict[str, Any]] | None]:
+    if not _declared_checks_enabled():
+        return [], [{"status": "skipped", "reason": "BABATA_DECLARED_CHECKS=0"}]
     if repo_root is None:
-        return [{"status": "skipped", "reason": "not a git repo"}]
+        return [], [{"status": "skipped", "reason": "not a git repo"}]
 
     config_path = _checks_config_path(repo_root)
     if config_path is None:
-        return [{"status": "skipped", "reason": "no .babata/checks.json"}]
+        return [], [{"status": "skipped", "reason": "no .babata/checks.json"}]
     if require_baseline_config and (baseline_config_rel is None or baseline_config_fingerprint is None):
-        return [{"status": "skipped", "reason": "declared checks config changed during turn"}]
+        return [], [{"status": "skipped", "reason": "declared checks config changed during turn"}]
     if require_baseline_config or baseline_config_rel is not None or baseline_config_fingerprint is not None:
         current_rel = config_path.relative_to(repo_root).as_posix()
         current_fingerprint = _file_fingerprint(config_path)
         if baseline_config_rel != current_rel:
-            return [{"status": "skipped", "reason": "declared checks config changed during turn"}]
+            return [], [{"status": "skipped", "reason": "declared checks config changed during turn"}]
         if baseline_config_fingerprint != current_fingerprint:
-            return [{"status": "skipped", "reason": "declared checks config changed during turn"}]
+            return [], [{"status": "skipped", "reason": "declared checks config changed during turn"}]
 
     try:
         data = json.loads(config_path.read_text())
     except Exception as e:
-        return [{"status": "config_error", "path": str(config_path), "error": str(e)}]
+        return [], [{"status": "config_error", "path": str(config_path), "error": str(e)}]
 
     checks = data.get("checks") if isinstance(data, dict) else None
     if not isinstance(checks, list):
-        return [{"status": "config_error", "path": str(config_path), "error": "checks must be a list"}]
+        return [], [{"status": "config_error", "path": str(config_path), "error": "checks must be a list"}]
+    return checks, None
 
-    context = _check_context(changed_files, guard_findings)
-    results: list[dict[str, Any]] = []
-    for idx, item in enumerate(checks):
-        if not isinstance(item, dict):
-            results.append({"status": "config_error", "index": idx, "error": "check must be an object"})
-            continue
-        name = str(item.get("name") or f"check-{idx + 1}")
-        command = item.get("command")
-        if not isinstance(command, str) or not command.strip():
-            results.append({"name": name, "status": "config_error", "error": "command is required"})
-            continue
-        when = item.get("when")
-        if when is not None and not _check_matches(when, context):
-            results.append({"name": name, "status": "skipped", "reason": "when did not match"})
-            continue
-        timeout = _check_timeout(item.get("timeout_seconds"))
-        started = time.time()
-        try:
-            proc = subprocess.run(
-                command,
-                cwd=repo_root,
-                shell=True,
-                text=True,
-                capture_output=True,
-                timeout=timeout,
-            )
-            output = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
-            results.append({
-                "name": name,
-                "command": command,
-                "status": "passed" if proc.returncode == 0 else "failed",
-                "exit_code": proc.returncode,
-                "duration_ms": round((time.time() - started) * 1000),
-                "output_tail": _tail(output, _MAX_CHECK_OUTPUT),
-            })
-        except subprocess.TimeoutExpired as e:
-            output = "\n".join(
-                part.decode("utf-8", errors="replace") if isinstance(part, bytes) else str(part)
-                for part in (e.stdout, e.stderr)
-                if part
-            )
-            results.append({
-                "name": name,
-                "command": command,
-                "status": "timeout",
-                "duration_ms": round((time.time() - started) * 1000),
-                "timeout_seconds": timeout,
-                "output_tail": _tail(output, _MAX_CHECK_OUTPUT),
-            })
-        except Exception as e:
-            results.append({
-                "name": name,
-                "command": command,
-                "status": "error",
-                "duration_ms": round((time.time() - started) * 1000),
-                "error": str(e),
-            })
-    return results or [{"status": "skipped", "reason": "no checks declared"}]
+
+def _run_declared_check_item(
+    repo_root: Path,
+    item: Any,
+    idx: int,
+    context: set[str],
+) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {"status": "config_error", "index": idx, "error": "check must be an object"}
+
+    name = str(item.get("name") or f"check-{idx + 1}")
+    command = item.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return {"name": name, "status": "config_error", "error": "command is required"}
+    when = item.get("when")
+    if when is not None and not _check_matches(when, context):
+        return {"name": name, "status": "skipped", "reason": "when did not match"}
+
+    timeout = _check_timeout(item.get("timeout_seconds"))
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=repo_root,
+            shell=True,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+        output = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
+        return {
+            "name": name,
+            "command": command,
+            "status": "passed" if proc.returncode == 0 else "failed",
+            "exit_code": proc.returncode,
+            "duration_ms": round((time.time() - started) * 1000),
+            "output_tail": _tail(output, _MAX_CHECK_OUTPUT),
+        }
+    except subprocess.TimeoutExpired as e:
+        output = "\n".join(
+            part.decode("utf-8", errors="replace") if isinstance(part, bytes) else str(part)
+            for part in (e.stdout, e.stderr)
+            if part
+        )
+        return {
+            "name": name,
+            "command": command,
+            "status": "timeout",
+            "duration_ms": round((time.time() - started) * 1000),
+            "timeout_seconds": timeout,
+            "output_tail": _tail(output, _MAX_CHECK_OUTPUT),
+        }
+    except Exception as e:
+        return {
+            "name": name,
+            "command": command,
+            "status": "error",
+            "duration_ms": round((time.time() - started) * 1000),
+            "error": str(e),
+        }
 
 
 def enqueue_review_tasks(
@@ -494,7 +587,7 @@ def enqueue_review_tasks(
     check_results: list[dict[str, Any]],
     tool_uses: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    mode = review_bus_mode()
+    mode = _review_bus_mode()
     if mode == "off":
         return []
 
@@ -537,7 +630,7 @@ def summarize_tool_use(name: str, tool_input: dict[str, Any] | None) -> dict[str
     tool_input = tool_input or {}
     command = tool_input.get("command") or tool_input.get("cmd")
     if isinstance(command, str):
-        out["command"] = _preview(command, _MAX_COMMAND_PREVIEW)
+        out.update(_command_record(command))
     for key in ("file_path", "path", "notebook_path"):
         value = tool_input.get(key)
         if isinstance(value, str):
@@ -556,7 +649,7 @@ def summarize_tool_use(name: str, tool_input: dict[str, Any] | None) -> dict[str
 
 
 def should_block_for_permission(tool_name: str, tool_input: dict[str, Any] | None) -> tuple[bool, str | None]:
-    if guard_mode() != "enforce":
+    if _guard_mode() != "enforce":
         return False, None
     findings = run_deterministic_guards(
         repo_root=None,
@@ -820,7 +913,10 @@ def _compact_tool_uses(tool_uses: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for tool in tool_uses:
         item = dict(tool)
         if isinstance(item.get("command"), str):
-            item["command"] = _preview(item["command"], _MAX_COMMAND_PREVIEW)
+            command = item["command"]
+            item["command"] = _preview(command, _MAX_COMMAND_PREVIEW)
+            item.setdefault("command_sha256", _sha256_text(command))
+            item.setdefault("command_bytes", _text_bytes(command))
         compact.append(item)
     return compact[:100]
 
@@ -886,7 +982,7 @@ def _finding(
     if path:
         out["path"] = path
     if command:
-        out["command"] = _preview(command, _MAX_COMMAND_PREVIEW)
+        out.update(_command_record(command))
     return out
 
 
@@ -978,6 +1074,30 @@ def _ordered_unique(items: list[str]) -> list[str]:
 
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _text_bytes(text: str) -> int:
+    return len(text.encode("utf-8", errors="replace"))
+
+
+def _error_record(error: BaseException | None) -> dict[str, Any] | None:
+    if error is None:
+        return None
+    message = str(error)
+    return {
+        "type": type(error).__name__,
+        "message_preview": _preview(message, _MAX_ERROR_PREVIEW),
+        "message_sha256": _sha256_text(message),
+        "message_bytes": _text_bytes(message),
+    }
+
+
+def _command_record(command: str) -> dict[str, Any]:
+    return {
+        "command": _preview(command, _MAX_COMMAND_PREVIEW),
+        "command_sha256": _sha256_text(command),
+        "command_bytes": _text_bytes(command),
+    }
 
 
 def _preview(text: str, limit: int) -> str:

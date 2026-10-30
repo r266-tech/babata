@@ -2,20 +2,14 @@
 
 These guard the wx bot stream coalescer from cutting messages mid-word /
 inside ``...`` / inside **...**, which would leak markdown chars verbatim
-because strip_markdown's pair-matching regexes fail on broken pairs.
+because _strip_markdown's pair-matching regexes fail on broken pairs.
 """
 from __future__ import annotations
 
 import asyncio
 import os
-import sys
-from pathlib import Path
 
-_REPO = Path(__file__).resolve().parents[1]
-_SDK_SITE = next(iter((_REPO / ".venv/lib").glob("python*/site-packages")), None)
-if _SDK_SITE:
-    sys.path.insert(0, str(_SDK_SITE))
-sys.path.insert(0, str(_REPO))
+import pytest
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:test")
 os.environ.setdefault("ALLOWED_USER_ID", "0")
@@ -24,9 +18,45 @@ import weixin_bot as wb
 from cc import Response
 
 
+
+class _NoQuota:
+    """Fake WeixinClient surface for the reply quota: untracked, nothing queued."""
+
+    def quota_left(self, _token):
+        return None
+
+    async def flush_backlog(self, *_a):
+        return 0
+
+
 def reset_wx_pending(monkeypatch, tmp_path):
+    monkeypatch.setattr(wb, "_WX_GRACE_S", 0)
     monkeypatch.setattr(wb, "PENDING_WX_UPDATES_FILE", tmp_path / "wx-pending.json")
     wb._pending_wx_records = {}
+
+
+def test_weixin_prompt_input_is_bounded(monkeypatch):
+    monkeypatch.setattr(wb, "_WX_INPUT_MAX_CHARS", 64)
+    text = "start-" + ("x" * 200) + "-WX-TAIL"
+
+    prompt = wb._format_wx_message_bodies([text])
+
+    assert len(prompt) <= 64
+    assert "start-" in prompt
+    assert "WX-TAIL" not in prompt
+    assert "WeChat input truncated" in prompt
+
+
+def test_weixin_multi_message_prompt_input_is_bounded(monkeypatch):
+    monkeypatch.setattr(wb, "_WX_INPUT_MAX_CHARS", 128)
+    text = "first-" + ("x" * 220) + "-WX-TAIL"
+
+    prompt = wb._format_wx_message_bodies(["short", text])
+
+    assert len(prompt) <= 128
+    assert "Multiple WeChat messages" in prompt
+    assert "WX-TAIL" not in prompt
+    assert "WeChat input truncated" in prompt
 
 
 # ── _md_balanced ────────────────────────────────────────────────────
@@ -110,14 +140,14 @@ def test_md_balanced_link_with_double_nested_paren():
     assert isinstance(result, bool)
 
 
-# ── strip_markdown fence info string ────────────────────────────────
+# ── _strip_markdown fence info string ────────────────────────────────
 
 
 def test_strip_markdown_fence_with_dot_in_lang(monkeypatch):
     # Round 2 codex finding: `.env` info string was leaking before fix.
     monkeypatch.setenv("BABATA_WEIXIN_STRIP_MD", "1")
     text = "```.env\nKEY=value\n```"
-    out = wb.strip_markdown(text)
+    out = wb._strip_markdown(text)
     assert "KEY=value" in out
     assert ".env" not in out
     assert "```" not in out
@@ -126,7 +156,7 @@ def test_strip_markdown_fence_with_dot_in_lang(monkeypatch):
 def test_strip_markdown_fence_with_space_in_lang(monkeypatch):
     monkeypatch.setenv("BABATA_WEIXIN_STRIP_MD", "1")
     text = "```shell script\nls -la\n```"
-    out = wb.strip_markdown(text)
+    out = wb._strip_markdown(text)
     assert "ls -la" in out
     assert "shell script" not in out
     assert "```" not in out
@@ -135,7 +165,7 @@ def test_strip_markdown_fence_with_space_in_lang(monkeypatch):
 def test_strip_markdown_fence_with_csharp_lang(monkeypatch):
     monkeypatch.setenv("BABATA_WEIXIN_STRIP_MD", "1")
     text = "```c#\nint x = 1;\n```"
-    out = wb.strip_markdown(text)
+    out = wb._strip_markdown(text)
     assert "int x = 1;" in out
     assert "c#" not in out
     assert "```" not in out
@@ -203,7 +233,7 @@ def test_find_safe_split_chinese_period():
 
 def test_find_safe_split_avoid_unpaired_backtick():
     # The latest space sits inside an unpaired `code span — splitting there
-    # would leave the prefix with an unclosed ` that strip_markdown can't
+    # would leave the prefix with an unclosed ` that _strip_markdown can't
     # remove. _find_safe_split must retract to a safer boundary.
     text = "前面一句话。后面 `code span 还没"
     pos = wb._find_safe_split(text)
@@ -237,7 +267,7 @@ def test_find_safe_split_falls_back_to_space():
 
 
 def test_find_safe_split_screenshot_case():
-    # Reproduction of V's actual screenshot — buf cut inside `...`.
+    # Reproduction of the actual screenshot — buf cut inside `...`.
     text = (
         "把它设回 False → 新 turn 没人监控\n"
         "中等 (2):\n"
@@ -257,21 +287,161 @@ def test_find_safe_split_screenshot_case():
     assert prefix.endswith("\n")
 
 
-# ── chunk_text untouched: regression guards ─────────────────────────
+# ── _chunk_text untouched: regression guards ─────────────────────────
 
 
 def test_chunk_text_short_stays_one():
-    assert wb.chunk_text("short text") == ["short text"]
+    assert wb._chunk_text("short text") == ["short text"]
 
 
 def test_chunk_text_long_splits_at_newline():
     para = "para one.\n" + ("x" * 3000) + "\npara three"
-    chunks = wb.chunk_text(para, limit=2000)
+    chunks = wb._chunk_text(para, limit=2000)
     assert len(chunks) >= 2
     assert all(len(c) <= 2000 for c in chunks)
 
 
-# ── strip_markdown: fenced code body must survive ───────────────────
+def test_send_wx_bubble_retries_once_then_succeeds(monkeypatch):
+    class FakeClient(_NoQuota):
+        def __init__(self):
+            self.calls: list[tuple[str, str | None, str]] = []
+
+        async def send_message(self, to_user, items, context_token=None):
+            text = (items[0].get("text_item") or {}).get("text", "")
+            self.calls.append((to_user, context_token, text))
+            if len(self.calls) == 1:
+                raise RuntimeError("transient")
+
+    async def no_sleep(_delay):
+        return None
+
+    async def run():
+        client = FakeClient()
+        monkeypatch.setattr(wb.asyncio, "sleep", no_sleep)
+
+        result = await wb._send_wx_bubble(client, "u1", "ctx", "hello")
+
+        assert result == wb.WxBubbleSendResult(sent_any=True, ok=True)
+        assert client.calls == [("u1", "ctx", "hello"), ("u1", "ctx", "hello")]
+
+    asyncio.run(run())
+
+
+def test_send_wx_bubble_reports_permanent_failure(monkeypatch):
+    class FakeClient(_NoQuota):
+        def __init__(self):
+            self.calls = 0
+
+        async def send_message(self, *_args, **_kwargs):
+            self.calls += 1
+            raise RuntimeError("permanent")
+
+    async def no_sleep(_delay):
+        return None
+
+    async def run():
+        client = FakeClient()
+        monkeypatch.setattr(wb.asyncio, "sleep", no_sleep)
+
+        result = await wb._send_wx_bubble(client, "u1", "ctx", "hello")
+
+        assert result == wb.WxBubbleSendResult(sent_any=False, ok=False)
+        assert client.calls == 2
+
+    asyncio.run(run())
+
+
+def test_wx_stream_coalescer_sends_marked_bubbles_then_final_tail():
+    sent: list[str] = []
+
+    async def send_bubble(text):
+        sent.append(text)
+        return wb.WxBubbleSendResult(sent_any=bool(text), ok=True)
+
+    async def run():
+        coalescer = wb.WxStreamCoalescer(send_bubble)
+
+        await coalescer.on_stream(None, None, "first\n\n\nsecond partial", None)
+        assert sent == ["first"]
+        assert coalescer.sent_any is True
+        assert coalescer.had_send_failure is False
+
+        await coalescer.drain(allow_hard_cut=True)
+        assert sent == ["first", "second partial"]
+
+    asyncio.run(run())
+
+
+def test_wx_stream_coalescer_tracks_send_failure():
+    async def send_bubble(_text):
+        return wb.WxBubbleSendResult(sent_any=False, ok=False)
+
+    async def run():
+        coalescer = wb.WxStreamCoalescer(send_bubble)
+
+        await coalescer.on_stream(None, None, "broken\n\n\n", None)
+
+        assert coalescer.sent_any is False
+        assert coalescer.had_send_failure is True
+
+    asyncio.run(run())
+
+
+def test_wx_final_replay_skips_when_stream_already_sent_cleanly():
+    sent: list[str] = []
+
+    async def send_bubble(text):
+        sent.append(text)
+        return wb.WxBubbleSendResult(sent_any=bool(text), ok=True)
+
+    async def run():
+        coalescer = wb.WxStreamCoalescer(send_bubble)
+        coalescer.sent_any = True
+        coalescer.had_send_failure = False
+
+        ok = await wb._replay_wx_final_if_needed(coalescer, "final")
+
+        assert ok is True
+        assert sent == []
+
+    asyncio.run(run())
+
+
+def test_wx_final_replay_sends_final_when_stream_was_empty():
+    sent: list[str] = []
+
+    async def send_bubble(text):
+        sent.append(text)
+        return wb.WxBubbleSendResult(sent_any=bool(text), ok=True)
+
+    async def run():
+        coalescer = wb.WxStreamCoalescer(send_bubble)
+
+        ok = await wb._replay_wx_final_if_needed(coalescer, "first\n\n\nsecond")
+
+        assert ok is True
+        assert sent == ["first", "second"]
+        assert coalescer.had_send_failure is False
+
+    asyncio.run(run())
+
+
+def test_wx_final_replay_reports_unrecoverable_send_failure_without_final():
+    async def send_bubble(_text):
+        raise AssertionError("should not send without final")
+
+    async def run():
+        coalescer = wb.WxStreamCoalescer(send_bubble)
+        coalescer.had_send_failure = True
+
+        ok = await wb._replay_wx_final_if_needed(coalescer, "")
+
+        assert ok is False
+
+    asyncio.run(run())
+
+
+# ── _strip_markdown: fenced code body must survive ───────────────────
 
 
 def test_strip_markdown_keeps_fenced_code_body(monkeypatch):
@@ -279,7 +449,7 @@ def test_strip_markdown_keeps_fenced_code_body(monkeypatch):
     code output entirely. Strip fallback keeps the inner text, drops fence."""
     monkeypatch.setenv("BABATA_WEIXIN_STRIP_MD", "1")
     text = "before\n```python\nimport os\nprint('hi')\n```\nafter"
-    out = wb.strip_markdown(text)
+    out = wb._strip_markdown(text)
     assert "import os" in out
     assert "print('hi')" in out
     assert "```" not in out
@@ -288,14 +458,14 @@ def test_strip_markdown_keeps_fenced_code_body(monkeypatch):
 def test_strip_markdown_keeps_unlabelled_fence(monkeypatch):
     monkeypatch.setenv("BABATA_WEIXIN_STRIP_MD", "1")
     text = "```\nplain block content\n```"
-    out = wb.strip_markdown(text)
+    out = wb._strip_markdown(text)
     assert "plain block content" in out
     assert "```" not in out
 
 
 def test_strip_markdown_link_to_label_plus_url(monkeypatch):
     monkeypatch.setenv("BABATA_WEIXIN_STRIP_MD", "1")
-    out = wb.strip_markdown("see [docs](https://example.com) end")
+    out = wb._strip_markdown("see [docs](https://example.com) end")
     assert "docs" in out
     assert "https://example.com" in out
     assert "[" not in out and "](" not in out
@@ -322,7 +492,7 @@ def test_find_safe_split_avoid_unclosed_link():
 
 
 def test_md_balanced_unclosable_buf_returns_false_throughout():
-    """A buf that opens with `\`` and never closes it has NO balanced prefix
+    r"""A buf that opens with `\`` and never closes it has NO balanced prefix
     at any cut > 0; only cut=0 (empty) is balanced."""
     text = "`unclosed code that goes on and on and on with no closer"
     # No prefix length except 0 should be balanced
@@ -347,7 +517,7 @@ def test_weixin_process_retries_same_turn_before_failure_reply(monkeypatch):
                 await on_stream(None, None, "ok", None)
             return Response(content="ok", session_id="sid-1", cost=0.0)
 
-    class FakeClient:
+    class FakeClient(_NoQuota):
         def __init__(self):
             self.sent: list[str] = []
 
@@ -380,12 +550,174 @@ def test_weixin_process_retries_same_turn_before_failure_reply(monkeypatch):
     asyncio.run(run())
 
 
+def test_weixin_process_sends_final_content_when_stream_has_no_delta(monkeypatch):
+    class FakeCC:
+        async def query(self, prompt, *, images=None, on_stream=None):
+            assert prompt == "hello"
+            assert images is None
+            return Response(content="final only", session_id="sid-1", cost=0.0)
+
+    class FakeClient(_NoQuota):
+        def __init__(self):
+            self.sent: list[str] = []
+
+        async def get_config(self, *_args, **_kwargs):
+            return {}
+
+        async def send_message(self, _to_user, items, **_kwargs):
+            self.sent.extend((item.get("text_item") or {}).get("text", "") for item in items)
+
+    async def run():
+        client = FakeClient()
+        monkeypatch.setattr(wb, "cc", FakeCC())
+        msg = {
+            "from_user_id": "u1",
+            "context_token": "ctx",
+            "item_list": [
+                {"type": wb.ITEM_TEXT, "text_item": {"text": "hello"}},
+            ],
+        }
+
+        consumed = await wb._process_combined_msgs(client, [msg], "acc")
+
+        assert consumed is True
+        assert client.sent == ["final only"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("content", ["", "图片已生成。"])
+def test_weixin_process_delivers_native_generated_image(monkeypatch, tmp_path, content):
+    image = tmp_path / "generated.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n native-image-bytes")
+
+    class FakeCC:
+        async def query(self, *_args, **_kwargs):
+            return Response(
+                content=content, session_id="sid-image", cost=0.0,
+                generated_images=[str(image)],
+            )
+
+    class FakeClient(_NoQuota):
+        def __init__(self):
+            self.sent = []
+            self.uploads = []
+
+        async def get_config(self, *_args, **_kwargs):
+            return {}
+
+        async def upload_media(self, data, **kwargs):
+            self.uploads.append((data, kwargs))
+            return {"encrypt_query_param": "image-cdn", "aes_key": "image-key", "cipher_size": 32}
+
+        async def send_message(self, peer, items, **kwargs):
+            self.sent.append((peer, items, kwargs))
+
+    async def run():
+        client = FakeClient()
+        monkeypatch.setattr(wb, "cc", FakeCC())
+        msg = {
+            "from_user_id": "image-user", "context_token": "image-context",
+            "item_list": [{"type": wb.ITEM_TEXT, "text_item": {"text": "画一张图"}}],
+        }
+
+        assert await wb._process_combined_msgs(client, [msg], "image-account") is True
+        assert len(client.uploads) == 1
+        assert client.uploads[0][0] == b"\x89PNG\r\n\x1a\n native-image-bytes"
+        assert client.uploads[0][1]["to_user_id"] == "image-user"
+        media_messages = [sent for sent in client.sent if sent[1][0]["type"] == wb.ITEM_IMAGE]
+        assert len(media_messages) == 1
+        assert media_messages[0][0] == "image-user"
+        assert media_messages[0][2]["context_token"] == "image-context"
+        text_messages = [
+            item["text_item"]["text"]
+            for _, items, _ in client.sent for item in items if item["type"] == wb.ITEM_TEXT
+        ]
+        assert text_messages == ([content] if content else [])
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["missing", "upload", "send"])
+def test_weixin_generated_image_failure_keeps_turn_unconsumed(monkeypatch, tmp_path, failure):
+    image = tmp_path / "generated.png"
+    if failure != "missing":
+        image.write_bytes(b"\x89PNG\r\n\x1a\n native-image-bytes")
+
+    class FakeCC:
+        async def query(self, *_args, **_kwargs):
+            return Response(
+                content="", session_id="sid-image", cost=0.0,
+                generated_images=[str(image)],
+            )
+
+    class FakeClient(_NoQuota):
+        async def get_config(self, *_args, **_kwargs):
+            return {}
+
+        async def upload_media(self, *_args, **_kwargs):
+            if failure == "upload":
+                raise OSError("CDN temporarily unavailable")
+            return {"encrypt_query_param": "image-cdn", "aes_key": "image-key", "cipher_size": 32}
+
+        async def send_message(self, *_args, **_kwargs):
+            if failure == "send":
+                raise OSError("WeChat temporarily unavailable")
+
+    async def run():
+        monkeypatch.setattr(wb, "cc", FakeCC())
+        msg = {
+            "from_user_id": "image-user", "context_token": "image-context",
+            "item_list": [{"type": wb.ITEM_TEXT, "text_item": {"text": "画一张图"}}],
+        }
+
+        assert await wb._process_combined_msgs(FakeClient(), [msg], "image-account") is False
+
+    asyncio.run(run())
+
+
+def test_collect_wx_turn_inputs_preserves_prompt_contract():
+    class FakeClient(_NoQuota):
+        pass
+
+    async def run():
+        from_user, ctx_token, prompt, images = await wb._collect_wx_turn_inputs(
+            FakeClient(),
+            [
+                {
+                    "from_user_id": "u1",
+                    "context_token": "ctx1",
+                    "item_list": [
+                        {"type": wb.ITEM_TEXT, "text_item": {"text": "first"}},
+                    ],
+                },
+                {
+                    "from_user_id": "u1",
+                    "context_token": "ctx2",
+                    "item_list": [
+                        {"type": wb.ITEM_TEXT, "text_item": {"text": "second"}},
+                    ],
+                },
+            ],
+        )
+
+        assert from_user == "u1"
+        assert ctx_token == "ctx2"
+        assert images == []
+        assert "Multiple WeChat messages, oldest to newest" in prompt
+        assert "clarify or supersede" not in prompt
+        assert "<user_message n=1>\nfirst\n</user_message>" in prompt
+        assert "<user_message n=2>\nsecond\n</user_message>" in prompt
+
+    asyncio.run(run())
+
+
 def test_weixin_sync_buf_saved_after_message_processing(monkeypatch, tmp_path):
     saved: list[str] = []
     processed: list[str] = []
     reset_wx_pending(monkeypatch, tmp_path)
 
-    class FakeClient:
+    class FakeClient(_NoQuota):
         def __init__(self, **_kwargs):
             self.calls = 0
 
@@ -448,7 +780,7 @@ def test_weixin_sync_buf_not_saved_when_processing_unconsumed(monkeypatch, tmp_p
     saved: list[str] = []
     reset_wx_pending(monkeypatch, tmp_path)
 
-    class FakeClient:
+    class FakeClient(_NoQuota):
         def __init__(self, **_kwargs):
             self.calls = 0
 
@@ -502,7 +834,7 @@ def test_weixin_poll_batch_coalesces_same_sender_messages(monkeypatch, tmp_path)
             prompts.append(prompt)
             return Response(content="ok", session_id="sid-1", cost=0.0)
 
-    class FakeClient:
+    class FakeClient(_NoQuota):
         def __init__(self, **_kwargs):
             self.calls = 0
             self.sent: list[str] = []
@@ -558,7 +890,10 @@ def test_weixin_poll_batch_coalesces_same_sender_messages(monkeypatch, tmp_path)
         task = asyncio.create_task(wb._run_account("acc"))
         await asyncio.wait_for(_wait_until(lambda: saved == ["new-buf"]), timeout=1)
         assert len(prompts) == 1
-        assert "WeChat messages" in prompts[0]
+        assert "Multiple WeChat messages, oldest to newest" in prompts[0]
+        assert "clarify or supersede" not in prompts[0]
+        assert "previous turn" not in prompts[0]
+        assert "poll checkpoint" not in prompts[0]
         assert "<user_message n=1>" in prompts[0]
         assert "first" in prompts[0]
         assert "<user_message n=2>" in prompts[0]
@@ -616,7 +951,7 @@ def test_weixin_pending_journal_replays_and_acks(monkeypatch, tmp_path):
             prompts.append(prompt)
             return Response(content="ok", session_id="sid-1", cost=0.0)
 
-    class FakeClient:
+    class FakeClient(_NoQuota):
         async def get_config(self, *_args, **_kwargs):
             return {}
 
@@ -671,3 +1006,92 @@ def test_weixin_pending_journal_keeps_unconsumed_batch(monkeypatch, tmp_path):
         assert "r1" in wb._pending_wx_records
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("initial_buf", ["old-buf", "buf-1"])
+def test_weixin_pending_replay_deduplicates_messages_across_cursors(monkeypatch, tmp_path, initial_buf):
+    reset_wx_pending(monkeypatch, tmp_path)
+    first = {"message_id": 1, "from_user_id": "u1"}
+    second = {"message_id": 2, "from_user_id": "u1"}
+    other_peer = {"message_id": 1, "from_user_id": "u2"}
+    no_id = {"from_user_id": "u2"}
+    batches = [
+        [[first, first]],
+        [[first]],
+        [[first, second]],
+        [[other_peer, no_id, no_id]],
+    ]
+    wb._pending_wx_records = {
+        f"r{i}": {
+            "id": f"r{i}", "account_id": "acc", "received_at": i,
+            "new_buf": f"buf-{i}", "units": units,
+        }
+        for i, units in enumerate(batches, 1)
+    }
+    current_buf = {"value": initial_buf}
+    received = []
+
+    async def process(_client, _account_id, units):
+        received.extend(msg for unit in units for msg in unit)
+        return True
+
+    def save_buf(_account_id, buf):
+        current_buf["value"] = buf
+
+    monkeypatch.setattr(wb, "load_sync_buf", lambda _account_id: current_buf["value"])
+    monkeypatch.setattr(wb, "save_sync_buf", save_buf)
+    monkeypatch.setattr(wb, "_process_wx_units", process)
+
+    asyncio.run(wb._replay_pending_wx_updates(object(), "acc"))
+
+    expected = [second, other_peer, no_id, no_id]
+    if initial_buf == "old-buf":
+        expected.insert(0, first)
+    assert received == expected
+    assert current_buf["value"] == "buf-4"
+    assert wb._pending_wx_records == {}
+
+
+def test_weixin_failed_replay_keeps_overlapping_records(monkeypatch, tmp_path):
+    reset_wx_pending(monkeypatch, tmp_path)
+    first = {"message_id": 1, "from_user_id": "u1"}
+    second = {"message_id": 2, "from_user_id": "u1"}
+    wb._pending_wx_records = {
+        "r1": {"id": "r1", "account_id": "acc", "received_at": 1,
+               "new_buf": "buf-1", "units": [[first]]},
+        "r2": {"id": "r2", "account_id": "acc", "received_at": 2,
+               "new_buf": "buf-2", "units": [[first, second]]},
+    }
+    saved = []
+    calls = []
+
+    async def process(_client, _account_id, units):
+        calls.append(units)
+        return False
+
+    monkeypatch.setattr(wb, "load_sync_buf", lambda _account_id: "old-buf")
+    monkeypatch.setattr(wb, "save_sync_buf", lambda _account_id, buf: saved.append(buf))
+    monkeypatch.setattr(wb, "_process_wx_units", process)
+
+    asyncio.run(wb._replay_pending_wx_updates(object(), "acc"))
+
+    assert calls == [[[first]]]
+    assert saved == []
+    assert set(wb._pending_wx_records) == {"r1", "r2"}
+
+
+@pytest.mark.parametrize("units", [[None], [[None]]])
+def test_weixin_replay_keeps_malformed_units_for_processing_failure(monkeypatch, tmp_path, units):
+    reset_wx_pending(monkeypatch, tmp_path)
+    wb._pending_wx_records = {
+        "r1": {"id": "r1", "account_id": "acc", "received_at": 1,
+               "new_buf": "new-buf", "units": units},
+    }
+    saved = []
+    monkeypatch.setattr(wb, "load_sync_buf", lambda _account_id: "old-buf")
+    monkeypatch.setattr(wb, "save_sync_buf", lambda _account_id, buf: saved.append(buf))
+
+    asyncio.run(wb._replay_pending_wx_updates(object(), "acc"))
+
+    assert saved == []
+    assert "r1" in wb._pending_wx_records

@@ -15,7 +15,7 @@ Include:
 babata is a **personal-use bot** with one trusted operator (`ALLOWED_USER_ID`).
 
 - **Single tenant**: anyone with `ALLOWED_USER_ID`'s Telegram account effectively gets shell access to the host (especially under `BABATA_FULL_TRUST=1`). Treat the TG bot token + chat ID as host credentials.
-- **Default isolation**: babata defaults to `setting_sources=[]` + `cwd=repo` + `permission_mode=default`. Doesn't read user `~/.claude/`, doesn't access user `$HOME`. Power-user mode (`BABATA_FULL_TRUST=1`) opts into broader access.
+- **Default isolation**: babata defaults to `setting_sources=["project"]` + `cwd=repo` + `permission_mode=default`. It loads the repo's `CLAUDE.md`, but not the user `~/.claude/` profile or OAuth state. Power-user mode (`BABATA_FULL_TRUST=1`) opts into broader filesystem access and explicitly appends the same repo adapter after moving `cwd` to `$HOME`.
 - **Auth fail-closed**: `ALLOWED_USER_ID` unset = bot rejects everyone (including the bot's own owner). Never deploy without setting it.
 
 ## Out of Scope

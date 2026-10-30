@@ -1,12 +1,39 @@
 from __future__ import annotations
 
+import shutil
 import sys
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+sys.dont_write_bytecode = True
+
+_REPO = Path(__file__).resolve().parents[1]
+_SDK_SITE = _REPO / ".venv/lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+if _SDK_SITE.is_dir() and str(_SDK_SITE) not in sys.path:
+    sys.path.insert(0, str(_SDK_SITE))
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
 import pytest
+
+
+def pytest_sessionfinish(session, exitstatus):
+    repo = Path(__file__).resolve().parents[1]
+    for path in (
+        Path(__file__).resolve().parent / "__pycache__",
+        repo / "__pycache__",
+        repo / ".pytest_cache",
+    ):
+        shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_gemini_media(monkeypatch):
+    """babata-media-ai is on the dev PATH; tests must never hit Gemini for real."""
+    import media
+    monkeypatch.setattr(media, "_media_ai_bin", lambda: None)
 
 
 @pytest.fixture(autouse=True)
@@ -34,6 +61,7 @@ class ClaudeAgentOptions:
     setting_sources: list[str] | None = None
     max_buffer_size: int | None = None
     can_use_tool: Any = None
+    sandbox: dict[str, Any] | None = None
 
 
 class ClaudeSDKClient:

@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import json
 import logging
 import os
 import re
-import subprocess
+import shutil
 import tempfile
 import time
+import tomllib
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -27,9 +27,14 @@ from blocking_review import (
     run_blocking_review,
     unresolved_review_message,
 )
+from cli_runtime import resolve_cli_command
 from constants import HOOKS_DIR as _HOOKS_DIR
-from cc import CC, Event, Response, StreamCB, _memory_source_from_prompt
-from skill_evolve_nudge import notify_skill_evolve_turn
+from cc import CC, Event, Response, StreamCB, _record_session_metadata
+from memory_runtime import (
+    memory_inject_enabled,
+    memory_inject_timeout,
+    render_babata_memory_context,
+)
 from turn_audit import begin_turn, finish_turn, summarize_tool_use
 
 log = logging.getLogger(__name__)
@@ -49,9 +54,19 @@ _CODEX_SPLIT_ERRORS = (
 _CODEX_STREAM_LIMIT = 64 * 1024 * 1024
 _CODEX_TOOL_RESULT_MAX_CHARS = 4000
 _CODEX_MEMORY_INJECTED_KEY = "codex_memory_injected_sids"
-_DEFAULT_MEMORY_INJECT_SCRIPT = Path.home() / "cc-workspace/scripts/memory-inject.sh"
-_DEFAULT_MEMORY_REFLEX_SCRIPT = Path.home() / "cc-workspace/bin/babata-memory-reflex"
-_DEFAULT_MEMORY_REFLEX_LOG = Path.home() / "cc-workspace/state/memory-reflex/events.jsonl"
+# session.json is a resume picker/cache, not the raw transcript authority.
+_CODEX_STATE_TURN_LIMIT = 8
+_CODEX_STATE_TEXT_CHARS = 300
+_CODEX_IMAGE_INTENT_RE = re.compile(
+    r"(生图|出图|改图|修图|p图|真人版|写实化|"
+    r"生成.{0,16}(图|图片|照片|photo|image|picture)|"
+    r"画一张|做.{0,16}(图|图片|照片|真人|写实)|"
+    r"转成.{0,16}(图|图片|照片|真人|写实)|"
+    r"(generate|create|edit|transform).{0,48}(image|photo|picture))",
+    re.IGNORECASE,
+)
+_CODEX_NATIVE_IMAGE_POLICY = """For image generation or editing, use a callable native image tool first unless the user explicitly chose another provider. If unavailable or technically failed, explain and ask before using a fallback unless already authorized. Never bypass a native safety refusal. Image attachments alone do not request generation or editing."""
+_CODEX_GENERATED_IMAGE_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
 
 
 def _codex_stall_timeout() -> float:
@@ -69,6 +84,27 @@ def _is_codex_split_error(message: str | None) -> bool:
     return any(marker in message for marker in _CODEX_SPLIT_ERRORS)
 
 
+def _cap_codex_state_text(value: object, cap: int = _CODEX_STATE_TEXT_CHARS) -> str:
+    text = str(value or "")
+    if len(text) <= cap:
+        return text
+    return text[:cap].rstrip() + "..."
+
+
+def _cap_codex_state_turns(turns: object) -> list[list[str]]:
+    if not isinstance(turns, list):
+        return []
+    out: list[list[str]] = []
+    for item in turns:
+        if not isinstance(item, list) or len(item) != 2:
+            continue
+        role = str(item[0])
+        if role not in ("user", "assistant"):
+            continue
+        out.append([role, _cap_codex_state_text(item[1])])
+    return out[-_CODEX_STATE_TURN_LIMIT:]
+
+
 def _split_error_content(content: str) -> str:
     if content:
         return content
@@ -79,12 +115,38 @@ def _split_error_content(content: str) -> str:
     )
 
 
+async def _terminate_process(proc: Any, timeout: float) -> None:
+    with suppress(ProcessLookupError, Exception):
+        proc.terminate()
+    with suppress(asyncio.TimeoutError, Exception):
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+
+
+async def _cancel_task(task: asyncio.Task[Any]) -> None:
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
+def _split_error_result(
+    *,
+    sid: str | None,
+    content: str,
+    tools: list[str],
+    tool_uses: list[dict[str, Any]],
+    usage: dict[str, int],
+) -> dict[str, Any]:
+    return {
+        "sid": sid,
+        "content": _split_error_content(content),
+        "tools": tools,
+        "tool_uses": tool_uses,
+        "usage": usage,
+    }
+
+
 def _codex_cli_path() -> str:
-    return (
-        os.environ.get("BABATA_CODEX_CLI_PATH")
-        or os.environ.get("CODEX_CLI_PATH")
-        or "codex"
-    )
+    return resolve_cli_command("codex", "BABATA_CODEX_CLI_PATH", "CODEX_CLI_PATH")
 
 
 def _codex_sandbox() -> str:
@@ -98,278 +160,118 @@ def _codex_sandbox() -> str:
     )
 
 
+def _codex_sandbox_permission_overrides() -> list[str]:
+    configured = os.environ.get("BABATA_CODEX_SANDBOX_PERMISSIONS")
+    if configured:
+        return ["-c", f"sandbox_permissions={configured}"]
+    raw = os.environ.get("BABATA_CODEX_DISK_READ_ACCESS", "1").strip().lower()
+    if raw in {"0", "false", "off", "no"}:
+        return []
+    # Codex skills live under CODEX_HOME, outside the workspace root. Headless
+    # workspace-write must still be able to read them for progressive disclosure.
+    return ["-c", 'sandbox_permissions=["disk-full-read-access"]']
+
+
+def _codex_search_enabled() -> bool:
+    raw = os.environ.get("BABATA_CODEX_SEARCH", "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _codex_transport_overrides(source: str | None) -> list[str]:
+    raw = os.environ.get("BABATA_WEIXIN_CODEX_WEBSOCKETS", "").strip().lower()
+    if source != "wechat" or raw not in {"0", "false", "off", "no"}:
+        return []
+    provider = "openai"
+    if os.environ.get("BABATA_CODEX_IGNORE_USER_CONFIG") != "1":
+        home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        config = home / "config.toml"
+        if config.is_file():
+            with config.open("rb") as stream:
+                provider = tomllib.load(stream).get("model_provider", provider)
+    # CLI dotted overrides require one unquoted provider key.
+    if not isinstance(provider, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", provider):
+        raise ValueError("WeChat HTTP transport requires a simple Codex provider ID")
+    return ["-c", f"model_providers.{provider}.supports_websockets=false"]
+
+
+def _codex_code_mode_host_path() -> str | None:
+    configured = os.environ.get("CODEX_CODE_MODE_HOST_PATH")
+    if configured:
+        return configured
+
+    candidates: list[Path] = []
+    cli = _codex_cli_path()
+    resolved_cli = shutil.which(cli) if not Path(cli).is_absolute() else cli
+    if resolved_cli:
+        candidates.append(Path(resolved_cli).with_name("codex-code-mode-host"))
+    configured_cli = os.environ.get("CODEX_OFFICIAL_BIN")
+    if configured_cli:
+        candidates.append(Path(configured_cli).expanduser().with_name("codex-code-mode-host"))
+    candidates.extend([
+        Path("/Applications/Codex.app/Contents/Resources/codex-code-mode-host"),
+        Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        / "plugins/.plugin-appserver/codex-code-mode-host",
+    ])
+    discovered = shutil.which("codex-code-mode-host")
+    if discovered:
+        candidates.append(Path(discovered))
+    candidates.append(
+        Path("/Applications/ChatGPT.app/Contents/Resources/codex-code-mode-host")
+    )
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def _codex_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    if not env.get("CODEX_CODE_MODE_HOST_PATH"):
+        host_path = _codex_code_mode_host_path()
+        if host_path:
+            env["CODEX_CODE_MODE_HOST_PATH"] = host_path
+    return env
+
+
+def _codex_generated_images_root() -> Path:
+    configured = os.environ.get("BABATA_CODEX_GENERATED_IMAGES_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    return codex_home / "generated_images"
+
+
+def _codex_generated_images_for_session(sid: str | None) -> set[Path]:
+    if not sid:
+        return set()
+    session_dir = _codex_generated_images_root() / sid
+    try:
+        return {
+            path
+            for path in session_dir.rglob("*")
+            if path.is_file()
+            and path.suffix.lower() in _CODEX_GENERATED_IMAGE_SUFFIXES
+        }
+    except OSError:
+        return set()
+
+
 def _codex_cwd(source: str | None = None) -> str:
-    if source == "sidebar":
-        return str(Path(__file__).parent)
-    if os.environ.get("BABATA_FULL_TRUST") == "1":
-        return str(Path.home())
+    # Trust changes sandbox access, not the project instruction root.
     return str(Path(__file__).parent)
 
 
-def _codex_memory_inject_enabled() -> bool:
-    return os.environ.get("BABATA_CODEX_MEMORY_INJECT", "1") != "0"
-
-
-def _memory_inject_script() -> Path:
-    configured = os.environ.get("BABATA_MEMORY_INJECT_SCRIPT")
-    return Path(configured).expanduser() if configured else _DEFAULT_MEMORY_INJECT_SCRIPT
-
-
-def _memory_inject_timeout() -> float:
-    raw = os.environ.get("BABATA_CODEX_MEMORY_INJECT_TIMEOUT", "5")
-    try:
-        return max(0.1, float(raw))
-    except ValueError:
-        return 5.0
-
-
-def _memory_reflex_enabled() -> bool:
-    return os.environ.get("BABATA_MEMORY_REFLEX", "1") != "0"
-
-
-def _memory_reflex_mode() -> str:
-    if not _memory_reflex_enabled():
-        return "off"
-    mode = os.environ.get("BABATA_MEMORY_REFLEX_MODE", "dry-run").strip().lower()
-    return mode if mode in {"dry-run", "enforce"} else "dry-run"
-
-
-def _memory_reflex_script() -> Path:
-    configured = os.environ.get("BABATA_MEMORY_REFLEX_SCRIPT")
-    return Path(configured).expanduser() if configured else _DEFAULT_MEMORY_REFLEX_SCRIPT
-
-
-def _memory_reflex_timeout() -> float:
-    raw = os.environ.get("BABATA_MEMORY_REFLEX_TIMEOUT", "0.8")
-    try:
-        return max(0.1, float(raw))
-    except ValueError:
-        return 0.8
-
-
-def _memory_source_from_prompt(source_prompt: str) -> str:
-    lower = source_prompt.lower()
-    if "source: telegram" in lower:
-        return "tg"
-    if "source: wechat" in lower:
-        return "wechat"
-    if "source: sidebar" in lower:
-        return "sidebar"
-    return os.environ.get("BABATA_MEMORY_SOURCE") or "unknown"
-
-
-def _memory_reflex_for_prompt(source: str, user_prompt: str | None) -> dict[str, Any]:
-    if not _memory_reflex_enabled() or not user_prompt:
-        return {}
-    script = _memory_reflex_script()
-    if not script.is_file():
-        log.warning("babata memory reflex script missing: %s", script)
-        return {}
-    try:
-        result = subprocess.run(
-            [
-                str(script),
-                "--message", "-",
-                "--source", source,
-                "--cpu", "codex",
-                "--cwd", _codex_cwd(source),
-            ],
-            input=user_prompt,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=_memory_reflex_timeout(),
-            check=False,
-        )
-    except Exception as exc:
-        log.warning("babata memory reflex failed: %s", exc)
-        return {}
-    if result.returncode != 0:
-        log.warning("babata memory reflex exited %s: %s", result.returncode, result.stderr.strip()[:500])
-        return {}
-    try:
-        parsed = json.loads(result.stdout)
-    except Exception as exc:
-        log.warning("babata memory reflex returned invalid json: %s", exc)
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _format_memory_reflex_hint(reflex: dict[str, Any]) -> str:
-    routes = [str(r) for r in reflex.get("routes", []) if str(r)]
-    profile = str(reflex.get("profile") or "lite")
-    if not routes or (profile == "lite" and all(r in {"none", "lite"} for r in routes)):
-        return ""
-    reasons = reflex.get("reasons")
-    reason_text = "; ".join(str(r) for r in reasons[:3]) if isinstance(reasons, list) else ""
-    return "\n".join([
-        "<memory-reflex>",
-        f"routes: {', '.join(routes)}",
-        f"profile: {profile}",
-        "note: router signal only; retrieve deeper evidence only when useful.",
-        f"why: {reason_text}" if reason_text else "why: unspecified",
-        "</memory-reflex>",
-    ])
-
-
-def _memory_reflex_log_path() -> Path:
-    configured = os.environ.get("BABATA_MEMORY_REFLEX_LOG")
-    return Path(configured).expanduser() if configured else _DEFAULT_MEMORY_REFLEX_LOG
-
-
-def _message_summary(text: str | None, limit: int = 180) -> str:
-    compact = " ".join((text or "").split())
-    return compact[:limit].rstrip()
-
-
-def _append_memory_reflex_event(payload: dict[str, Any]) -> None:
-    try:
-        path = _memory_reflex_log_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
-    except Exception as exc:
-        log.warning("babata memory reflex log failed: %s", exc)
-
-
-def _log_memory_reflex_preflight(
-    *,
-    reflex: dict[str, Any],
-    user_prompt: str | None,
-    source: str,
-    cpu: str,
-    mode: str,
-    actual_profile: str,
-    memory_injected: bool,
-    hint_injected: bool,
-) -> str | None:
-    if not reflex:
-        return None
-    now = time.time()
-    digest = hashlib.sha256((user_prompt or "").encode("utf-8")).hexdigest()
-    event_id = hashlib.sha256(f"{now}:{cpu}:{source}:{digest}".encode("utf-8")).hexdigest()[:16]
-    _append_memory_reflex_event({
-        "event": "preflight",
-        "id": event_id,
-        "ts": now,
-        "source": source,
-        "cpu": cpu,
-        "mode": mode,
-        "message_sha256": digest,
-        "message_summary": _message_summary(user_prompt),
-        "router": reflex,
-        "actual_profile": actual_profile,
-        "memory_injected": memory_injected,
-        "hint_injected": hint_injected,
-        "post_answer_observation": "pending",
-    })
-    return event_id
-
-
-def _answer_memory_observation(content: str) -> dict[str, Any]:
-    markers = ("不记得", "没记住", "没有记忆", "没有记录", "查不到", "没查到", "无法确认", "没有找到")
-    return {
-        "heuristic_only": True,
-        "memory_miss_marker": any(marker in content for marker in markers),
-        "wrong_recall": None,
-        "missed_required_lookup": None,
-    }
-
-
-def _log_memory_reflex_post_answer(event_id: str | None, content: str) -> None:
-    if not event_id:
-        return
-    _append_memory_reflex_event({
-        "event": "post_answer",
-        "id": event_id,
-        "ts": time.time(),
-        "answer_sha256": hashlib.sha256((content or "").encode("utf-8")).hexdigest(),
-        "answer_summary": _message_summary(content),
-        "observation": _answer_memory_observation(content or ""),
-    })
-
-
-def _log_memory_reflex_preflight_only(source: str | None, user_prompt: str | None) -> str | None:
-    if os.environ.get("BABATA_CRON_AGENT") == "1":
-        return None
-    source_name = source or "unknown"
-    reflex = _memory_reflex_for_prompt(source_name, user_prompt)
-    mode = _memory_reflex_mode()
-    actual_profile = os.environ.get("BABATA_MEMORY_PROFILE") or "lite"
-    return _log_memory_reflex_preflight(
-        reflex=reflex,
-        user_prompt=user_prompt,
-        source=source_name,
+def _render_babata_memory_context(source: str | None = None) -> str:
+    return render_babata_memory_context(
+        enabled=memory_inject_enabled("codex"),
+        source=source or "unknown",
         cpu="codex",
-        mode=mode,
-        actual_profile=actual_profile,
-        memory_injected=False,
-        hint_injected=False,
+        timeout=memory_inject_timeout("codex"),
     )
 
 
-def _render_babata_memory_context_event(
-    source: str | None = None,
-    user_prompt: str | None = None,
-) -> tuple[str, str | None]:
-    if not _codex_memory_inject_enabled():
-        return "", None
-    script = _memory_inject_script()
-    if not script.is_file():
-        log.warning("babata memory inject script missing: %s", script)
-        return "", None
-    source_name = source or "unknown"
-    reflex = _memory_reflex_for_prompt(source_name, user_prompt)
-    mode = _memory_reflex_mode()
-    enforce = mode == "enforce"
-    actual_profile = os.environ.get("BABATA_MEMORY_PROFILE") or (
-        str(reflex.get("profile") or "lite") if enforce else "lite"
-    )
-    env = os.environ.copy()
-    env["BABATA_MEMORY_PROFILE"] = actual_profile
-    env.setdefault("BABATA_MEMORY_CPU", "codex")
-    env.setdefault("BABATA_MEMORY_SOURCE", source_name)
-    env.setdefault("BABATA_MEMORY_INCLUDE_TOP", "force")
-    try:
-        result = subprocess.run(
-            [str(script)],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=_memory_inject_timeout(),
-            check=False,
-        )
-    except Exception as exc:
-        log.warning("babata memory inject failed: %s", exc)
-        return "", None
-    if result.returncode != 0:
-        log.warning(
-            "babata memory inject exited %s: %s",
-            result.returncode,
-            result.stderr.strip()[:500],
-        )
-        return "", None
-    parts = [result.stdout.strip()]
-    hint = _format_memory_reflex_hint(reflex) if enforce else ""
-    if hint:
-        parts.append(hint)
-    context = "\n\n".join(part for part in parts if part)
-    event_id = _log_memory_reflex_preflight(
-        reflex=reflex,
-        user_prompt=user_prompt,
-        source=source_name,
-        cpu="codex",
-        mode=mode,
-        actual_profile=actual_profile,
-        memory_injected=bool(context),
-        hint_injected=bool(hint),
-    )
-    return context, event_id
-
-
-def _render_babata_memory_context(source: str | None = None, user_prompt: str | None = None) -> str:
-    return _render_babata_memory_context_event(source, user_prompt)[0]
+def _is_codex_image_request(prompt: str) -> bool:
+    return bool(_CODEX_IMAGE_INTENT_RE.search(prompt or ""))
 
 
 def _toml_key(key: str) -> str:
@@ -501,6 +403,100 @@ def _codex_tool_summary(name: str, item: dict[str, Any]) -> dict[str, Any]:
     return summarize_tool_use(name, tool_input)
 
 
+class CodexCommandAccumulator:
+    def __init__(self, on_stream: StreamCB | None) -> None:
+        self.on_stream = on_stream
+        self.sid: str | None = None
+        self.content = ""
+        self.tools: list[str] = []
+        self.tool_uses: list[dict[str, Any]] = []
+        self.running_tools: dict[str, str] = {}
+        self.usage: dict[str, int] = {}
+        self.failure_message: str | None = None
+
+    def _remember_tool(self, name: str) -> None:
+        if name not in self.tools:
+            self.tools.append(name)
+
+    def _remember_tool_use(self, name: str, item: dict[str, Any]) -> None:
+        if not name:
+            return
+        summary = _codex_tool_summary(name, item)
+        if summary not in self.tool_uses:
+            self.tool_uses.append(summary)
+
+    async def handle_event(self, event: dict[str, Any], line: str) -> None:
+        etype = event.get("type")
+        if etype == "thread.started":
+            self.sid = event.get("thread_id") or self.sid
+            return
+        if etype == "turn.failed":
+            err = event.get("error") or {}
+            if isinstance(err, dict) and err.get("message"):
+                self.failure_message = str(err.get("message"))
+            else:
+                self.failure_message = json.dumps(event, ensure_ascii=False)
+            return
+        if etype == "error":
+            self.failure_message = str(event.get("message") or line)
+            return
+        if etype == "item.started":
+            item = event.get("item") or {}
+            name = _extract_tool_name(item)
+            if name:
+                self._remember_tool(name)
+                self._remember_tool_use(name, item)
+                item_id = _extract_tool_id(item)
+                if item_id:
+                    self.running_tools[item_id] = name
+                if self.on_stream:
+                    await self.on_stream(name, item, None, None)
+            return
+        if etype == "item.completed":
+            item = event.get("item") or {}
+            if item.get("type") == "agent_message":
+                text = str(item.get("text") or "").strip()
+                if text:
+                    self.content = text
+                return
+            item_id = _extract_tool_id(item)
+            name = _extract_tool_name(item)
+            if not name and item_id:
+                name = self.running_tools.get(item_id)
+            if name:
+                self._remember_tool(name)
+                if item_id:
+                    self.running_tools.pop(item_id, None)
+                if self.on_stream:
+                    await self.on_stream(None, None, None, _extract_tool_result(item))
+            return
+        if etype == "turn.completed":
+            raw_usage = event.get("usage") or {}
+            self.usage = {
+                "input_tokens": int(raw_usage.get("input_tokens") or 0),
+                "cached_input_tokens": int(raw_usage.get("cached_input_tokens") or 0),
+                "output_tokens": int(raw_usage.get("output_tokens") or 0),
+            }
+
+    def result(self) -> dict[str, Any]:
+        return {
+            "sid": self.sid,
+            "content": self.content,
+            "tools": self.tools,
+            "tool_uses": self.tool_uses,
+            "usage": self.usage,
+        }
+
+    def split_error_result(self) -> dict[str, Any]:
+        return _split_error_result(
+            sid=self.sid,
+            content=self.content,
+            tools=self.tools,
+            tool_uses=self.tool_uses,
+            usage=self.usage,
+        )
+
+
 class CodexEngine(CC):
     """One-shot Codex CLI backend with babata-compatible state."""
 
@@ -512,17 +508,26 @@ class CodexEngine(CC):
         state_file: Path,
         source_prompt: str,
         mcp_servers: dict[str, Any] | None = None,
+        model: str | None = None,
+        reasoning: str | None = None,
+        memory_source: str | None = None,
+        memory_enabled: bool = True,
     ) -> None:
         super().__init__(
             state_file=state_file,
             source_prompt=source_prompt,
             mcp_servers=mcp_servers,
+            memory_source=memory_source,
+            memory_enabled=memory_enabled,
         )
-        self._memory_reflex_event_id: str | None = None
+        self._codex_model_override = model
+        self._codex_reasoning_override = reasoning
 
-    @property
-    def session_id(self) -> str | None:
-        return self._session_id
+    def _codex_model(self) -> str:
+        return self._codex_model_override or os.environ.get("BABATA_CODEX_MODEL") or "gpt-5.6-sol"
+
+    def _codex_reasoning(self) -> str:
+        return self._codex_reasoning_override or os.environ.get("BABATA_CODEX_REASONING") or "medium"
 
     async def query(
         self,
@@ -540,7 +545,7 @@ class CodexEngine(CC):
             channel=self._channel_label(),
             prompt=prompt,
             session_id_before=self._session_id,
-            cwd=_codex_cwd(_memory_source_from_prompt(self._source_prompt)),
+            cwd=_codex_cwd(self._memory_source),
             images_count=len(images or []),
         )
         try:
@@ -588,7 +593,7 @@ class CodexEngine(CC):
             channel=self._channel_label(),
             prompt=prompt,
             session_id_before=self._session_id,
-            cwd=_codex_cwd(_memory_source_from_prompt(self._source_prompt)),
+            cwd=_codex_cwd(self._memory_source),
             images_count=0,
         )
         try:
@@ -618,6 +623,12 @@ class CodexEngine(CC):
         os.close(_last_fd)
         last_file = Path(_last_path)
         image_paths: list[Path] = []
+        image_turn = bool(images) or _is_codex_image_request(prompt)
+        generated_before = (
+            _codex_generated_images_for_session(self._session_id)
+            if image_turn
+            else set()
+        )
         try:
             for img in images or []:
                 image_paths.append(_decode_image_to_file(img, image_dir))
@@ -632,6 +643,22 @@ class CodexEngine(CC):
             if content and on_stream:
                 await on_stream(None, None, content, None)
             sid = result["sid"] or self._session_id or ""
+            generated_images = []
+            if image_turn and sid:
+                generated_images = sorted(
+                    _codex_generated_images_for_session(sid) - generated_before,
+                    key=lambda path: (path.stat().st_mtime_ns, path.name),
+                )
+            tools = list(result["tools"])
+            tool_uses = list(result.get("tool_uses", []))
+            if generated_images:
+                if "image_gen" not in tools:
+                    tools.append("image_gen")
+                tool_uses.append({
+                    "name": "image_gen",
+                    "native": True,
+                    "paths": [str(path) for path in generated_images],
+                })
             if sid:
                 old_sid = self._session_id
                 if sid != old_sid:
@@ -640,27 +667,18 @@ class CodexEngine(CC):
                 self._record_codex_turn(sid, prompt, content)
                 if memory_injected:
                     self._mark_codex_memory_injected(sid)
-                notify_skill_evolve_turn(
-                    session_id=sid,
-                    cpu="codex",
-                    source=_memory_source_from_prompt(self._source_prompt),
-                    channel=self._channel_label(),
-                    state_file=self._state_file,
-                    metadata={"tools": result["tools"], "engine": "codex"},
-                )
-            _log_memory_reflex_post_answer(self._memory_reflex_event_id, content)
-            self._memory_reflex_event_id = None
 
             return Response(
                 content=content,
                 session_id=sid,
                 cost=0.0,
-                tools=result["tools"],
-                audit={"tool_uses": result.get("tool_uses", [])},
-                model=os.environ.get("BABATA_CODEX_MODEL") or "codex",
+                tools=tools,
+                audit={"tool_uses": tool_uses},
+                model=self._codex_model(),
                 input_tokens=result["usage"].get("input_tokens", 0),
                 output_tokens=result["usage"].get("output_tokens", 0),
                 cache_read_tokens=result["usage"].get("cached_input_tokens", 0),
+                generated_images=[str(path) for path in generated_images],
             )
         finally:
             with suppress(Exception):
@@ -677,81 +695,101 @@ class CodexEngine(CC):
         image_paths: list[Path],
         last_file: Path,
     ) -> tuple[list[str], str, bool]:
-        memory_context = ""
-        source = _memory_source_from_prompt(self._source_prompt)
-        should_inject_memory = self._should_inject_codex_memory()
-        if should_inject_memory:
-            memory_context, event_id = _render_babata_memory_context_event(
-                source,
-                prompt,
-            )
-            self._memory_reflex_event_id = event_id
-        else:
-            self._memory_reflex_event_id = _log_memory_reflex_preflight_only(source, prompt)
-        full_prompt = self._build_full_prompt(prompt, memory_context)
-        memory_injected = bool(memory_context)
+        full_prompt, memory_injected = self._build_prompt_stdin(
+            prompt,
+            has_images=bool(image_paths),
+        )
         base = [
             _codex_cli_path(),
             "-c", "notify=[]",
             "-c", 'approval_policy="never"',
+            # Resume must apply the current deployment policy, not the sandbox
+            # captured when this session was first created.
+            "-c", f'sandbox_mode="{_codex_sandbox()}"',
+            "-c", "features.memories=false",
+            *_codex_sandbox_permission_overrides(),
+            *_codex_transport_overrides(self._memory_source),
             *_codex_mcp_overrides(self._mcp_servers),
         ]
-        model = os.environ.get("BABATA_CODEX_MODEL")
-        if model:
-            base.extend(["-m", model])
+        model = self._codex_model()
+        reasoning = self._codex_reasoning()
+        base.extend(["-m", model, "-c", f'model_reasoning_effort="{reasoning}"'])
+        if _codex_search_enabled():
+            base.append("--search")
         if os.environ.get("BABATA_CODEX_IGNORE_USER_CONFIG") == "1":
             exec_flags = ["--ignore-user-config"]
         else:
             exec_flags = []
-        if os.environ.get("BABATA_CODEX_SEARCH") == "1":
-            base.append("--search")
-
         image_args: list[str] = []
         for fp in image_paths:
             image_args.extend(["-i", str(fp)])
-
-        if self._session_id:
+        sid = self._session_id
+        if sid:
             return [
                 *base,
                 "exec",
+                "-C", _codex_cwd(self._memory_source),
                 "resume",
                 *exec_flags,
                 "--json",
                 "--skip-git-repo-check",
                 "-o", str(last_file),
                 *image_args,
-                self._session_id,
+                sid,
                 "-",
             ], full_prompt, memory_injected
-        return [
-            *base,
-            "exec",
-            *exec_flags,
-            "--json",
-            "--skip-git-repo-check",
-            "--sandbox", _codex_sandbox(),
-            "-C", _codex_cwd(source),
-            "-o", str(last_file),
-            *image_args,
-            "-",
-        ], full_prompt, memory_injected
+        return (
+            [
+                *base,
+                "exec",
+                *exec_flags,
+                "--json",
+                "--skip-git-repo-check",
+                "-C", _codex_cwd(self._memory_source),
+                "-o", str(last_file),
+                *image_args,
+                "-",
+            ],
+            full_prompt,
+            memory_injected,
+        )
 
-    def _build_full_prompt(self, prompt: str, memory_context: str) -> str:
+    def _build_prompt_stdin(
+        self,
+        prompt: str,
+        *,
+        has_images: bool = False,
+    ) -> tuple[str, bool]:
+        memory_context = ""
+        if self._memory_enabled and self._should_inject_codex_memory():
+            memory_context = _render_babata_memory_context(self._memory_source)
+        full_prompt = self._build_full_prompt(
+            prompt,
+            memory_context,
+            has_images=has_images,
+        )
+        return full_prompt, bool(memory_context)
+
+    def _build_full_prompt(
+        self,
+        prompt: str,
+        memory_context: str,
+        *,
+        has_images: bool = False,
+    ) -> str:
         parts = []
         if self._source_prompt:
             parts.append(self._source_prompt)
+        if has_images or _is_codex_image_request(prompt):
+            parts.append(_CODEX_NATIVE_IMAGE_POLICY)
         if memory_context:
             parts.append(memory_context)
         parts.append(prompt)
         return "\n\n".join(parts)
 
     def _should_inject_codex_memory(self) -> bool:
-        if not _codex_memory_inject_enabled():
+        if not memory_inject_enabled("codex"):
             return False
-        if os.environ.get("BABATA_CRON_AGENT") == "1":
-            return False
-        if _memory_reflex_mode() == "enforce":
-            return True
         if not self._session_id:
             return True
         state = self._load_state()
@@ -782,6 +820,7 @@ class CodexEngine(CC):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=_CODEX_STREAM_LIMIT,
+            env=_codex_subprocess_env(),
         )
         assert proc.stdout is not None
         assert proc.stderr is not None
@@ -797,24 +836,7 @@ class CodexEngine(CC):
                 with suppress(Exception):
                     await wait_closed()
         stderr_task = asyncio.create_task(proc.stderr.read())
-        sid: str | None = None
-        content = ""
-        tools: list[str] = []
-        tool_uses: list[dict[str, Any]] = []
-        running_tools: dict[str, str] = {}
-        usage: dict[str, int] = {}
-        failure_message: str | None = None
-
-        def remember_tool(name: str) -> None:
-            if name not in tools:
-                tools.append(name)
-
-        def remember_tool_use(name: str, item: dict[str, Any]) -> None:
-            if not name:
-                return
-            summary = _codex_tool_summary(name, item)
-            if summary not in tool_uses:
-                tool_uses.append(summary)
+        events = CodexCommandAccumulator(on_stream)
 
         try:
             stall_timeout = _codex_stall_timeout()
@@ -828,10 +850,7 @@ class CodexEngine(CC):
                     else:
                         raw = await proc.stdout.readline()
                 except asyncio.TimeoutError:
-                    with suppress(ProcessLookupError, Exception):
-                        proc.terminate()
-                    with suppress(asyncio.TimeoutError, Exception):
-                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    await _terminate_process(proc, timeout=5)
                     raise RuntimeError(
                         f"codex stalled: no stdout event for {stall_timeout:.0f}s"
                     )
@@ -845,106 +864,28 @@ class CodexEngine(CC):
                 except json.JSONDecodeError:
                     log.debug("codex non-json stdout: %s", line[:500])
                     continue
-                etype = event.get("type")
-                if etype == "thread.started":
-                    sid = event.get("thread_id") or sid
-                    continue
-                if etype == "turn.failed":
-                    err = event.get("error") or {}
-                    if isinstance(err, dict) and err.get("message"):
-                        failure_message = str(err.get("message"))
-                    else:
-                        failure_message = json.dumps(event, ensure_ascii=False)
-                    continue
-                if etype == "error":
-                    failure_message = str(event.get("message") or line)
-                    continue
-                if etype == "item.started":
-                    item = event.get("item") or {}
-                    name = _extract_tool_name(item)
-                    if name:
-                        remember_tool(name)
-                        remember_tool_use(name, item)
-                        item_id = _extract_tool_id(item)
-                        if item_id:
-                            running_tools[item_id] = name
-                        if on_stream:
-                            await on_stream(name, item, None, None)
-                    continue
-                if etype == "item.completed":
-                    item = event.get("item") or {}
-                    if item.get("type") == "agent_message":
-                        text = str(item.get("text") or "").strip()
-                        if text:
-                            content = text
-                    else:
-                        item_id = _extract_tool_id(item)
-                        name = _extract_tool_name(item)
-                        if not name and item_id:
-                            name = running_tools.get(item_id)
-                        if name:
-                            remember_tool(name)
-                            if item_id:
-                                running_tools.pop(item_id, None)
-                            if on_stream:
-                                await on_stream(None, None, None, _extract_tool_result(item))
-                    continue
-                if etype == "turn.completed":
-                    raw_usage = event.get("usage") or {}
-                    usage = {
-                        "input_tokens": int(raw_usage.get("input_tokens") or 0),
-                        "cached_input_tokens": int(raw_usage.get("cached_input_tokens") or 0),
-                        "output_tokens": int(raw_usage.get("output_tokens") or 0),
-                    }
+                await events.handle_event(event, line)
             rc = await proc.wait()
         except asyncio.CancelledError:
-            with suppress(ProcessLookupError, Exception):
-                proc.terminate()
-            with suppress(asyncio.TimeoutError, Exception):
-                await asyncio.wait_for(proc.wait(), timeout=2)
-            stderr_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await stderr_task
+            await _terminate_process(proc, timeout=2)
+            await _cancel_task(stderr_task)
             raise
         except Exception as e:
-            with suppress(ProcessLookupError, Exception):
-                proc.terminate()
-            with suppress(asyncio.TimeoutError, Exception):
-                await asyncio.wait_for(proc.wait(), timeout=2)
-            stderr_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await stderr_task
+            await _terminate_process(proc, timeout=2)
+            await _cancel_task(stderr_task)
             if _is_codex_split_error(str(e)):
                 log.warning("codex stdout split failure: %s", str(e)[:300])
-                return {
-                    "sid": sid,
-                    "content": _split_error_content(content),
-                    "tools": tools,
-                    "tool_uses": tool_uses,
-                    "usage": usage,
-                }
+                return events.split_error_result()
             raise
 
         stderr = (await stderr_task).decode("utf-8", errors="replace").strip()
-        error_text = "\n".join(part for part in (failure_message, stderr) if part)
-        if rc != 0 or failure_message:
+        error_text = "\n".join(part for part in (events.failure_message, stderr) if part)
+        if rc != 0 or events.failure_message:
             if _is_codex_split_error(error_text):
                 log.warning("codex output split failure: %s", error_text[:300])
-                return {
-                    "sid": sid,
-                    "content": _split_error_content(content),
-                    "tools": tools,
-                    "tool_uses": tool_uses,
-                    "usage": usage,
-                }
+                return events.split_error_result()
             raise RuntimeError(error_text or f"codex exited {rc}")
-        return {
-            "sid": sid,
-            "content": content,
-            "tools": tools,
-            "tool_uses": tool_uses,
-            "usage": usage,
-        }
+        return events.result()
 
     def _record_codex_turn(self, sid: str, prompt: str, content: str) -> None:
         state = self._load_state()
@@ -953,25 +894,23 @@ class CodexEngine(CC):
             sessions = {}
         now = time.time()
         rec = sessions.get(sid) if isinstance(sessions.get(sid), dict) else {}
-        first_user = rec.get("first_user") or prompt
-        turns = rec.get("turns") if isinstance(rec.get("turns"), list) else []
-        turns.append(["user", prompt])
+        user_text = _cap_codex_state_text(prompt)
+        assistant_text = _cap_codex_state_text(content)
+        first_user = _cap_codex_state_text(rec.get("first_user") or user_text)
+        turns = _cap_codex_state_turns(rec.get("turns"))
+        turns.append(["user", user_text])
         if content:
-            turns.append(["assistant", content])
+            turns.append(["assistant", assistant_text])
         rec.update({
             "first_user": first_user,
-            "preview": content or prompt,
             "mtime": now,
-            "turns": turns[-8:],
+            "turns": turns[-_CODEX_STATE_TURN_LIMIT:],
         })
+        rec.pop("preview", None)
         sessions[sid] = rec
         state[_CODEX_SESSIONS_KEY] = sessions
-        state["session_id"] = sid
         self._remember_engine_sid(state, sid)
-        state["last_activity_at"] = now
-        hist = [s for s in state.get("recent_sids", []) if s != sid]
-        hist.insert(0, sid)
-        state["recent_sids"] = hist[:_CODEX_RECENT_LIMIT]
+        _record_session_metadata(state, sid, now=now, recent_limit=_CODEX_RECENT_LIMIT)
         self._save_state(state)
 
     def list_recent_sessions(
@@ -994,10 +933,15 @@ class CodexEngine(CC):
             first_user = str(rec.get("first_user") or "")
             if not first_user:
                 continue
+            turns = _cap_codex_state_turns(rec.get("turns"))
+            if turns:
+                preview = turns[-1][1] or first_user
+            else:
+                preview = str(rec.get("preview") or first_user)
             out.append({
                 "sid": sid,
                 "first_user": first_user,
-                "preview": str(rec.get("preview") or first_user),
+                "preview": preview,
                 "mtime": float(rec.get("mtime") or 0.0),
                 "is_current": sid == self._session_id,
                 "channel": own_channel,
@@ -1062,11 +1006,19 @@ class CodexLiveSession(CodexEngine):
         state_file: Path,
         source_prompt: str,
         mcp_servers: dict[str, Any] | None = None,
+        model: str | None = None,
+        reasoning: str | None = None,
+        memory_source: str | None = None,
+        memory_enabled: bool = True,
     ) -> None:
         super().__init__(
             state_file=state_file,
             source_prompt=source_prompt,
             mcp_servers=mcp_servers,
+            model=model,
+            reasoning=reasoning,
+            memory_source=memory_source,
+            memory_enabled=memory_enabled,
         )
         self._events: asyncio.Queue[Event | None] = asyncio.Queue()
         self._turn_task: asyncio.Task[None] | None = None

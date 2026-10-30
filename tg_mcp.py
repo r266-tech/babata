@@ -11,6 +11,8 @@ import logging
 import os
 import sys
 
+sys.dont_write_bytecode = True
+
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
@@ -30,21 +32,16 @@ _RETRYABLE_CONNECT_ERRNOS = {
     errno.ECONNREFUSED,
     errno.ECONNRESET,
 }
+_TG_PUBLIC_PAGE_ENV = "BABATA_TG_ENABLE_PUBLIC_PAGE"
 
 # TG bot instances exposed via optional `instance` tool argument. Derived from
-# INSTANCE_LABELS so OSS forks inherit the map automatically. WeChat has its
-# own MCP (weixin_mcp.py), so we exclude it here.
-TG_INSTANCES = [k for k in INSTANCE_LABELS if k != "weixin"]
+# INSTANCE_LABELS so OSS forks inherit the map automatically. WeChat and
+# Sidebar have their own MCP surfaces, so they are not TG route targets.
+TG_INSTANCES = [k for k in INSTANCE_LABELS if k not in {"weixin", "sidebar"}]
 
 INSTANCE_SCHEMA = {
     "type": "string",
     "enum": TG_INSTANCES,
-    "description": (
-        "Optional TG bot selector. "
-        + "; ".join(f"'{k}' → {INSTANCE_LABELS[k]}" for k in TG_INSTANCES)
-        + ". Omit → send via this MCP server's bound socket "
-        "(terminal CC → 主 bot; bot-internal CC → that bot's own channel)."
-    ),
 }
 
 
@@ -62,184 +59,170 @@ server = Server("tg")
 
 def _voice_description() -> str:
     """Facts about the actual TTS backend so CC can decide how to use markup."""
-    base = (
-        "Synthesize text to speech and send as a TG voice message. "
-        "text may include backend-specific expressive markup."
-    )
+    base = "Synthesize text to TG voice message."
     backend = os.environ.get("TTS_BACKEND", "openai").lower()
     has_custom_url = bool(os.environ.get("TTS_URL"))
 
     if backend == "mimo" and has_custom_url:
-        return (
-            f"{base} Current backend (mimo-v2-tts) recognizes "
-            "<style>arbitrary natural-language description</style> prefix "
-            "(emotion/dialect/role/singing/free combinations), and full-width "
-            "paren inline cues like （笑）/（咳嗽）/（叹气）/（停顿） for sound events."
-        )
+        return f"{base} Mimo supports <style> prefix and full-width paren cues."
     if has_custom_url:
-        return f"{base} Current backend is OpenAI-compatible /audio/speech (plain text, no markup)."
-    return f"{base} Current backend is edge-tts (plain text, no markup)."
+        return f"{base} OpenAI-compatible /audio/speech: plain text, no markup."
+    return f"{base} edge-tts: plain text, no markup."
+
+
+def _object_schema(properties: dict, required: list[str] | None = None) -> dict:
+    schema = {"type": "object", "properties": properties}
+    if required:
+        schema["required"] = required
+    return schema
+
+
+def _tool(name: str, description: str, properties: dict, required: list[str] | None = None) -> Tool:
+    return Tool(
+        name=name,
+        description=description,
+        inputSchema=_object_schema(properties, required),
+    )
+
+
+_TG_TOOL_SPECS = (
+    (
+        "tg_send_buttons",
+        (
+            "Send interactive buttons: string callback or {label,url}; URL-only returns 'Links sent'."
+        ),
+        {
+            "text": {"type": "string"},
+            "options": {
+                "type": "array",
+                "items": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "url": {"type": "string"},
+                            },
+                            "required": ["label"],
+                        },
+                    ]
+                },
+                "minItems": 1,
+                "maxItems": 8,
+            },
+            "instance": INSTANCE_SCHEMA,
+        },
+        ["text", "options"],
+    ),
+    (
+        "tg_send_text",
+        (
+            "Send text to Telegram. Final replies auto-delivered; only for "
+            "mid-turn pushes, long-running progress, proactive sends."
+        ),
+        {
+            "text": {"type": "string"},
+            "instance": INSTANCE_SCHEMA,
+        },
+        ["text"],
+    ),
+    (
+        "tg_send_file",
+        "Send local file as TG document.",
+        {
+            "path": {"type": "string"},
+            "caption": {"type": "string"},
+            "instance": INSTANCE_SCHEMA,
+        },
+        ["path"],
+    ),
+    (
+        "tg_send_album",
+        "Send 2-10 local images as TG album.",
+        {
+            "paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 2,
+                "maxItems": 10,
+            },
+            "caption": {"type": "string"},
+            "instance": INSTANCE_SCHEMA,
+        },
+        ["paths"],
+    ),
+    (
+        "tg_send_location",
+        "Send location with Amap open-link button.",
+        {
+            "latitude": {"type": "number"},
+            "longitude": {"type": "number"},
+            "name": {"type": "string"},
+            "instance": INSTANCE_SCHEMA,
+        },
+        ["latitude", "longitude"],
+    ),
+    (
+        "tg_send_voice",
+        _voice_description,
+        {
+            "text": {"type": "string"},
+            "voice": {
+                "type": "string",
+            },
+            "instance": INSTANCE_SCHEMA,
+        },
+        ["text"],
+    ),
+    (
+        "tg_send_video",
+        "Send local mp4/mov as TG video.",
+        {
+            "path": {"type": "string"},
+            "caption": {"type": "string"},
+            "instance": INSTANCE_SCHEMA,
+        },
+        ["path"],
+    ),
+    (
+        "tg_send_page",
+        (
+            "Publish Telegraph page from markdown for long structured content "
+            "TG inline HTML cannot render; returns the Telegraph URL."
+        ),
+        {
+            "title": {
+                "type": "string",
+            },
+            "content_md": {
+                "type": "string",
+            },
+            "caption": {
+                "type": "string",
+            },
+            "instance": INSTANCE_SCHEMA,
+        },
+        ["title", "content_md"],
+    ),
+)
+
+
+def _public_page_enabled() -> bool:
+    return os.environ.get(_TG_PUBLIC_PAGE_ENV) == "1"
+
+
+def _tg_tool_specs() -> tuple:
+    if _public_page_enabled():
+        return _TG_TOOL_SPECS
+    return tuple(spec for spec in _TG_TOOL_SPECS if spec[0] != "tg_send_page")
 
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
-        Tool(
-            name="tg_send_buttons",
-            description=(
-                "Present interactive buttons. Each option is either a label string "
-                "(callback) or {label, url} (opens link). Returns the callback label "
-                "clicked, or 'Links sent' if all are URL buttons."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "Message above buttons"},
-                    "options": {
-                        "type": "array",
-                        "items": {
-                            "oneOf": [
-                                {"type": "string"},
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "label": {"type": "string"},
-                                        "url": {"type": "string"},
-                                    },
-                                    "required": ["label"],
-                                },
-                            ]
-                        },
-                        "minItems": 1,
-                        "maxItems": 8,
-                    },
-                    "instance": INSTANCE_SCHEMA,
-                },
-                "required": ["text", "options"],
-            },
-        ),
-        Tool(
-            name="tg_send_text",
-            description=(
-                "Send a plain text message to the user's Telegram. "
-                "When invoked from the TG bot channel, the assistant's final turn text "
-                "is already auto-delivered — this tool is additive, for mid-turn pushes, "
-                "long-running task progress, or proactive sends from terminal/scheduled callers."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string"},
-                    "instance": INSTANCE_SCHEMA,
-                },
-                "required": ["text"],
-            },
-        ),
-        Tool(
-            name="tg_send_file",
-            description="Send a local file to the user as a TG document.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute or ~-relative file path"},
-                    "caption": {"type": "string"},
-                    "instance": INSTANCE_SCHEMA,
-                },
-                "required": ["path"],
-            },
-        ),
-        Tool(
-            name="tg_send_album",
-            description="Send 2-10 local images as a TG media album.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 2,
-                        "maxItems": 10,
-                    },
-                    "caption": {"type": "string"},
-                    "instance": INSTANCE_SCHEMA,
-                },
-                "required": ["paths"],
-            },
-        ),
-        Tool(
-            name="tg_send_location",
-            description="Send a pinpoint location to the user. Attaches an Amap open-link button.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "latitude": {"type": "number"},
-                    "longitude": {"type": "number"},
-                    "name": {"type": "string", "description": "Optional place name for the map label"},
-                    "instance": INSTANCE_SCHEMA,
-                },
-                "required": ["latitude", "longitude"],
-            },
-        ),
-        Tool(
-            name="tg_send_voice",
-            description=_voice_description(),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "Text to speak (with optional markup)"},
-                    "voice": {
-                        "type": "string",
-                        "description": "Optional voice identifier (backend-specific, e.g. nova/mimo_default/zh-CN-XiaoxiaoNeural)",
-                    },
-                    "instance": INSTANCE_SCHEMA,
-                },
-                "required": ["text"],
-            },
-        ),
-        Tool(
-            name="tg_send_video",
-            description="Send a local video file (mp4/mov) to the user as a TG video message.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "caption": {"type": "string"},
-                    "instance": INSTANCE_SCHEMA,
-                },
-                "required": ["path"],
-            },
-        ),
-        Tool(
-            name="tg_send_page",
-            description=(
-                "Publish a Telegraph (telegra.ph) page from markdown and send the URL to TG — "
-                "renders as an Instant View card with full rich layout (h3/h4 headings, real "
-                "<ul>/<ol> lists, blockquote, syntax-highlighted code, inline b/i/u/s/code/a). "
-                "Use when the reply has headings, long structured content, multi-language code blocks, "
-                "or exceeds what TG's inline HTML parse_mode can render cleanly. "
-                "content_md accepts standard markdown; unsupported elements (tables, h1/h2 in body) "
-                "degrade to plain paragraphs. Returns the Telegraph URL."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "Page title — shown as h1 in the Instant View card and in TG's preview snippet",
-                    },
-                    "content_md": {
-                        "type": "string",
-                        "description": "Markdown body. Do NOT repeat the title inside; the page already shows it.",
-                    },
-                    "caption": {
-                        "type": "string",
-                        "description": "Optional short text placed above the URL in the TG message (e.g. a one-line summary)",
-                    },
-                    "instance": INSTANCE_SCHEMA,
-                },
-                "required": ["title", "content_md"],
-            },
-        ),
+        _tool(name, description() if callable(description) else description, properties, required)
+        for name, description, properties, required in _tg_tool_specs()
     ]
 
 
@@ -332,6 +315,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 caption=arguments.get("caption", ""),
             )
         elif name == "tg_send_page":
+            if not _public_page_enabled():
+                return [TextContent(
+                    type="text",
+                    text=f"Tool not available: tg_send_page requires {_TG_PUBLIC_PAGE_ENV}=1",
+                )]
             result = await _relay(
                 "send_page",
                 instance=instance,

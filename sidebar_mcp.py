@@ -5,7 +5,7 @@ server per cc.query session), relays tool calls to sidebar_bot through Unix
 socket bridge (/tmp/babata-sidebar-bridge.sock), which fans out to the
 connected browser extension SW over WebSocket.
 
-V0 哲学: 给 LLM raw primitive 不给 workflow.
+Expose raw primitives, not workflow macros.
 - Browser-side: raw DOM/page primitive (tab_metadata / dom_query / dom_inject
   / dom_set / dom_click / page_snapshot / page_click_ref + tab_navigate).
   LLM compose 它们做任意页面读写 — 抓正文 / 表单填写 / 点击 / 显式注释.
@@ -17,6 +17,10 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import sys
+
+sys.dont_write_bytecode = True
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -31,11 +35,15 @@ SOCKET_PATH = "/tmp/babata-sidebar-bridge.sock"
 server = Server("sidebar")
 
 
+def _tool_scope() -> str:
+    return os.environ.get("BABATA_SIDEBAR_MCP_SCOPE", "page-read")
+
+
 # ── Tool surface ──────────────────────────────────────────────────────
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [Tool(**spec) for spec in tool_specs()]
+    return [Tool(**spec) for spec in tool_specs(_tool_scope())]
 
 
 # ── Bridge relay ──────────────────────────────────────────────────────
@@ -76,6 +84,9 @@ def _format_result(payload: dict) -> str:
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
+        if name not in {spec["name"] for spec in tool_specs(_tool_scope())}:
+            return [TextContent(type="text", text=f"Tool not available in this sidebar scope: {name}")]
+
         # Direct browser-side primitives — round-trip via bridge.
         if name in BRIDGE_TOOL_NAMES:
             payload = await _bridge_call(name, args=arguments or {})
@@ -93,7 +104,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             target = str(target).strip() or "zh"
             h = hashlib.sha256(f"{target}\0{text}".encode("utf-8")).hexdigest()[:16]
             results = await translate_batch(
-                "mcp",
                 target,
                 [{"hash": h, "text": text}],
                 url="mcp://sidebar/translate",
@@ -110,10 +120,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             prompts = arguments.get("prompts") or []
             if not isinstance(prompts, list):
                 return [TextContent(type="text", text="Error: 'prompts' must be a list")]
+            args = {"prompts": prompts}
+            if isinstance(arguments.get("tab_id"), int):
+                args["tab_id"] = arguments["tab_id"]
+            if isinstance(arguments.get("window_id"), int):
+                args["window_id"] = arguments["window_id"]
             payload = await _bridge_call(
                 "notify_sw",
                 name="suggest_prompts",
-                args={"prompts": prompts},
+                args=args,
             )
             return [TextContent(type="text", text=_format_result(payload))]
 
