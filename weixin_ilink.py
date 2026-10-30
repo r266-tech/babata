@@ -65,6 +65,7 @@ MEDIA_FILE = 3
 IMAGE_FETCH_MAX = 20 * 1024 * 1024
 # Big PNGs (GPT images run 2-3MB) upload slowly and fail more often on the WeChat CDN.
 UPLOAD_JPEG_OVER = 1024 * 1024
+UPLOAD_REENCODE_MAX_PIXELS = 40_000_000  # decompression-bomb guard for sips
 
 # Inbound MessageItem type values (proto: MessageItemType).
 ITEM_TEXT = 1
@@ -752,9 +753,25 @@ async def send_image(
     )
 
 
+async def _sips(args: list[str], timeout: float) -> bytes:
+    """Run sips; on timeout or error the process is killed, never left running."""
+    proc = await asyncio.create_subprocess_exec(
+        "sips", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+    if proc.returncode != 0:
+        raise WeixinApiError(f"sips exit {proc.returncode}")
+    return out
+
+
 async def _jpeg_for_upload(data: bytes) -> bytes:
     """Re-encode a large still image as quality-90 JPEG at full resolution; the original wins
-    if it's small, animated (GIF), or the conversion fails or doesn't help."""
+    if it's small, animated (GIF), oversized in pixels, or the conversion fails or doesn't help."""
     if len(data) <= UPLOAD_JPEG_OVER or data.startswith((b"GIF87a", b"GIF89a")):
         return data
     with tempfile.TemporaryDirectory() as tmp:
@@ -762,17 +779,20 @@ async def _jpeg_for_upload(data: bytes) -> bytes:
         with open(src, "wb") as fh:
             fh.write(data)
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "sips", "-s", "format", "jpeg", "-s", "formatOptions", "90", src, "--out", dst,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(proc.wait(), timeout=30)
+            # Header-only read first: a small file can still decode to a huge bitmap.
+            dims = re.findall(rb"pixel(?:Width|Height): (\d+)", await _sips(
+                ["-g", "pixelWidth", "-g", "pixelHeight", src], timeout=10))
+            if len(dims) != 2 or int(dims[0]) * int(dims[1]) > UPLOAD_REENCODE_MAX_PIXELS:
+                return data
+            await _sips(["-s", "format", "jpeg", "-s", "formatOptions", "90", src, "--out", dst], timeout=30)
+            if os.path.getsize(dst) >= len(data):
+                return data
             with open(dst, "rb") as fh:
                 jpeg = fh.read()
         except Exception as e:
             log.warning("jpeg re-encode failed, sending original: %s", e)
             return data
-    return jpeg if jpeg.startswith(b"\xff\xd8\xff") and len(jpeg) < len(data) else data
+    return jpeg if jpeg.startswith(b"\xff\xd8\xff") else data
 
 
 def file_item(uploaded: dict[str, Any], file_name: str) -> dict[str, Any]:

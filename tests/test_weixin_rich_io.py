@@ -379,3 +379,39 @@ def test_failed_reencode_sends_original(monkeypatch):
     monkeypatch.setattr(wi.asyncio, "create_subprocess_exec", boom)
     big = _noise_bmp()
     assert asyncio.run(wi._jpeg_for_upload(big)) == big
+
+
+def test_huge_pixel_count_is_not_decoded(monkeypatch):
+    calls = []
+
+    async def fake_sips(args, timeout):
+        calls.append(args[0])
+        return b"  pixelWidth: 20000\n  pixelHeight: 20000\n"
+    monkeypatch.setattr(wi, "_sips", fake_sips)
+    big = _noise_bmp()
+    assert asyncio.run(wi._jpeg_for_upload(big)) == big
+    assert calls == ["-g"]  # never reached the full decode
+
+
+def test_sips_timeout_kills_the_process(monkeypatch):
+    killed = []
+
+    class Proc:
+        returncode = None
+
+        async def communicate(self):
+            await asyncio.sleep(10)
+
+        def kill(self):
+            killed.append(True)
+            self.returncode = -9
+
+        async def wait(self):
+            return self.returncode
+
+    async def spawn(*_a, **_k):
+        return Proc()
+    monkeypatch.setattr(wi.asyncio, "create_subprocess_exec", spawn)
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(wi._sips(["-g", "pixelWidth", "x"], timeout=0.05))
+    assert killed == [True]
