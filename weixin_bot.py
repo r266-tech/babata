@@ -395,7 +395,7 @@ async def _send_wx_bubble(
 # (paragraph / line / sentence-end), never mid-word, mid-token, or mid-marker.
 _STREAM_FLUSH_IDLE_S = 3.0   # idle drain — ship completed boundary or hold
 _STREAM_HARD_MAX = 3500      # bubble exceeded this — force ship at safest split
-_MERGE_WHEN_LEFT = 3         # quota sends left at which the rest of a turn becomes one bubble
+_MERGE_WHEN_LEFT = 5         # quota sends left at which the rest of a turn becomes one bubble (leaves room for images)
 
 
 # Boundary preference for splitting trailing partials, longest-context first.
