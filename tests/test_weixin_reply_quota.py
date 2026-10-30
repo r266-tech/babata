@@ -108,8 +108,8 @@ def test_queued_bubble_counts_as_handled_and_is_not_retried(tmp_path):
 
 
 @pytest.mark.parametrize("left,expected", [
-    (9, ["a", "b", "c"]),
-    (3, ["a\n\nb\n\nc"]),
+    (6, ["a", "b", "c"]),
+    (5, ["a\n\nb\n\nc"]),
 ])
 def test_low_quota_merges_the_rest_of_the_turn_into_one_bubble(left, expected):
     sent = []
