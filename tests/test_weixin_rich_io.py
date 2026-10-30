@@ -347,3 +347,35 @@ def test_retired_peer_never_alerts(monkeypatch, tmp_path):
 def test_peer_that_dies_mid_run_alerts_once(monkeypatch, tmp_path):
     sent = _run_heartbeat(monkeypatch, tmp_path, [10, 500, 600, 700])
     assert len(sent) == 1 and "心跳" in sent[0]
+
+
+# ── upload size ──────────────────────────────────────────────────────
+
+
+def _noise_bmp(w=800, h=600):
+    import random
+    import struct
+    row = (w * 3 + 3) & ~3
+    rng = random.Random(0)
+    pixels = b"".join(bytes(rng.getrandbits(8) for _ in range(w * 3)) + b"\0" * (row - w * 3) for _ in range(h))
+    return (b"BM" + struct.pack("<IHHI", 54 + len(pixels), 0, 0, 54)
+            + struct.pack("<IiiHHIIiiII", 40, w, h, 1, 24, 0, len(pixels), 2835, 2835, 0, 0) + pixels)
+
+
+def test_big_still_image_is_reencoded_as_jpeg_small_and_gif_untouched():
+    big = _noise_bmp()
+    assert len(big) > wi.UPLOAD_JPEG_OVER
+    out = asyncio.run(wi._jpeg_for_upload(big))
+    assert out.startswith(b"\xff\xd8\xff") and len(out) < len(big)
+    small = b"\x89PNG\r\n\x1a\n" + b"0" * 100
+    assert asyncio.run(wi._jpeg_for_upload(small)) == small
+    gif = b"GIF89a" + b"0" * (wi.UPLOAD_JPEG_OVER + 1)
+    assert asyncio.run(wi._jpeg_for_upload(gif)) == gif
+
+
+def test_failed_reencode_sends_original(monkeypatch):
+    async def boom(*_a, **_k):
+        raise OSError("no sips")
+    monkeypatch.setattr(wi.asyncio, "create_subprocess_exec", boom)
+    big = _noise_bmp()
+    assert asyncio.run(wi._jpeg_for_upload(big)) == big
