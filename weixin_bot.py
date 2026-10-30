@@ -40,13 +40,13 @@ from media import transcribe_silk, transcribe_voice, understand_video
 from weixin_account import (
     add_allow_from, clear_stale_for_user, get_context_token, is_allowed,
     list_account_ids, load_account, load_allow_from, load_sync_buf,
-    recall_message, register_account, remember_message, save_account,
-    save_sync_buf, set_context_token,
+    recall_message, register_account, remember_message, reply_quota_path,
+    save_account, save_sync_buf, set_context_token,
 )
 from weixin_bridge import bridge
 from weixin_ilink import (
     ITEM_FILE, ITEM_IMAGE, ITEM_TEXT, ITEM_VIDEO, ITEM_VOICE,
-    WeixinClient, WeixinSessionExpired,
+    WeixinClient, WeixinQuotaExhausted, WeixinSessionExpired,
     normalize_account_id, send_image, start_qr_login, text_item, wait_qr_login,
     wechat_markdown,
 )
@@ -357,6 +357,10 @@ async def _send_wx_bubble(
                 sent_any = True
                 success = True
                 break
+            except WeixinQuotaExhausted:  # queued for the user's next message: handled, never retried
+                sent_any = True
+                success = True
+                break
             except Exception:
                 if attempt == 0:
                     log.warning("wx send failed (retry once)", exc_info=True)
@@ -368,6 +372,8 @@ async def _send_wx_bubble(
     for target in image_targets:
         try:
             await _send_wx_image(client, from_user, ctx_token, target)
+            sent_any = True
+        except WeixinQuotaExhausted:
             sent_any = True
         except Exception as e:
             log.warning("markdown image delivery failed: %s: %s", target, e)
@@ -389,6 +395,7 @@ async def _send_wx_bubble(
 # (paragraph / line / sentence-end), never mid-word, mid-token, or mid-marker.
 _STREAM_FLUSH_IDLE_S = 3.0   # idle drain — ship completed boundary or hold
 _STREAM_HARD_MAX = 3500      # bubble exceeded this — force ship at safest split
+_MERGE_WHEN_LEFT = 3         # quota sends left at which the rest of a turn becomes one bubble
 
 
 # Boundary preference for splitting trailing partials, longest-context first.
@@ -425,8 +432,10 @@ def _safe_split_partial(text: str) -> tuple[str, str]:
 
 
 class WxStreamCoalescer:
-    def __init__(self, send_bubble: Any) -> None:
+    def __init__(self, send_bubble: Any, quota_left: Any = None) -> None:
         self._send_bubble = send_bubble
+        # Few sends left in the user's quota: hold the rest of the turn and ship it as one bubble.
+        self._quota_left = quota_left or (lambda: None)
         self._buf: list[str] = []
         self._last_flush: float | None = None
         self._flush_lock = asyncio.Lock()
@@ -445,8 +454,18 @@ class WxStreamCoalescer:
         self.had_send_failure = self.had_send_failure or not result.ok
         return result.ok
 
+    def _merging(self) -> bool:
+        left = self._quota_left()
+        return left is not None and left <= _MERGE_WHEN_LEFT
+
     async def drain(self, allow_hard_cut: bool) -> None:
         async with self._flush_lock:
+            if self._merging():
+                if allow_hard_cut and self._buf:
+                    raw = "".join(self._buf)
+                    self._buf.clear()
+                    await self.send_bubble(re.sub(r"\n{3,}", "\n\n", raw))
+                return
             while True:
                 if not self._buf:
                     break
@@ -485,6 +504,8 @@ class WxStreamCoalescer:
         if self._last_flush is None:
             self._last_flush = time.monotonic()
         self._buf.append(text_chunk)
+        if self._merging():
+            return  # the end-of-stream drain ships it all as one bubble
         raw = "".join(self._buf)
         if "\n\n\n" in raw:
             await self.drain(allow_hard_cut=False)
@@ -845,6 +866,12 @@ async def _enqueue_inbound_msgs(
         return True
 
     async with _cc_lock:
+        # Sends that hit the reply quota last time go out first, on this message's token.
+        newest = next((m.get("context_token") for m in reversed(msgs) if m.get("context_token")), None)
+        try:
+            await client.flush_backlog(from_user, newest)
+        except Exception:
+            log.exception("reply backlog flush failed")
         try:
             return await _process_combined_msgs(client, msgs, account_id)
         except Exception:
@@ -1023,7 +1050,7 @@ async def _process_combined_msgs(
     async def send_bubble(text: str) -> WxBubbleSendResult:
         return await _send_wx_bubble(client, from_user, ctx_token, text, account_id)
 
-    coalescer = WxStreamCoalescer(send_bubble)
+    coalescer = WxStreamCoalescer(send_bubble, lambda: client.quota_left(ctx_token))
 
     resp = await _query_wx_turn_with_recovery(combined or "[图片]", images, coalescer)
     if resp is None:
@@ -1038,6 +1065,8 @@ async def _process_combined_msgs(
         path = Path(raw_path).expanduser()
         try:
             await _send_wx_image(client, from_user, ctx_token, path)
+        except WeixinQuotaExhausted:
+            continue
         except Exception as e:
             log.warning("generated image delivery failed: %s: %s", path, e)
             await _set_wx_typing(client, from_user, ticket, 2)
@@ -1219,6 +1248,7 @@ async def _run_account(account_id: str) -> None:
         base_url=meta["baseUrl"],
         token=meta["token"],
         account_id=account_id,
+        quota_path=reply_quota_path(account_id),
     )
     # Make the live client available to bridge before any inbound message.
     # Enables proactive cron pushes (e.g. codex2api-grabber) on bot boot —

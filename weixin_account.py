@@ -136,6 +136,13 @@ def get_context_token(account_id: str, user_id: str) -> str | None:
     return _load_context_tokens(account_id).get(user_id)
 
 
+def reply_quota_path(account_id: str) -> Path:
+    """Where WeixinClient keeps per-message send counts and the queued sends."""
+    path = _account_path(account_id, ".reply-quota.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 # ── quote cache (newer clients quote by svr_id only) ─────────────────
 
 _QUOTE_KEEP = 1000

@@ -1,7 +1,8 @@
 """Weixin iLink bot protocol — HTTP client + QR login + CDN AES.
 
-Raw protocol layer. No state persistence, no business logic; caller owns
-token / sync_buf / context_tokens / account index storage. Port of
+Raw protocol layer. Caller owns token / sync_buf / context_tokens / account
+index storage; the client only keeps the per-message reply quota (see
+REPLY_QUOTA) in the file the caller names. Port of
 @tencent-weixin/openclaw-weixin (MIT) src/api/api.ts + src/auth/login-qr.ts
 + src/cdn/upload.ts + aes-ecb.ts.
 """
@@ -9,6 +10,7 @@ token / sync_buf / context_tokens / account index storage. Port of
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import os
 import re
@@ -81,6 +83,20 @@ class WeixinSessionExpired(Exception):
 
 class WeixinApiError(Exception):
     """Non-zero ret or HTTP error."""
+
+
+class WeixinQuotaExhausted(WeixinApiError):
+    """Reply quota used up: the send is queued and goes out after the peer's next message."""
+
+
+# iLink lets the bot send about 10 messages (text or media) per inbound message; each
+# inbound message brings a fresh context_token and resets the count. Past it every send
+# is ret=-2 "prepare failed". No official doc: third-party SDKs (weilink) state 10, and
+# our 2026-10-30 log matched it. The last slot is kept for QUOTA_NOTICE.
+REPLY_QUOTA = 10
+QUOTA_NOTICE = "（微信限制：你每发一条消息，我最多回 10 条。这次的额度用完了，回我任意一句，我就把剩下的发出来。）"
+QUOTA_KEEP_TOKENS = 20
+BACKLOG_MAX = 30
 
 
 # ── header helpers ────────────────────────────────────────────────────
@@ -293,12 +309,78 @@ class WeixinClient:
         token: str,
         account_id: str = "",
         cdn_base_url: str | None = None,
+        quota_path: str | os.PathLike | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.account_id = account_id
         self.cdn_base_url = (cdn_base_url or DEFAULT_CDN_BASE_URL).rstrip("/")
         self._paused_until: float = 0.0
+        self._quota_path = quota_path
+        self._quota = self._load_quota()
+
+    # ── reply quota ──────────────────────────────────────────────────
+
+    def _load_quota(self) -> dict[str, Any]:
+        data: Any = {}
+        if self._quota_path:
+            try:
+                with open(self._quota_path) as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                pass
+        if not isinstance(data, dict):
+            data = {}
+        return {"sent": dict(data.get("sent") or {}), "backlog": list(data.get("backlog") or [])}
+
+    def _save_quota(self) -> None:
+        sent = self._quota["sent"]
+        for old in list(sent)[:-QUOTA_KEEP_TOKENS]:
+            del sent[old]
+        if not self._quota_path:
+            return
+        tmp = f"{self._quota_path}.tmp"
+        # Holds context tokens and media keys: owner-only.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(self._quota, f, ensure_ascii=False)
+        os.replace(tmp, self._quota_path)
+
+    def quota_left(self, context_token: str | None) -> int | None:
+        """Sends left for content (the notice slot excluded); None when untracked."""
+        if not context_token:
+            return None
+        return max(0, REPLY_QUOTA - 1 - self._quota["sent"].get(context_token, 0))
+
+    def _queue(self, to_user_id: str, item_list: list[dict[str, Any]]) -> None:
+        backlog = self._quota["backlog"]
+        if len(backlog) < BACKLOG_MAX:
+            backlog.append({"to": to_user_id, "items": item_list})
+        else:
+            log.warning("reply backlog full (%d), dropping a send to %s", BACKLOG_MAX, to_user_id)
+
+    def _exhaust(self, to_user_id: str, item_list: list[dict[str, Any]], context_token: str) -> None:
+        self._quota["sent"][context_token] = REPLY_QUOTA
+        self._queue(to_user_id, item_list)
+        self._save_quota()
+
+    async def flush_backlog(self, to_user_id: str, context_token: str | None) -> int:
+        """Send what queued up for this peer with its fresh token, oldest first; returns how many went out."""
+        mine = [b for b in self._quota["backlog"] if b.get("to") == to_user_id]
+        if not mine or not context_token:
+            return 0
+        self._quota["backlog"] = [b for b in self._quota["backlog"] if b.get("to") != to_user_id]
+        self._save_quota()
+        for i, entry in enumerate(mine):
+            try:
+                await self.send_message(to_user_id, entry["items"], context_token=context_token)
+            except WeixinQuotaExhausted:  # send_message re-queued this one; the rest follow it
+                self._quota["backlog"].extend(mine[i + 1:])
+                self._save_quota()
+                return i
+            except Exception as e:  # e.g. a media ref that expired meanwhile
+                log.warning("dropping queued send to %s: %s", to_user_id, e)
+        return len(mine)
 
     # ── session pause ────────────────────────────────────────────────
 
@@ -380,7 +462,36 @@ class WeixinClient:
         Caller builds each item, e.g.
             {"type": 1, "text_item": {"text": "hi"}}
             {"type": 2, "image_item": {"media": {...}, "mid_size": N}}
+
+        With a context_token the reply quota applies: once the content slots are
+        used, the send is queued, the peer gets QUOTA_NOTICE once, and
+        WeixinQuotaExhausted is raised.
         """
+        if context_token and not self.quota_left(context_token):
+            first_refusal = self._quota["sent"].get(context_token, 0) < REPLY_QUOTA
+            self._exhaust(to_user_id, item_list, context_token)
+            if first_refusal:
+                try:
+                    await self._send(to_user_id, [text_item(QUOTA_NOTICE)], context_token)
+                except WeixinApiError as e:
+                    log.warning("quota notice not delivered: %s", e)
+            raise WeixinQuotaExhausted("reply quota used up; queued until the peer's next message")
+        try:
+            resp = await self._send(to_user_id, item_list, context_token)
+        except WeixinApiError as e:
+            if context_token and "ret=-2" in str(e):  # the server counted more than we did
+                self._exhaust(to_user_id, item_list, context_token)
+                raise WeixinQuotaExhausted(f"{e}; queued until the peer's next message") from e
+            raise
+        if context_token:
+            sent = self._quota["sent"]
+            sent[context_token] = sent.pop(context_token, 0) + 1  # re-insert: newest last
+            self._save_quota()
+        return resp
+
+    async def _send(
+        self, to_user_id: str, item_list: list[dict[str, Any]], context_token: str | None,
+    ) -> dict[str, Any]:
         client_id = f"babata-weixin-{secrets.token_hex(12)}"
         msg: dict[str, Any] = {
             "from_user_id": "",

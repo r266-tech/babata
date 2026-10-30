@@ -18,6 +18,17 @@ import weixin_bot as wb
 from cc import Response
 
 
+
+class _NoQuota:
+    """Fake WeixinClient surface for the reply quota: untracked, nothing queued."""
+
+    def quota_left(self, _token):
+        return None
+
+    async def flush_backlog(self, *_a):
+        return 0
+
+
 def reset_wx_pending(monkeypatch, tmp_path):
     monkeypatch.setattr(wb, "_WX_GRACE_S", 0)
     monkeypatch.setattr(wb, "PENDING_WX_UPDATES_FILE", tmp_path / "wx-pending.json")
@@ -291,7 +302,7 @@ def test_chunk_text_long_splits_at_newline():
 
 
 def test_send_wx_bubble_retries_once_then_succeeds(monkeypatch):
-    class FakeClient:
+    class FakeClient(_NoQuota):
         def __init__(self):
             self.calls: list[tuple[str, str | None, str]] = []
 
@@ -317,7 +328,7 @@ def test_send_wx_bubble_retries_once_then_succeeds(monkeypatch):
 
 
 def test_send_wx_bubble_reports_permanent_failure(monkeypatch):
-    class FakeClient:
+    class FakeClient(_NoQuota):
         def __init__(self):
             self.calls = 0
 
@@ -506,7 +517,7 @@ def test_weixin_process_retries_same_turn_before_failure_reply(monkeypatch):
                 await on_stream(None, None, "ok", None)
             return Response(content="ok", session_id="sid-1", cost=0.0)
 
-    class FakeClient:
+    class FakeClient(_NoQuota):
         def __init__(self):
             self.sent: list[str] = []
 
@@ -546,7 +557,7 @@ def test_weixin_process_sends_final_content_when_stream_has_no_delta(monkeypatch
             assert images is None
             return Response(content="final only", session_id="sid-1", cost=0.0)
 
-    class FakeClient:
+    class FakeClient(_NoQuota):
         def __init__(self):
             self.sent: list[str] = []
 
@@ -587,7 +598,7 @@ def test_weixin_process_delivers_native_generated_image(monkeypatch, tmp_path, c
                 generated_images=[str(image)],
             )
 
-    class FakeClient:
+    class FakeClient(_NoQuota):
         def __init__(self):
             self.sent = []
             self.uploads = []
@@ -640,7 +651,7 @@ def test_weixin_generated_image_failure_keeps_turn_unconsumed(monkeypatch, tmp_p
                 generated_images=[str(image)],
             )
 
-    class FakeClient:
+    class FakeClient(_NoQuota):
         async def get_config(self, *_args, **_kwargs):
             return {}
 
@@ -666,7 +677,7 @@ def test_weixin_generated_image_failure_keeps_turn_unconsumed(monkeypatch, tmp_p
 
 
 def test_collect_wx_turn_inputs_preserves_prompt_contract():
-    class FakeClient:
+    class FakeClient(_NoQuota):
         pass
 
     async def run():
@@ -706,7 +717,7 @@ def test_weixin_sync_buf_saved_after_message_processing(monkeypatch, tmp_path):
     processed: list[str] = []
     reset_wx_pending(monkeypatch, tmp_path)
 
-    class FakeClient:
+    class FakeClient(_NoQuota):
         def __init__(self, **_kwargs):
             self.calls = 0
 
@@ -769,7 +780,7 @@ def test_weixin_sync_buf_not_saved_when_processing_unconsumed(monkeypatch, tmp_p
     saved: list[str] = []
     reset_wx_pending(monkeypatch, tmp_path)
 
-    class FakeClient:
+    class FakeClient(_NoQuota):
         def __init__(self, **_kwargs):
             self.calls = 0
 
@@ -823,7 +834,7 @@ def test_weixin_poll_batch_coalesces_same_sender_messages(monkeypatch, tmp_path)
             prompts.append(prompt)
             return Response(content="ok", session_id="sid-1", cost=0.0)
 
-    class FakeClient:
+    class FakeClient(_NoQuota):
         def __init__(self, **_kwargs):
             self.calls = 0
             self.sent: list[str] = []
@@ -940,7 +951,7 @@ def test_weixin_pending_journal_replays_and_acks(monkeypatch, tmp_path):
             prompts.append(prompt)
             return Response(content="ok", session_id="sid-1", cost=0.0)
 
-    class FakeClient:
+    class FakeClient(_NoQuota):
         async def get_config(self, *_args, **_kwargs):
             return {}
 

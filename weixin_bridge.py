@@ -19,6 +19,8 @@ import logging
 import os
 from pathlib import Path
 
+from weixin_ilink import WeixinQuotaExhausted
+
 log = logging.getLogger(__name__)
 
 SOCKET_PATH = "/tmp/babata-weixin-bridge.sock"
@@ -111,6 +113,9 @@ class WeixinBridge:
                 return
 
             await handler(request, writer)
+        except WeixinQuotaExhausted as e:
+            log.info("weixin bridge: %s", e)
+            await self._respond(writer, "Queued: WeChat reply quota used up; goes out after the user's next message")
         except Exception as e:
             log.warning("weixin bridge error: %s", e)
             try:
